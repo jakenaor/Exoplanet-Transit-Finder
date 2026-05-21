@@ -393,6 +393,15 @@ INDEX_HTML = r"""<!doctype html>
           <div class="metric"><span>Noise</span><span>-</span></div>
         </div>
       </section>
+
+      <section>
+        <h2>Export</h2>
+        <div class="controls">
+          <button id="exportCsvButton" class="view-button" type="button" disabled>Transit CSV</button>
+          <button id="exportPngButton" class="view-button" type="button" disabled>Graph PNG</button>
+          <button id="exportJsonButton" class="view-button" type="button" disabled>Summary JSON</button>
+        </div>
+      </section>
     </aside>
 
     <section class="workspace">
@@ -456,6 +465,9 @@ INDEX_HTML = r"""<!doctype html>
     const minDurationInput = document.getElementById('minDurationInput');
     const maxDurationInput = document.getElementById('maxDurationInput');
     const resetDetectionButton = document.getElementById('resetDetectionButton');
+    const exportCsvButton = document.getElementById('exportCsvButton');
+    const exportPngButton = document.getElementById('exportPngButton');
+    const exportJsonButton = document.getElementById('exportJsonButton');
     let selectedFile = null;
     let currentResult = null;
     let currentView = 'zoom';
@@ -588,6 +600,13 @@ INDEX_HTML = r"""<!doctype html>
       if (editBoxesButton.disabled) {
         canvas.classList.remove('editing');
       }
+    }
+
+    function syncExportButtons() {
+      const disabled = !currentResult;
+      exportCsvButton.disabled = disabled;
+      exportPngButton.disabled = disabled;
+      exportJsonButton.disabled = disabled;
     }
 
     fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
@@ -831,6 +850,7 @@ INDEX_HTML = r"""<!doctype html>
       renderMetrics();
       updateChartHeading();
       syncEditButton();
+      syncExportButtons();
       renderTransitRows();
       drawChart();
     }
@@ -857,6 +877,126 @@ INDEX_HTML = r"""<!doctype html>
       renderTransitRows();
       drawChart();
     });
+
+    function exportBaseName() {
+      const fileStem = selectedFile
+        ? selectedFile.name.replace(/\.[^/.]+$/, '')
+        : 'transit-analysis';
+      const safeStem = fileStem.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '');
+      return safeStem || 'transit-analysis';
+    }
+
+    function downloadBlob(content, filename, type) {
+      const blob = content instanceof Blob ? content : new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function csvCell(value) {
+      if (value === null || value === undefined) return '';
+      const text = String(value);
+      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    }
+
+    function transitRowsForExport() {
+      return currentResult.transits.map((transit, index) => ({
+        transit: index + 1,
+        start_day: transit.start,
+        center_day: transit.center,
+        end_day: transit.end,
+        start_jd: currentResult.time_reference + transit.start,
+        center_jd: currentResult.time_reference + transit.center,
+        end_jd: currentResult.time_reference + transit.end,
+        duration_days: transit.duration,
+        depth: transit.depth,
+        points: transit.points,
+        manually_edited: Boolean(transit.manually_edited),
+      }));
+    }
+
+    function exportTransitCsv() {
+      if (!currentResult) return;
+      const rows = transitRowsForExport();
+      const headers = [
+        'transit',
+        'start_day',
+        'center_day',
+        'end_day',
+        'start_jd',
+        'center_jd',
+        'end_jd',
+        'duration_days',
+        'depth',
+        'points',
+        'manually_edited',
+      ];
+      const csv = [
+        headers.join(','),
+        ...rows.map(row => headers.map(header => csvCell(row[header])).join(',')),
+      ].join('\n');
+      downloadBlob(csv, `${exportBaseName()}-transits.csv`, 'text/csv;charset=utf-8');
+      setStatus('Transit CSV exported.');
+    }
+
+    function summaryForExport() {
+      const metrics = currentAnalysisMetrics();
+      return {
+        exported_at: new Date().toISOString(),
+        source_file: selectedFile ? selectedFile.name : null,
+        chart_view: currentView,
+        total_points: currentResult.total_points,
+        time_reference_jd: currentResult.time_reference,
+        time_unit: currentResult.time_unit,
+        detection_options: currentResult.detection_options,
+        boxes_edited: Boolean(currentResult.boxesEdited),
+        metrics: {
+          transit_count: currentResult.transits.length,
+          orbital_period_days: metrics.period,
+          orbital_period_method: metrics.periodMethod,
+          orbital_period_scatter: metrics.periodScatter,
+          period_sample_count: metrics.periodMatchCount,
+          chi_square_p_value: metrics.pValue,
+          chi_square_p_value_percent: metrics.pValue === null || metrics.pValue === undefined ? null : metrics.pValue * 100,
+          delta_chi_squared: metrics.deltaChiSquared,
+          median_flux: currentResult.median_flux,
+          robust_noise: currentResult.robust_noise,
+        },
+        transits: transitRowsForExport(),
+      };
+    }
+
+    function exportSummaryJson() {
+      if (!currentResult) return;
+      downloadBlob(
+        JSON.stringify(summaryForExport(), null, 2),
+        `${exportBaseName()}-summary.json`,
+        'application/json;charset=utf-8'
+      );
+      setStatus('Summary JSON exported.');
+    }
+
+    function exportGraphPng() {
+      if (!currentResult) return;
+      drawChart();
+      canvas.toBlob(blob => {
+        if (!blob) {
+          setStatus('Graph PNG export failed.', true);
+          return;
+        }
+        downloadBlob(blob, `${exportBaseName()}-${currentView}-graph.png`, 'image/png');
+        setStatus('Graph PNG exported.');
+      }, 'image/png');
+    }
+
+    exportCsvButton.addEventListener('click', exportTransitCsv);
+    exportPngButton.addEventListener('click', exportGraphPng);
+    exportJsonButton.addEventListener('click', exportSummaryJson);
 
     function resizeCanvas() {
       const rect = canvas.getBoundingClientRect();
