@@ -62,6 +62,11 @@ The `Time` column is treated as continuous Julian dates. UI plots show days sinc
   - Minimum duration.
   - Maximum duration.
   - Reset detection.
+- Transit depth estimates:
+  - Raw flux depth.
+  - Depth fraction, percent, and ppm.
+  - Radius-ratio estimate using `Rp/Rs = sqrt(depth fraction)`.
+  - Flux near a positive baseline is treated as fractional flux; residual ppm-style flux is treated as ppm directly.
 - Export controls:
   - Transit CSV, including edited boxes and original JD columns.
   - Current graph PNG.
@@ -140,8 +145,8 @@ The user asked to proceed through features 1 through 8. Current status:
 2. Manual transit box editing: done.
 3. Detection sensitivity controls: done.
 4. Export results: done.
-5. Transit depth in percent/ppm and radius-ratio estimate: next.
-6. False-positive warnings: pending.
+5. Transit depth in percent/ppm and radius-ratio estimate: done.
+6. False-positive warnings: next.
 7. Data cleaning panel: pending.
 8. Reset/home view button: pending.
 

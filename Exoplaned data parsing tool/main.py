@@ -432,11 +432,14 @@ INDEX_HTML = r"""<!doctype html>
               <th>End day</th>
               <th>Duration</th>
               <th>Depth</th>
+              <th>Depth %</th>
+              <th>Depth ppm</th>
+              <th>Rp/Rs</th>
               <th>Points</th>
             </tr>
           </thead>
           <tbody id="transitRows">
-            <tr><td colspan="7" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>
+            <tr><td colspan="10" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>
           </tbody>
         </table>
       </div>
@@ -493,6 +496,16 @@ INDEX_HTML = r"""<!doctype html>
       if (percent === 0) return '< 1e-12%';
       if (percent > 0 && percent < 0.000001) return '< 0.000001%';
       return `${fmt(percent, 6)}%`;
+    };
+
+    const fmtDepthPercent = value => {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+      return `${fmt(Number(value) * 100, 6)}%`;
+    };
+
+    const fmtPpm = value => {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+      return fmt(Number(value), 1);
     };
 
     function average(values) {
@@ -796,6 +809,12 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function currentAnalysisMetrics() {
+      const depthFractions = currentResult.transits
+        .map(transit => Number(transit.depth_fraction))
+        .filter(value => Number.isFinite(value) && value >= 0);
+      const radiusRatios = currentResult.transits
+        .map(transit => Number(transit.radius_ratio))
+        .filter(value => Number.isFinite(value) && value >= 0);
       const metrics = {
         period: currentResult.period,
         periodMethod: currentResult.period_method,
@@ -803,6 +822,8 @@ INDEX_HTML = r"""<!doctype html>
         periodMatchCount: currentResult.period_match_count,
         pValue: currentResult.p_value,
         deltaChiSquared: currentResult.delta_chi_squared,
+        medianDepthFraction: median(depthFractions),
+        medianRadiusRatio: median(radiusRatios),
       };
 
       if (currentResult.boxesEdited) {
@@ -835,6 +856,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><span>Data points</span><span>${currentResult.total_points.toLocaleString()}</span></div>
         <div class="metric"><span>Transits</span><span>${currentResult.transits.length}</span></div>
         <div class="metric"><span>Orbital period</span><span>${period}</span></div>
+        <div class="metric"><span>Median depth</span><span>${fmtDepthPercent(metrics.medianDepthFraction)} / ${fmtPpm(metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000)} ppm</span></div>
+        <div class="metric"><span>Radius ratio</span><span>${fmt(metrics.medianRadiusRatio)}</span></div>
         <div class="metric"><span>Chi-sq p-value</span><span>${fmtPercent(metrics.pValue)}</span></div>
         <div class="metric"><span>JD start</span><span>${fmt(currentResult.time_reference, 5)}</span></div>
         <div class="metric"><span>Median flux</span><span>${fmt(currentResult.median_flux)}</span></div>
@@ -865,9 +888,12 @@ INDEX_HTML = r"""<!doctype html>
           <td>${fmt(t.end)}</td>
           <td>${fmt(t.duration)}</td>
           <td>${fmt(t.depth)}</td>
+          <td>${fmtDepthPercent(t.depth_fraction)}</td>
+          <td>${fmtPpm(t.depth_ppm)}</td>
+          <td>${fmt(t.radius_ratio)}</td>
           <td>${t.points}</td>
         </tr>
-      `).join('') : '<tr><td colspan="7" style="text-align:left;color:#60656f;">No statistically strong transit candidates found.</td></tr>';
+      `).join('') : '<tr><td colspan="10" style="text-align:left;color:#60656f;">No statistically strong transit candidates found.</td></tr>';
     }
 
     rowsEl.addEventListener('click', event => {
@@ -915,6 +941,11 @@ INDEX_HTML = r"""<!doctype html>
         end_jd: currentResult.time_reference + transit.end,
         duration_days: transit.duration,
         depth: transit.depth,
+        depth_fraction: transit.depth_fraction,
+        depth_percent: transit.depth_percent,
+        depth_ppm: transit.depth_ppm,
+        radius_ratio: transit.radius_ratio,
+        depth_basis: transit.depth_basis,
         points: transit.points,
         manually_edited: Boolean(transit.manually_edited),
       }));
@@ -933,6 +964,11 @@ INDEX_HTML = r"""<!doctype html>
         'end_jd',
         'duration_days',
         'depth',
+        'depth_fraction',
+        'depth_percent',
+        'depth_ppm',
+        'radius_ratio',
+        'depth_basis',
         'points',
         'manually_edited',
       ];
@@ -961,6 +997,10 @@ INDEX_HTML = r"""<!doctype html>
           orbital_period_method: metrics.periodMethod,
           orbital_period_scatter: metrics.periodScatter,
           period_sample_count: metrics.periodMatchCount,
+          median_depth_fraction: metrics.medianDepthFraction,
+          median_depth_percent: metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 100,
+          median_depth_ppm: metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000,
+          median_radius_ratio: metrics.medianRadiusRatio,
           chi_square_p_value: metrics.pValue,
           chi_square_p_value_percent: metrics.pValue === null || metrics.pValue === undefined ? null : metrics.pValue * 100,
           delta_chi_squared: metrics.deltaChiSquared,
@@ -1177,6 +1217,28 @@ INDEX_HTML = r"""<!doctype html>
       return Math.max(span * 0.00025, 1e-6);
     }
 
+    function applyDepthMetrics(transit, baseline) {
+      if (!transit || !Number.isFinite(Number(transit.depth)) || Number(transit.depth) < 0) {
+        transit.depth_fraction = null;
+        transit.depth_percent = null;
+        transit.depth_ppm = null;
+        transit.radius_ratio = null;
+        transit.depth_basis = null;
+        return;
+      }
+      const depth = Number(transit.depth);
+      const normalizedFraction = Number.isFinite(Number(baseline)) && baseline > 0
+        ? depth / Number(baseline)
+        : null;
+      const useNormalizedFlux = normalizedFraction !== null && normalizedFraction <= 0.5;
+      const depthFraction = useNormalizedFlux ? normalizedFraction : depth / 1000000;
+      transit.depth_fraction = depthFraction;
+      transit.depth_percent = depthFraction * 100;
+      transit.depth_ppm = depthFraction * 1000000;
+      transit.radius_ratio = Math.sqrt(depthFraction);
+      transit.depth_basis = useNormalizedFlux ? 'fractional flux' : 'ppm flux';
+    }
+
     function clampTransitBounds(start, end) {
       const minDuration = minimumTransitDuration();
       const domain = currentResult.domain;
@@ -1205,6 +1267,7 @@ INDEX_HTML = r"""<!doctype html>
         transit.points = count;
         const baseline = Number.isFinite(currentResult.median_flux) ? currentResult.median_flux : high;
         transit.depth = Math.max(0, baseline - low);
+        applyDepthMetrics(transit, baseline);
       }
     }
 
@@ -2246,6 +2309,38 @@ def detect_transits(time, flux, options=None):
     }
 
 
+def add_depth_metrics(transit, baseline_flux):
+    depth = transit.get("depth")
+    if (
+        depth is None
+        or not math.isfinite(float(depth))
+        or float(depth) < 0
+    ):
+        transit["depth_fraction"] = None
+        transit["depth_percent"] = None
+        transit["depth_ppm"] = None
+        transit["radius_ratio"] = None
+        transit["depth_basis"] = None
+        return transit
+
+    normalized_fraction = None
+    if (
+        baseline_flux is not None
+        and math.isfinite(float(baseline_flux))
+        and float(baseline_flux) > 0
+    ):
+        normalized_fraction = float(depth) / float(baseline_flux)
+
+    use_normalized_flux = normalized_fraction is not None and normalized_fraction <= 0.5
+    depth_fraction = normalized_fraction if use_normalized_flux else float(depth) / 1000000.0
+    transit["depth_fraction"] = depth_fraction
+    transit["depth_percent"] = depth_fraction * 100.0
+    transit["depth_ppm"] = depth_fraction * 1000000.0
+    transit["radius_ratio"] = math.sqrt(depth_fraction)
+    transit["depth_basis"] = "fractional flux" if use_normalized_flux else "ppm flux"
+    return transit
+
+
 def robust_flux_limits(values, sigma=4.0):
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
@@ -2391,6 +2486,7 @@ def analyze(time, flux, options=None):
     display_transits = []
     for transit in detection["transits"]:
         display_transit = dict(transit)
+        add_depth_metrics(display_transit, detection["median_flux"])
         display_transit["start"] = float(transit["start"] - time_reference)
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
