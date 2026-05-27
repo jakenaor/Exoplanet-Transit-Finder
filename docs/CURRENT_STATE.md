@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-05-21
+Last updated: 2026-05-27
 
 ## Canonical Location
 
@@ -137,6 +137,48 @@ Browser JavaScript has also been syntax-checked with macOS `osascript -l JavaScr
 - The detector can still confuse stellar variability or noise dips with transits. False-positive warnings are planned.
 - Top candidate periods and period harmonics are not yet exposed.
 
+## TLS Parity Roadmap
+
+This project is intended to become a more user-friendly version of Transit Least Squares (TLS). Missing TLS-inspired capabilities to add after the current feature sequence:
+
+- Transit-shaped model fitting:
+  - Add an optional TLS-style search mode using limb-darkened transit templates instead of only BLS boxes/local dip boxes.
+  - Show model overlays in time view and phase-folded view.
+  - Support trapezoid/grazing-transit templates for V-shaped or box-like events.
+- Stellar parameter priors:
+  - Let users enter or import stellar radius, stellar mass/density, and limb-darkening coefficients.
+  - Use stellar priors to constrain physically plausible period and duration grids.
+  - Surface missing/invalid stellar-prior warnings clearly.
+- Search controls:
+  - Add period minimum/maximum controls.
+  - Add duration minimum/maximum controls tied to physically plausible ranges.
+  - Show the actual period grid and duration grid used for the search.
+  - Add quick-look binning/resampling controls for large or short-cadence datasets.
+- Detection statistics:
+  - Show SDE and raw SDE.
+  - Show false alarm probability estimates and explain white-noise vs red-noise caveats.
+  - Show chi-squared and reduced chi-squared for the best model.
+  - Show period uncertainty, epoch/T0, duration, depth, mean depth uncertainty, SNR, and per-transit SNR.
+  - Show odd/even transit depth mismatch as an eclipsing-binary warning.
+  - Show transit count, distinct transit count, empty transit count, per-transit point counts, and before/in/after-transit phase-bin counts.
+  - Show individual transit depths and depth uncertainties.
+- Transit masks and iterative searches:
+  - Generate an in-transit mask for the best candidate.
+  - Let users hide, highlight, or export in-transit/out-of-transit points.
+  - Add "cleanse detected signal and search again" for multi-planet systems.
+- Data cleaning and uncertainties:
+  - Accept an optional flux uncertainty column.
+  - Clean NaN, None, infinite, masked, and invalid flux/error values with a user-visible report.
+  - Preserve a reversible cleaning log for exports.
+- Power-spectrum inspection:
+  - Add a periodogram/SDE-ogram view.
+  - Expose top candidate periods, harmonics, aliases, and the median-smoothed vs raw power spectrum.
+  - Flag edge-effect or phase-wrapping artifacts where relevant.
+- Performance/user feedback:
+  - Add progress reporting for long searches.
+  - Add a fast preview mode before full-resolution search.
+  - Consider installing `transitleastsquares` as an optional backend dependency once the UI has a stable search workflow.
+
 ## Planned Feature Order
 
 The user asked to proceed through features 1 through 8. Current status:
@@ -153,7 +195,14 @@ The user asked to proceed through features 1 through 8. Current status:
 Additional useful future features after step 8:
 
 - Transit prediction from period and epoch.
-- Multiple candidate BLS periods and harmonics.
+- Multiple candidate BLS/TLS periods and harmonics.
+- Periodogram/SDE-ogram view with top candidate periods, aliases, and raw vs smoothed power.
+- TLS-style transit model overlay on phase-folded and time-series views.
+- User-entered stellar priors and limb-darkening coefficients.
+- SDE, FAP, SNR, period uncertainty, reduced chi-squared, and odd/even mismatch statistics.
+- Transit masks, signal cleansing, and iterative multi-planet search.
+- Optional uncertainty-column support.
+- Search progress reporting and quick-look binning/resampling.
 - Save/load edited sessions.
 - A real test suite for analysis functions.
 - Refactor into modules once behavior stabilizes.
