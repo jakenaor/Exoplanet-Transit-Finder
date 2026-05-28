@@ -11,18 +11,18 @@ import numpy as np
 
 try:
     from scipy.signal import find_peaks, peak_widths
-except ImportError:
+except Exception:
     find_peaks = None
     peak_widths = None
 
 try:
     from scipy.stats import chi2
-except ImportError:
+except Exception:
     chi2 = None
 
 try:
     from astropy.timeseries import BoxLeastSquares
-except ImportError:
+except Exception:
     BoxLeastSquares = None
 
 
@@ -196,6 +196,37 @@ INDEX_HTML = r"""<!doctype html>
     .metric:last-child { border-bottom: 0; }
     .metric span:first-child { color: var(--muted); }
     .metric span:last-child { font-weight: 750; text-align: right; }
+
+    .warning-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .warning-item {
+      border: 1px solid #d7dce3;
+      border-left-width: 4px;
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: #fbfcfd;
+      color: #3f4650;
+    }
+
+    .warning-item strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .warning-item span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .warning-item.info { border-left-color: var(--accent); }
+    .warning-item.caution { border-left-color: var(--accent-2); }
+    .warning-item.danger { border-left-color: var(--danger); }
 
     .controls {
       display: grid;
@@ -387,10 +418,25 @@ INDEX_HTML = r"""<!doctype html>
           <div class="metric"><span>Data points</span><span>-</span></div>
           <div class="metric"><span>Transits</span><span>-</span></div>
           <div class="metric"><span>Orbital period</span><span>-</span></div>
+          <div class="metric"><span>Median depth</span><span>-</span></div>
+          <div class="metric"><span>Radius ratio</span><span>-</span></div>
+          <div class="metric"><span>Depth SNR</span><span>-</span></div>
+          <div class="metric"><span>Period SDE</span><span>-</span></div>
           <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
+          <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
           <div class="metric"><span>JD start</span><span>-</span></div>
           <div class="metric"><span>Median flux</span><span>-</span></div>
           <div class="metric"><span>Noise</span><span>-</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Warnings</h2>
+        <div class="warning-list" id="warnings">
+          <div class="warning-item info">
+            <strong>No analysis yet</strong>
+            <span>Candidate checks appear after upload.</span>
+          </div>
         </div>
       </section>
 
@@ -452,6 +498,7 @@ INDEX_HTML = r"""<!doctype html>
     const analyzeButton = document.getElementById('analyzeButton');
     const statusEl = document.getElementById('status');
     const metricsEl = document.getElementById('metrics');
+    const warningsEl = document.getElementById('warnings');
     const chartTitleEl = document.getElementById('chartTitle');
     const subtitleEl = document.getElementById('subtitle');
     const emptyEl = document.getElementById('empty');
@@ -524,6 +571,13 @@ INDEX_HTML = r"""<!doctype html>
       if (!clean.length) return null;
       const middle = Math.floor(clean.length / 2);
       return clean.length % 2 ? clean[middle] : (clean[middle - 1] + clean[middle]) / 2;
+    }
+
+    function coefficientOfVariation(values) {
+      const clean = values.filter(value => Number.isFinite(value) && value >= 0);
+      const center = median(clean);
+      if (center === null || center <= 0 || clean.length < 2) return null;
+      return standardDeviation(clean, average(clean)) / center;
     }
 
     function erfcApprox(x) {
@@ -822,8 +876,13 @@ INDEX_HTML = r"""<!doctype html>
         periodMatchCount: currentResult.period_match_count,
         pValue: currentResult.p_value,
         deltaChiSquared: currentResult.delta_chi_squared,
+        reducedChiSquared: currentResult.reduced_chi_squared_box,
+        periodSde: currentResult.period_sde,
         medianDepthFraction: median(depthFractions),
         medianRadiusRatio: median(radiusRatios),
+        detectionSnr: currentResult.detection_snr,
+        oddEvenDepthMismatch: currentResult.odd_even_depth_mismatch,
+        depthScatterRatio: currentResult.depth_scatter_ratio,
       };
 
       if (currentResult.boxesEdited) {
@@ -845,6 +904,133 @@ INDEX_HTML = r"""<!doctype html>
       return metrics;
     }
 
+    function currentWarnings(metrics = currentAnalysisMetrics()) {
+      if (!currentResult) return [];
+      const transits = currentResult.transits || [];
+      const warnings = [];
+      const depths = transits
+        .map(transit => Number(transit.depth_ppm ?? transit.depth))
+        .filter(value => Number.isFinite(value) && value >= 0);
+      const rawDepths = transits
+        .map(transit => Number(transit.depth))
+        .filter(value => Number.isFinite(value) && value >= 0);
+      const radii = transits
+        .map(transit => Number(transit.radius_ratio))
+        .filter(value => Number.isFinite(value) && value >= 0);
+      const points = transits
+        .map(transit => Number(transit.points))
+        .filter(value => Number.isFinite(value) && value >= 0);
+      const oddDepths = depths.filter((_, index) => index % 2 === 0);
+      const evenDepths = depths.filter((_, index) => index % 2 === 1);
+      const oddMedian = median(oddDepths);
+      const evenMedian = median(evenDepths);
+      const depthCenter = median(depths);
+      const depthScatterRatio = coefficientOfVariation(depths);
+      const oddEvenMismatch = (
+        oddMedian !== null && evenMedian !== null && Math.max(oddMedian, evenMedian) > 0
+      ) ? Math.abs(oddMedian - evenMedian) / Math.max(oddMedian, evenMedian) : null;
+      const rawDepthCenter = median(rawDepths);
+      const snr = currentResult.boxesEdited || !Number.isFinite(Number(metrics.detectionSnr)) ? (
+        rawDepthCenter !== null && Number.isFinite(Number(currentResult.robust_noise)) && currentResult.robust_noise > 0
+          ? rawDepthCenter / currentResult.robust_noise
+          : null
+      ) : Number(metrics.detectionSnr);
+      const medianPoints = median(points);
+      const maxRadius = radii.length ? Math.max(...radii) : null;
+
+      if (!transits.length) {
+        warnings.push({
+          severity: 'caution',
+          title: 'No transit candidates',
+          detail: 'Try lowering strictness or checking the input columns and flux units.',
+        });
+      }
+      if (transits.length > 0 && transits.length < 3) {
+        warnings.push({
+          severity: 'caution',
+          title: 'Few observed transits',
+          detail: 'A single event or pair of events is harder to separate from systematics.',
+        });
+      }
+      if (metrics.period === null || metrics.period === undefined) {
+        warnings.push({
+          severity: 'caution',
+          title: 'No stable period',
+          detail: 'The app could not estimate a repeating orbital period.',
+        });
+      }
+      if (metrics.periodMethod && metrics.periodMethod !== 'BLS') {
+        warnings.push({
+          severity: 'info',
+          title: 'Period is provisional',
+          detail: `Period came from ${metrics.periodMethod}, not a BLS peak.`,
+        });
+      }
+      if (metrics.pValue !== null && metrics.pValue !== undefined && metrics.pValue > 0.01) {
+        warnings.push({
+          severity: 'caution',
+          title: 'Weak model significance',
+          detail: 'The box model is not much better than a flat light curve by the current chi-squared estimate.',
+        });
+      }
+      if (snr !== null && snr < 7) {
+        warnings.push({
+          severity: 'caution',
+          title: 'Low depth SNR',
+          detail: `Median transit depth is about ${fmt(snr, 2)}x the robust noise.`,
+        });
+      }
+      if (oddEvenMismatch !== null && oddEvenMismatch > 0.5 && oddDepths.length >= 2 && evenDepths.length >= 2) {
+        warnings.push({
+          severity: 'danger',
+          title: 'Odd/even depth mismatch',
+          detail: 'Alternating transit depths can indicate an eclipsing binary or blended source.',
+        });
+      }
+      if (depthScatterRatio !== null && depthScatterRatio > 0.8 && depths.length >= 4) {
+        warnings.push({
+          severity: 'caution',
+          title: 'Inconsistent transit depths',
+          detail: 'Detected depths vary substantially across events.',
+        });
+      }
+      if (maxRadius !== null && maxRadius > 0.2) {
+        warnings.push({
+          severity: 'caution',
+          title: 'Large radius ratio',
+          detail: 'Rp/Rs above 0.2 is large for many planet candidates and deserves closer inspection.',
+        });
+      }
+      if (medianPoints !== null && medianPoints < 4) {
+        warnings.push({
+          severity: 'info',
+          title: 'Sparse transit sampling',
+          detail: 'Some events have very few points inside the detected box.',
+        });
+      }
+      return warnings;
+    }
+
+    function renderWarnings() {
+      if (!currentResult) return;
+      const warnings = currentWarnings();
+      if (!warnings.length) {
+        warningsEl.innerHTML = `
+          <div class="warning-item info">
+            <strong>No major warnings</strong>
+            <span>These checks are heuristic and do not prove the candidate is planetary.</span>
+          </div>
+        `;
+        return;
+      }
+      warningsEl.innerHTML = warnings.map(warning => `
+        <div class="warning-item ${warning.severity}">
+          <strong>${warning.title}</strong>
+          <span>${warning.detail}</span>
+        </div>
+      `).join('');
+    }
+
     function renderMetrics() {
       if (!currentResult) return;
       const metrics = currentAnalysisMetrics();
@@ -858,11 +1044,15 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><span>Orbital period</span><span>${period}</span></div>
         <div class="metric"><span>Median depth</span><span>${fmtDepthPercent(metrics.medianDepthFraction)} / ${fmtPpm(metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000)} ppm</span></div>
         <div class="metric"><span>Radius ratio</span><span>${fmt(metrics.medianRadiusRatio)}</span></div>
+        <div class="metric"><span>Depth SNR</span><span>${fmt(metrics.detectionSnr, 2)}</span></div>
+        <div class="metric"><span>Period SDE</span><span>${fmt(metrics.periodSde, 2)}</span></div>
         <div class="metric"><span>Chi-sq p-value</span><span>${fmtPercent(metrics.pValue)}</span></div>
+        <div class="metric"><span>Reduced chi-sq</span><span>${fmt(metrics.reducedChiSquared, 3)}</span></div>
         <div class="metric"><span>JD start</span><span>${fmt(currentResult.time_reference, 5)}</span></div>
         <div class="metric"><span>Median flux</span><span>${fmt(currentResult.median_flux)}</span></div>
         <div class="metric"><span>Noise</span><span>${fmt(currentResult.robust_noise)}</span></div>
       `;
+      renderWarnings();
     }
 
     function renderResult(result) {
@@ -982,6 +1172,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function summaryForExport() {
       const metrics = currentAnalysisMetrics();
+      const warnings = currentWarnings(metrics);
       return {
         exported_at: new Date().toISOString(),
         source_file: selectedFile ? selectedFile.name : null,
@@ -991,6 +1182,12 @@ INDEX_HTML = r"""<!doctype html>
         time_unit: currentResult.time_unit,
         detection_options: currentResult.detection_options,
         boxes_edited: Boolean(currentResult.boxesEdited),
+        warnings,
+        diagnostics: {
+          detection_snr: metrics.detectionSnr,
+          odd_even_depth_mismatch: metrics.oddEvenDepthMismatch,
+          depth_scatter_ratio: metrics.depthScatterRatio,
+        },
         metrics: {
           transit_count: currentResult.transits.length,
           orbital_period_days: metrics.period,
@@ -1004,6 +1201,9 @@ INDEX_HTML = r"""<!doctype html>
           chi_square_p_value: metrics.pValue,
           chi_square_p_value_percent: metrics.pValue === null || metrics.pValue === undefined ? null : metrics.pValue * 100,
           delta_chi_squared: metrics.deltaChiSquared,
+          reduced_chi_squared: metrics.reducedChiSquared,
+          detection_snr: metrics.detectionSnr,
+          period_sde: metrics.periodSde,
           median_flux: currentResult.median_flux,
           robust_noise: currentResult.robust_noise,
         },
@@ -1923,14 +2123,127 @@ def chi_squared_transit_probability(time, flattened_flux, period, duration, tran
     return {
         "chi_squared_flat": chi2_flat,
         "chi_squared_box": chi2_box,
+        "reduced_chi_squared_box": chi2_box / max(len(y) - 2, 1),
         "delta_chi_squared": delta_chi2,
         "p_value": p_value,
     }
 
 
+def estimate_period_with_binned_bls(time, flux):
+    if len(time) < 50:
+        return None
+
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    if full_span <= 0:
+        return None
+
+    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
+    clipped_flux = np.clip(flux, clipped_low, clipped_high)
+    trend_days = min(10.0, max(2.0, full_span / 6.0))
+    trend_width = max(5, int(trend_days / max(cadence, 1e-9)))
+    if trend_width % 2 == 0:
+        trend_width += 1
+    trend = moving_average(clipped_flux, trend_width)
+    flattened_flux = clipped_flux - trend
+    flattened_flux = flattened_flux - np.median(flattened_flux)
+    residual_median = float(np.median(flattened_flux))
+    residual_mad = float(np.median(np.abs(flattened_flux - residual_median)))
+    sigma = max(1.4826 * residual_mad, float(np.std(flattened_flux)), 1e-9)
+
+    min_period = max(cadence * 20.0, 2.0, full_span / 30.0)
+    max_period = max(min_period * 1.5, full_span / 3.0)
+    min_duration = max(cadence * 4.0, 0.3)
+    max_duration = min(30.0, max(min_duration * 2.0, full_span / 8.0))
+    if min_period >= max_period or min_duration >= max_duration:
+        return None
+
+    periods = np.linspace(min_period, max_period, 900)
+    durations = np.linspace(min_duration, max_duration, 10)
+    bin_count = 360
+    best = None
+    powers = []
+    reference_time = float(time[0])
+
+    for period in periods:
+        phase = ((time - reference_time) % period) / period
+        bin_ids = np.minimum((phase * bin_count).astype(int), bin_count - 1)
+        sums = np.bincount(bin_ids, weights=flattened_flux, minlength=bin_count)
+        counts = np.bincount(bin_ids, minlength=bin_count)
+        doubled_sums = np.r_[sums, sums]
+        doubled_counts = np.r_[counts, counts]
+        sum_prefix = np.r_[0.0, np.cumsum(doubled_sums)]
+        count_prefix = np.r_[0.0, np.cumsum(doubled_counts)]
+        period_best_power = -math.inf
+
+        for duration in durations:
+            window = max(1, int(round((duration / period) * bin_count)))
+            if window >= bin_count // 2:
+                continue
+
+            window_sums = sum_prefix[window:window + bin_count] - sum_prefix[:bin_count]
+            window_counts = count_prefix[window:window + bin_count] - count_prefix[:bin_count]
+            valid = window_counts > 2
+            if not np.any(valid):
+                continue
+
+            means = np.where(valid, window_sums / np.maximum(window_counts, 1), np.inf)
+            bin_index = int(np.argmin(means))
+            depth = -float(means[bin_index])
+            if depth <= 0:
+                continue
+
+            power = depth / sigma * math.sqrt(max(float(window_counts[bin_index]), 1.0))
+            period_best_power = max(period_best_power, power)
+            if best is None or power > best["power"]:
+                transit_time = reference_time + ((bin_index + window / 2.0) / bin_count) * period
+                best = {
+                    "period": float(period),
+                    "duration": float(duration),
+                    "transit_time": float(transit_time),
+                    "power": float(power),
+                }
+
+        powers.append(period_best_power if math.isfinite(period_best_power) else 0.0)
+
+    if best is None:
+        return None
+
+    powers = np.asarray(powers, dtype=float)
+    finite_powers = powers[np.isfinite(powers)]
+    if finite_powers.size >= 5:
+        power_median = float(np.median(finite_powers))
+        power_std = max(float(np.std(finite_powers)), 1e-9)
+        sde = (best["power"] - power_median) / power_std
+    else:
+        sde = None
+
+    first_epoch = math.ceil((time[0] - best["transit_time"]) / best["period"])
+    last_epoch = math.floor((time[-1] - best["transit_time"]) / best["period"])
+    expected_count = max(1, int(last_epoch - first_epoch + 1))
+    chi_squared = chi_squared_transit_probability(
+        time,
+        flattened_flux,
+        best["period"],
+        best["duration"],
+        best["transit_time"],
+    )
+    return {
+        "period": best["period"],
+        "scatter": 0.0,
+        "count": expected_count,
+        "duration": best["duration"],
+        "transit_time": best["transit_time"],
+        "power": best["power"],
+        "sde": sde,
+        "method": "binned BLS fallback",
+        **(chi_squared or {}),
+    }
+
+
 def estimate_period_with_bls(time, flux):
     if BoxLeastSquares is None or len(time) < 50:
-        return None
+        return estimate_period_with_binned_bls(time, flux)
 
     cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
@@ -2269,9 +2582,11 @@ def detect_transits(time, flux, options=None):
     p_value = None
     chi_squared_flat = None
     chi_squared_box = None
+    reduced_chi_squared_box = None
     delta_chi_squared = None
     period_epoch = None
     period_duration = None
+    period_sde = None
     if bls_period is not None:
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
@@ -2280,9 +2595,11 @@ def detect_transits(time, flux, options=None):
         p_value = bls_period.get("p_value")
         chi_squared_flat = bls_period.get("chi_squared_flat")
         chi_squared_box = bls_period.get("chi_squared_box")
+        reduced_chi_squared_box = bls_period.get("reduced_chi_squared_box")
         delta_chi_squared = bls_period.get("delta_chi_squared")
         period_epoch = bls_period.get("transit_time")
         period_duration = bls_period.get("duration")
+        period_sde = bls_period.get("sde")
     else:
         period, period_scatter, period_match_count = estimate_period_from_candidates(transits, full_span)
         period_method = "average gaps" if period is not None else None
@@ -2297,10 +2614,12 @@ def detect_transits(time, flux, options=None):
         "period_method": period_method,
         "period_epoch": period_epoch,
         "period_duration": period_duration,
+        "period_sde": period_sde,
         "p_value": p_value,
         "p_value_percent": None if p_value is None else p_value * 100.0,
         "chi_squared_flat": chi_squared_flat,
         "chi_squared_box": chi_squared_box,
+        "reduced_chi_squared_box": reduced_chi_squared_box,
         "delta_chi_squared": delta_chi_squared,
         "median_flux": median_flux,
         "robust_noise": float(detection["robust_noise"]),
@@ -2339,6 +2658,122 @@ def add_depth_metrics(transit, baseline_flux):
     transit["radius_ratio"] = math.sqrt(depth_fraction)
     transit["depth_basis"] = "fractional flux" if use_normalized_flux else "ppm flux"
     return transit
+
+
+def finite_values(values):
+    return [float(value) for value in values if value is not None and math.isfinite(float(value))]
+
+
+def median_or_none(values):
+    clean = sorted(finite_values(values))
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
+def coefficient_of_variation(values):
+    clean = finite_values(values)
+    center = median_or_none(clean)
+    if center is None or center <= 0 or len(clean) < 2:
+        return None
+    return float(np.std(np.asarray(clean, dtype=float)) / center)
+
+
+def build_candidate_diagnostics(transits, detection):
+    depths = finite_values([item.get("depth") for item in transits])
+    radius_ratios = finite_values([item.get("radius_ratio") for item in transits])
+    point_counts = finite_values([item.get("points") for item in transits])
+    odd_depths = depths[0::2]
+    even_depths = depths[1::2]
+    odd_depth = median_or_none(odd_depths)
+    even_depth = median_or_none(even_depths)
+    depth_center = median_or_none(depths)
+    robust_noise = detection.get("robust_noise")
+    detection_snr = None
+    if depth_center is not None and robust_noise is not None and math.isfinite(float(robust_noise)) and float(robust_noise) > 0:
+        detection_snr = depth_center / float(robust_noise)
+
+    odd_even_depth_mismatch = None
+    if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
+        odd_even_depth_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
+
+    diagnostics = {
+        "detection_snr": detection_snr,
+        "median_transit_points": median_or_none(point_counts),
+        "depth_scatter_ratio": coefficient_of_variation(depths),
+        "odd_depth": odd_depth,
+        "even_depth": even_depth,
+        "odd_even_depth_mismatch": odd_even_depth_mismatch,
+        "max_radius_ratio": max(radius_ratios) if radius_ratios else None,
+    }
+
+    warnings = []
+    if not transits:
+        warnings.append({
+            "severity": "caution",
+            "title": "No transit candidates",
+            "detail": "Try lowering strictness or checking the input columns and flux units.",
+        })
+    if 0 < len(transits) < 3:
+        warnings.append({
+            "severity": "caution",
+            "title": "Few observed transits",
+            "detail": "A single event or pair of events is harder to separate from systematics.",
+        })
+    if detection.get("period") is None:
+        warnings.append({
+            "severity": "caution",
+            "title": "No stable period",
+            "detail": "The app could not estimate a repeating orbital period.",
+        })
+    if detection.get("period_method") and detection.get("period_method") != "BLS":
+        warnings.append({
+            "severity": "info",
+            "title": "Period is provisional",
+            "detail": f"Period came from {detection.get('period_method')}, not a BLS peak.",
+        })
+    p_value = detection.get("p_value")
+    if p_value is not None and math.isfinite(float(p_value)) and float(p_value) > 0.01:
+        warnings.append({
+            "severity": "caution",
+            "title": "Weak model significance",
+            "detail": "The box model is not much better than a flat light curve by the current chi-squared estimate.",
+        })
+    if detection_snr is not None and detection_snr < 7:
+        warnings.append({
+            "severity": "caution",
+            "title": "Low depth SNR",
+            "detail": f"Median transit depth is about {detection_snr:.2f}x the robust noise.",
+        })
+    if odd_even_depth_mismatch is not None and odd_even_depth_mismatch > 0.5 and len(odd_depths) >= 2 and len(even_depths) >= 2:
+        warnings.append({
+            "severity": "danger",
+            "title": "Odd/even depth mismatch",
+            "detail": "Alternating transit depths can indicate an eclipsing binary or blended source.",
+        })
+    if diagnostics["depth_scatter_ratio"] is not None and diagnostics["depth_scatter_ratio"] > 0.8 and len(depths) >= 4:
+        warnings.append({
+            "severity": "caution",
+            "title": "Inconsistent transit depths",
+            "detail": "Detected depths vary substantially across events.",
+        })
+    if diagnostics["max_radius_ratio"] is not None and diagnostics["max_radius_ratio"] > 0.2:
+        warnings.append({
+            "severity": "caution",
+            "title": "Large radius ratio",
+            "detail": "Rp/Rs above 0.2 is large for many planet candidates and deserves closer inspection.",
+        })
+    if diagnostics["median_transit_points"] is not None and diagnostics["median_transit_points"] < 4:
+        warnings.append({
+            "severity": "info",
+            "title": "Sparse transit sampling",
+            "detail": "Some events have very few points inside the detected box.",
+        })
+
+    return diagnostics, warnings
 
 
 def robust_flux_limits(values, sigma=4.0):
@@ -2491,6 +2926,7 @@ def analyze(time, flux, options=None):
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
         display_transits.append(display_transit)
+    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection)
 
     zoom_domain = None
     if display_transits:
@@ -2530,6 +2966,11 @@ def analyze(time, flux, options=None):
         "zoom_domain": zoom_domain,
         "phase_folded": phase_folded,
         "plot_smooth_points": smooth_width,
+        "diagnostics": diagnostics,
+        "warnings": warnings,
+        "detection_snr": diagnostics["detection_snr"],
+        "odd_even_depth_mismatch": diagnostics["odd_even_depth_mismatch"],
+        "depth_scatter_ratio": diagnostics["depth_scatter_ratio"],
         **{**detection, "transits": display_transits},
     }
 
