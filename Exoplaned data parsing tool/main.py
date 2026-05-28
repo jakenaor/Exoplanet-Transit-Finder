@@ -36,6 +36,8 @@ DEFAULT_DETECTION_OPTIONS = {
     "min_depth": None,
     "min_duration": None,
     "max_duration": None,
+    "min_period": None,
+    "max_period": None,
 }
 
 
@@ -408,6 +410,20 @@ INDEX_HTML = r"""<!doctype html>
             </label>
             <input id="maxDurationInput" type="number" min="0" step="0.01" placeholder="auto">
           </div>
+          <div class="control-row">
+            <label class="control-label" for="minPeriodInput">
+              <span>Min period days</span>
+              <output>auto</output>
+            </label>
+            <input id="minPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="maxPeriodInput">
+              <span>Max period days</span>
+              <output>auto</output>
+            </label>
+            <input id="maxPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
           <button id="resetDetectionButton" class="view-button" type="button">Reset detection</button>
         </div>
       </section>
@@ -427,6 +443,16 @@ INDEX_HTML = r"""<!doctype html>
           <div class="metric"><span>JD start</span><span>-</span></div>
           <div class="metric"><span>Median flux</span><span>-</span></div>
           <div class="metric"><span>Noise</span><span>-</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Period Candidates</h2>
+        <div class="warning-list" id="periodCandidates">
+          <div class="warning-item info">
+            <strong>No candidates yet</strong>
+            <span>Period search results appear after analysis.</span>
+          </div>
         </div>
       </section>
 
@@ -499,6 +525,7 @@ INDEX_HTML = r"""<!doctype html>
     const statusEl = document.getElementById('status');
     const metricsEl = document.getElementById('metrics');
     const warningsEl = document.getElementById('warnings');
+    const periodCandidatesEl = document.getElementById('periodCandidates');
     const chartTitleEl = document.getElementById('chartTitle');
     const subtitleEl = document.getElementById('subtitle');
     const emptyEl = document.getElementById('empty');
@@ -514,6 +541,8 @@ INDEX_HTML = r"""<!doctype html>
     const minDepthInput = document.getElementById('minDepthInput');
     const minDurationInput = document.getElementById('minDurationInput');
     const maxDurationInput = document.getElementById('maxDurationInput');
+    const minPeriodInput = document.getElementById('minPeriodInput');
+    const maxPeriodInput = document.getElementById('maxPeriodInput');
     const resetDetectionButton = document.getElementById('resetDetectionButton');
     const exportCsvButton = document.getElementById('exportCsvButton');
     const exportPngButton = document.getElementById('exportPngButton');
@@ -634,6 +663,8 @@ INDEX_HTML = r"""<!doctype html>
         minDepth: optionalNumber(minDepthInput),
         minDuration: optionalNumber(minDurationInput),
         maxDuration: optionalNumber(maxDurationInput),
+        minPeriod: optionalNumber(minPeriodInput),
+        maxPeriod: optionalNumber(maxPeriodInput),
       };
     }
 
@@ -648,6 +679,8 @@ INDEX_HTML = r"""<!doctype html>
       minDepthInput.value = '';
       minDurationInput.value = '';
       maxDurationInput.value = '';
+      minPeriodInput.value = '';
+      maxPeriodInput.value = '';
       updateDetectionReadouts();
     }
 
@@ -683,7 +716,7 @@ INDEX_HTML = r"""<!doctype html>
         markDetectionControlsChanged();
       });
     });
-    [minDepthInput, minDurationInput, maxDurationInput].forEach(input => {
+    [minDepthInput, minDurationInput, maxDurationInput, minPeriodInput, maxPeriodInput].forEach(input => {
       input.addEventListener('change', markDetectionControlsChanged);
     });
     resetDetectionButton.addEventListener('click', () => {
@@ -727,6 +760,8 @@ INDEX_HTML = r"""<!doctype html>
         if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
         if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
         if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
+        if (options.minPeriod !== null) formData.append('minPeriod', options.minPeriod);
+        if (options.maxPeriod !== null) formData.append('maxPeriod', options.maxPeriod);
         const response = await fetch('/analyze', { method: 'POST', body: formData });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || 'Analysis failed.');
@@ -1031,6 +1066,26 @@ INDEX_HTML = r"""<!doctype html>
       `).join('');
     }
 
+    function renderPeriodCandidates() {
+      if (!currentResult) return;
+      const candidates = (currentResult.period_candidates || []).slice(0, 5);
+      if (!candidates.length) {
+        periodCandidatesEl.innerHTML = `
+          <div class="warning-item info">
+            <strong>No period grid</strong>
+            <span>Only candidate-box spacing is available for this run.</span>
+          </div>
+        `;
+        return;
+      }
+      periodCandidatesEl.innerHTML = candidates.map((candidate, index) => `
+        <div class="warning-item ${index === 0 ? 'info' : 'caution'}">
+          <strong>${fmt(candidate.period, 4)} days</strong>
+          <span>Power ${fmt(candidate.power, 2)}${candidate.sde === null || candidate.sde === undefined ? '' : `, SDE ${fmt(candidate.sde, 2)}`}</span>
+        </div>
+      `).join('');
+    }
+
     function renderMetrics() {
       if (!currentResult) return;
       const metrics = currentAnalysisMetrics();
@@ -1052,6 +1107,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><span>Median flux</span><span>${fmt(currentResult.median_flux)}</span></div>
         <div class="metric"><span>Noise</span><span>${fmt(currentResult.robust_noise)}</span></div>
       `;
+      renderPeriodCandidates();
       renderWarnings();
     }
 
@@ -1207,6 +1263,8 @@ INDEX_HTML = r"""<!doctype html>
           median_flux: currentResult.median_flux,
           robust_noise: currentResult.robust_noise,
         },
+        period_candidates: currentResult.period_candidates || [],
+        period_search: currentResult.period_search || null,
         transits: transitRowsForExport(),
       };
     }
@@ -2023,12 +2081,20 @@ def parse_detection_options(form):
     options["min_depth"] = parse_optional_float(form, "minDepth", 0.0, None)
     options["min_duration"] = parse_optional_float(form, "minDuration", 0.0, None)
     options["max_duration"] = parse_optional_float(form, "maxDuration", 0.0, None)
+    options["min_period"] = parse_optional_float(form, "minPeriod", 0.0, None)
+    options["max_period"] = parse_optional_float(form, "maxPeriod", 0.0, None)
     if (
         options["min_duration"] is not None
         and options["max_duration"] is not None
         and options["max_duration"] <= options["min_duration"]
     ):
         raise ValueError("maxDuration must be greater than minDuration.")
+    if (
+        options["min_period"] is not None
+        and options["max_period"] is not None
+        and options["max_period"] <= options["min_period"]
+    ):
+        raise ValueError("maxPeriod must be greater than minPeriod.")
     return options
 
 
@@ -2129,7 +2195,33 @@ def chi_squared_transit_probability(time, flattened_flux, period, duration, tran
     }
 
 
-def estimate_period_with_binned_bls(time, flux):
+def period_search_bounds(cadence, full_span, options=None):
+    auto_min_period = max(cadence * 20.0, 2.0, full_span / 30.0)
+    auto_max_period = max(auto_min_period * 1.5, full_span / 3.0)
+    min_period = auto_min_period
+    max_period = auto_max_period
+    if options:
+        if options.get("min_period") is not None:
+            min_period = max(cadence * 2.0, float(options["min_period"]))
+        if options.get("max_period") is not None:
+            max_period = min(full_span * 0.95, float(options["max_period"]))
+    return min_period, max_period
+
+
+def duration_search_bounds(cadence, full_span, options=None):
+    auto_min_duration = max(cadence * 4.0, 0.3)
+    auto_max_duration = min(30.0, max(auto_min_duration * 2.0, full_span / 8.0))
+    min_duration = auto_min_duration
+    max_duration = auto_max_duration
+    if options:
+        if options.get("min_duration") is not None:
+            min_duration = max(cadence * 2.0, float(options["min_duration"]))
+        if options.get("max_duration") is not None:
+            max_duration = min(full_span * 0.25, float(options["max_duration"]))
+    return min_duration, max_duration
+
+
+def estimate_period_with_binned_bls(time, flux, options=None):
     if len(time) < 50:
         return None
 
@@ -2151,10 +2243,8 @@ def estimate_period_with_binned_bls(time, flux):
     residual_mad = float(np.median(np.abs(flattened_flux - residual_median)))
     sigma = max(1.4826 * residual_mad, float(np.std(flattened_flux)), 1e-9)
 
-    min_period = max(cadence * 20.0, 2.0, full_span / 30.0)
-    max_period = max(min_period * 1.5, full_span / 3.0)
-    min_duration = max(cadence * 4.0, 0.3)
-    max_duration = min(30.0, max(min_duration * 2.0, full_span / 8.0))
+    min_period, max_period = period_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
     if min_period >= max_period or min_duration >= max_duration:
         return None
 
@@ -2218,6 +2308,18 @@ def estimate_period_with_binned_bls(time, flux):
     else:
         sde = None
 
+    candidate_indices = np.argsort(powers)[-8:][::-1]
+    candidates = []
+    for index in candidate_indices:
+        power = float(powers[index])
+        if not math.isfinite(power) or power <= 0:
+            continue
+        candidates.append({
+            "period": float(periods[index]),
+            "power": power,
+            "sde": None if sde is None else float((power - power_median) / power_std),
+        })
+
     first_epoch = math.ceil((time[0] - best["transit_time"]) / best["period"])
     last_epoch = math.floor((time[-1] - best["transit_time"]) / best["period"])
     expected_count = max(1, int(last_epoch - first_epoch + 1))
@@ -2236,14 +2338,19 @@ def estimate_period_with_binned_bls(time, flux):
         "transit_time": best["transit_time"],
         "power": best["power"],
         "sde": sde,
+        "candidates": candidates,
+        "search_min_period": float(min_period),
+        "search_max_period": float(max_period),
+        "search_min_duration": float(min_duration),
+        "search_max_duration": float(max_duration),
         "method": "binned BLS fallback",
         **(chi_squared or {}),
     }
 
 
-def estimate_period_with_bls(time, flux):
+def estimate_period_with_bls(time, flux, options=None):
     if BoxLeastSquares is None or len(time) < 50:
-        return estimate_period_with_binned_bls(time, flux)
+        return estimate_period_with_binned_bls(time, flux, options)
 
     cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
@@ -2261,10 +2368,8 @@ def estimate_period_with_bls(time, flux):
     flattened_flux = clipped_flux - trend
     flattened_flux = flattened_flux - np.median(flattened_flux)
 
-    min_period = max(cadence * 20.0, 2.0, full_span / 30.0)
-    max_period = max(min_period * 1.5, full_span / 3.0)
-    min_duration = max(cadence * 4.0, 0.3)
-    max_duration = min(30.0, max(min_duration * 2.0, full_span / 8.0))
+    min_period, max_period = period_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
     if min_period >= max_period or min_duration >= max_duration:
         return None
 
@@ -2291,6 +2396,20 @@ def estimate_period_with_bls(time, flux):
     last_epoch = math.floor((time[-1] - transit_time) / period)
     expected_count = max(1, int(last_epoch - first_epoch + 1))
     chi_squared = chi_squared_transit_probability(time, flattened_flux, period, duration, transit_time)
+    order = np.argsort(result.power)[-8:][::-1]
+    candidates = []
+    power_median = float(np.nanmedian(result.power))
+    power_std = max(float(np.nanstd(result.power)), 1e-9)
+    for index in order:
+        if not math.isfinite(float(result.power[index])):
+            continue
+        power_value = float(result.power[index])
+        candidates.append({
+            "period": float(result.period[index]),
+            "power": power_value,
+            "sde": (power_value - power_median) / power_std,
+        })
+
     return {
         "period": period,
         "scatter": 0.0,
@@ -2298,6 +2417,12 @@ def estimate_period_with_bls(time, flux):
         "duration": duration,
         "transit_time": transit_time,
         "power": power,
+        "sde": (power - power_median) / power_std,
+        "candidates": candidates,
+        "search_min_period": float(min_period),
+        "search_max_period": float(max_period),
+        "search_min_duration": float(min_duration),
+        "search_max_duration": float(max_duration),
         "method": "BLS",
         **(chi_squared or {}),
     }
@@ -2578,7 +2703,7 @@ def detect_transits(time, flux, options=None):
 
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    bls_period = estimate_period_with_bls(time, flux)
+    bls_period = estimate_period_with_bls(time, flux, options)
     p_value = None
     chi_squared_flat = None
     chi_squared_box = None
@@ -2587,6 +2712,8 @@ def detect_transits(time, flux, options=None):
     period_epoch = None
     period_duration = None
     period_sde = None
+    period_candidates = []
+    period_search = None
     if bls_period is not None:
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
@@ -2600,6 +2727,13 @@ def detect_transits(time, flux, options=None):
         period_epoch = bls_period.get("transit_time")
         period_duration = bls_period.get("duration")
         period_sde = bls_period.get("sde")
+        period_candidates = bls_period.get("candidates", [])
+        period_search = {
+            "min_period": bls_period.get("search_min_period"),
+            "max_period": bls_period.get("search_max_period"),
+            "min_duration": bls_period.get("search_min_duration"),
+            "max_duration": bls_period.get("search_max_duration"),
+        }
     else:
         period, period_scatter, period_match_count = estimate_period_from_candidates(transits, full_span)
         period_method = "average gaps" if period is not None else None
@@ -2615,6 +2749,8 @@ def detect_transits(time, flux, options=None):
         "period_epoch": period_epoch,
         "period_duration": period_duration,
         "period_sde": period_sde,
+        "period_candidates": period_candidates,
+        "period_search": period_search,
         "p_value": p_value,
         "p_value_percent": None if p_value is None else p_value * 100.0,
         "chi_squared_flat": chi_squared_flat,
