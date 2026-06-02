@@ -2114,6 +2114,45 @@ def moving_average(values, width):
     return np.convolve(padded, kernel, mode="valid")
 
 
+def observing_segments(time):
+    if len(time) == 0:
+        return []
+    if len(time) == 1:
+        return [(0, 1)]
+
+    deltas = np.diff(time)
+    positive_deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
+    if positive_deltas.size == 0:
+        return [(0, len(time))]
+
+    cadence = float(np.median(positive_deltas))
+    full_span = float(time[-1] - time[0])
+    gap_threshold = max(cadence * 25.0, 0.25)
+    if full_span > 0:
+        gap_threshold = min(gap_threshold, max(cadence * 25.0, full_span * 0.08))
+
+    starts = np.r_[0, np.where(deltas > gap_threshold)[0] + 1]
+    ends = np.r_[starts[1:], len(time)]
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends)
+        if end > start
+    ]
+
+
+def normalize_flux_by_segments(time, flux):
+    normalized = np.asarray(flux, dtype=float).copy()
+    segments = observing_segments(time)
+
+    for start, end in segments:
+        segment = normalized[start:end]
+        baseline = float(np.median(segment))
+        if math.isfinite(baseline) and baseline > 1e-9:
+            normalized[start:end] = segment / baseline
+
+    return normalized, segments
+
+
 def contiguous_regions(mask):
     if not np.any(mask):
         return []
@@ -2196,7 +2235,7 @@ def chi_squared_transit_probability(time, flattened_flux, period, duration, tran
 
 
 def period_search_bounds(cadence, full_span, options=None):
-    auto_min_period = max(cadence * 20.0, 2.0, full_span / 30.0)
+    auto_min_period = max(cadence * 20.0, 0.5)
     auto_max_period = max(auto_min_period * 1.5, full_span / 3.0)
     min_period = auto_min_period
     max_period = auto_max_period
@@ -2209,7 +2248,7 @@ def period_search_bounds(cadence, full_span, options=None):
 
 
 def duration_search_bounds(cadence, full_span, options=None):
-    auto_min_duration = max(cadence * 4.0, 0.3)
+    auto_min_duration = max(cadence * 4.0, 0.05)
     auto_max_duration = min(30.0, max(auto_min_duration * 2.0, full_span / 8.0))
     min_duration = auto_min_duration
     max_duration = auto_max_duration
@@ -2218,6 +2257,26 @@ def duration_search_bounds(cadence, full_span, options=None):
             min_duration = max(cadence * 2.0, float(options["min_duration"]))
         if options.get("max_duration") is not None:
             max_duration = min(full_span * 0.25, float(options["max_duration"]))
+    return min_duration, max_duration
+
+
+def period_grid(min_period, max_period, count):
+    if min_period >= max_period:
+        return np.asarray([], dtype=float)
+
+    linear_periods = np.linspace(min_period, max_period, count)
+    frequency_periods = 1.0 / np.linspace(1.0 / max_period, 1.0 / min_period, count)
+    periods = np.unique(np.r_[linear_periods, frequency_periods])
+    periods = periods[(periods >= min_period) & (periods <= max_period)]
+    return np.sort(periods.astype(float))
+
+
+def constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options=None):
+    max_duration = min(max_duration, min_period * 0.5)
+    if min_duration >= max_duration:
+        if options and options.get("min_duration") is not None:
+            return min_duration, max_duration
+        min_duration = max(cadence * 2.0, max_duration * 0.2)
     return min_duration, max_duration
 
 
@@ -2245,10 +2304,11 @@ def estimate_period_with_binned_bls(time, flux, options=None):
 
     min_period, max_period = period_search_bounds(cadence, full_span, options)
     min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options)
     if min_period >= max_period or min_duration >= max_duration:
         return None
 
-    periods = np.linspace(min_period, max_period, 900)
+    periods = period_grid(min_period, max_period, 900)
     durations = np.linspace(min_duration, max_duration, 10)
     bin_count = 360
     best = None
@@ -2370,10 +2430,11 @@ def estimate_period_with_bls(time, flux, options=None):
 
     min_period, max_period = period_search_bounds(cadence, full_span, options)
     min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options)
     if min_period >= max_period or min_duration >= max_duration:
         return None
 
-    periods = np.linspace(min_period, max_period, 1800)
+    periods = period_grid(min_period, max_period, 1200)
     durations = np.linspace(min_duration, max_duration, 12)
     try:
         model = BoxLeastSquares(time, flattened_flux)
@@ -2481,7 +2542,7 @@ def detect_transits_by_prominence(time, flux, median_flux, options):
     cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
 
-    auto_min_width_time = max(cadence * 4.0, min(0.5, full_span / 1000.0))
+    auto_min_width_time = max(cadence * 4.0, min(0.08, full_span / 5000.0))
     auto_max_curve_time = max(auto_min_width_time * 4.0, min(36.0, max(1.0, full_span * 0.12)))
     min_width_time = (
         max(cadence * 2.0, float(options["min_duration"]))
@@ -2698,8 +2759,16 @@ def detect_transits(time, flux, options=None):
         options = dict(DEFAULT_DETECTION_OPTIONS)
     median_flux = float(np.median(flux))
     detection = detect_transits_by_prominence(time, flux, median_flux, options)
+    threshold_detection = detect_transits_by_threshold(time, flux, median_flux, options)
     if detection is None:
-        detection = detect_transits_by_threshold(time, flux, median_flux, options)
+        detection = threshold_detection
+    elif threshold_detection is not None and len(threshold_detection["transits"]) > len(detection["transits"]):
+        detection = {
+            **detection,
+            "transits": prune_overlapping_transits(detection["transits"] + threshold_detection["transits"]),
+            "robust_noise": min(float(detection["robust_noise"]), float(threshold_detection["robust_noise"])),
+            "smooth_points": min(int(detection["smooth_points"]), int(threshold_detection["smooth_points"])),
+        }
 
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
@@ -3033,13 +3102,14 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
 def analyze(time, flux, options=None):
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
-    detection = detect_transits(time, flux, options)
+    analysis_flux, segments = normalize_flux_by_segments(time, flux)
+    detection = detect_transits(time, analysis_flux, options)
     time_reference = float(time[0])
     display_time = time - time_reference
-    raw_low, raw_high = robust_flux_limits(flux, sigma=4.0)
-    raw_clipped = np.clip(flux, raw_low, raw_high)
+    raw_low, raw_high = robust_flux_limits(analysis_flux, sigma=4.0)
+    raw_clipped = np.clip(analysis_flux, raw_low, raw_high)
 
-    base_smooth_width = int(max(25, min(251, len(flux) // 300)))
+    base_smooth_width = int(max(25, min(251, len(analysis_flux) // 300)))
     smooth_width = odd_window_width(base_smooth_width, float(options["smoothing"]), 5, 601)
     smooth_flux = moving_average(raw_clipped, smooth_width)
     plot_time, plot_raw, plot_smooth = downsample_for_plot(display_time, raw_clipped, smooth_flux)
@@ -3088,6 +3158,19 @@ def analyze(time, flux, options=None):
         "total_points": int(len(time)),
         "time_reference": time_reference,
         "time_unit": "Julian days since first observation",
+        "flux_unit": "relative flux",
+        "normalization": {
+            "method": "per-observing-segment median",
+            "segment_count": len(segments),
+            "segment_time_ranges": [
+                {
+                    "start_day": float(time[start] - time_reference),
+                    "end_day": float(time[end - 1] - time_reference),
+                    "median_flux": float(np.median(flux[start:end])),
+                }
+                for start, end in segments
+            ],
+        },
         "plot": {
             "time": plot_time.tolist(),
             "raw_flux": plot_raw.tolist(),
