@@ -1,0 +1,1826 @@
+const fileInput = document.getElementById('fileInput');
+const dropzone = document.getElementById('dropzone');
+const analyzeButton = document.getElementById('analyzeButton');
+const statusEl = document.getElementById('status');
+const metricsEl = document.getElementById('metrics');
+const warningsEl = document.getElementById('warnings');
+const periodCandidatesEl = document.getElementById('periodCandidates');
+const chartTitleEl = document.getElementById('chartTitle');
+const subtitleEl = document.getElementById('subtitle');
+const emptyEl = document.getElementById('empty');
+const rowsEl = document.getElementById('transitRows');
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+const viewButtons = [...document.querySelectorAll('.view-button[data-view]')];
+const editBoxesButton = document.getElementById('editBoxesButton');
+const strictnessInput = document.getElementById('strictnessInput');
+const strictnessValue = document.getElementById('strictnessValue');
+const smoothingInput = document.getElementById('smoothingInput');
+const smoothingValue = document.getElementById('smoothingValue');
+const minDepthInput = document.getElementById('minDepthInput');
+const minDurationInput = document.getElementById('minDurationInput');
+const maxDurationInput = document.getElementById('maxDurationInput');
+const minPeriodInput = document.getElementById('minPeriodInput');
+const maxPeriodInput = document.getElementById('maxPeriodInput');
+const resetDetectionButton = document.getElementById('resetDetectionButton');
+const exportCsvButton = document.getElementById('exportCsvButton');
+const exportPngButton = document.getElementById('exportPngButton');
+const exportJsonButton = document.getElementById('exportJsonButton');
+const exportAnalysisPdfButton = document.getElementById('exportAnalysisPdfButton');
+const exportBatchPdfButton = document.getElementById('exportBatchPdfButton');
+const resultSelect = document.getElementById('resultSelect');
+const batchCount = document.getElementById('batchCount');
+const MAX_BATCH_FILES = 100;
+let selectedFiles = [];
+let selectedFile = null;
+let batchResults = [];
+let currentBatchIndex = -1;
+let batchInProgress = false;
+let currentResult = null;
+let currentView = 'zoom';
+let currentViewport = null;
+let dragState = null;
+let boxDragState = null;
+let lastPointer = null;
+let selectedTransitIndex = null;
+let editBoxesEnabled = false;
+let transitBoxCache = [];
+const chartPad = { left: 62, right: 22, top: 24, bottom: 48 };
+
+const fmt = (value, digits = 6) => {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+  const n = Number(value);
+  if (Math.abs(n) >= 1000000 || (Math.abs(n) > 0 && Math.abs(n) < 0.001)) return n.toExponential(3);
+  return Number.parseFloat(n.toFixed(digits)).toString();
+};
+
+const fmtPercent = value => {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+  const percent = Number(value) * 100;
+  if (percent === 0) return '< 1e-12%';
+  if (percent > 0 && percent < 0.000001) return '< 0.000001%';
+  return `${fmt(percent, 6)}%`;
+};
+
+const fmtDepthPercent = value => {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+  return `${fmt(Number(value) * 100, 6)}%`;
+};
+
+const fmtPpm = value => {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
+  return fmt(Number(value), 1);
+};
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[character]));
+}
+
+function average(values) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function standardDeviation(values, center = average(values)) {
+  if (!values.length || center === null) return null;
+  const variance = values.reduce((sum, value) => sum + (value - center) ** 2, 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+function median(values) {
+  const clean = values.filter(value => Number.isFinite(value)).sort((a, b) => a - b);
+  if (!clean.length) return null;
+  const middle = Math.floor(clean.length / 2);
+  return clean.length % 2 ? clean[middle] : (clean[middle - 1] + clean[middle]) / 2;
+}
+
+function coefficientOfVariation(values) {
+  const clean = values.filter(value => Number.isFinite(value) && value >= 0);
+  const center = median(clean);
+  if (center === null || center <= 0 || clean.length < 2) return null;
+  return standardDeviation(clean, average(clean)) / center;
+}
+
+function erfcApprox(x) {
+  const z = Math.abs(x);
+  const t = 1 / (1 + z / 2);
+  const r = t * Math.exp(
+    -z * z - 1.26551223 + t * (
+      1.00002368 + t * (
+        0.37409196 + t * (
+          0.09678418 + t * (
+            -0.18628806 + t * (
+              0.27886807 + t * (
+                -1.13520398 + t * (
+                  1.48851587 + t * (
+                    -0.82215223 + t * 0.17087277
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+  return x >= 0 ? r : 2 - r;
+}
+
+function chiSquareOneDegreePValue(deltaChiSquared) {
+  if (!Number.isFinite(deltaChiSquared) || deltaChiSquared < 0) return null;
+  return Math.max(0, Math.min(1, erfcApprox(Math.sqrt(deltaChiSquared / 2))));
+}
+
+function setStatus(message, isError = false) {
+  statusEl.textContent = message;
+  statusEl.className = isError ? 'status error' : 'status';
+}
+
+function renderBatchSelect() {
+  const successCount = batchResults.filter(item => item.result).length;
+  batchCount.value = `${successCount}/${batchResults.length || selectedFiles.length || 0}`;
+  if (!batchResults.length) {
+    resultSelect.disabled = true;
+    resultSelect.innerHTML = '<option>No processed files</option>';
+    syncExportButtons();
+    return;
+  }
+
+  resultSelect.disabled = batchInProgress || successCount === 0;
+  resultSelect.innerHTML = batchResults.map((item, index) => {
+    const selected = index === currentBatchIndex ? ' selected' : '';
+    const disabled = item.error ? ' disabled' : '';
+    const detail = item.error
+      ? 'failed'
+      : `${item.result.transits.length} transits`;
+    return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
+  }).join('');
+  syncExportButtons();
+}
+
+function setFiles(fileList) {
+  const files = Array.from(fileList || []);
+  selectedFiles = files.slice(0, MAX_BATCH_FILES);
+  selectedFile = selectedFiles[0] || null;
+  batchResults = [];
+  currentBatchIndex = -1;
+  renderBatchSelect();
+  clearResultView();
+  analyzeButton.disabled = !selectedFiles.length;
+  if (!selectedFiles.length) {
+    setStatus('No file selected.');
+  } else if (files.length > MAX_BATCH_FILES) {
+    setStatus(`Selected first ${MAX_BATCH_FILES} of ${files.length} files.`);
+  } else {
+    setStatus(selectedFiles.length === 1
+      ? selectedFiles[0].name
+      : `${selectedFiles.length} files selected.`);
+  }
+}
+
+function optionalNumber(input) {
+  if (!input.value.trim()) return null;
+  const value = Number(input.value);
+  return Number.isFinite(value) ? value : null;
+}
+
+function detectionOptions() {
+  return {
+    strictness: Number(strictnessInput.value),
+    smoothing: Number(smoothingInput.value),
+    minDepth: optionalNumber(minDepthInput),
+    minDuration: optionalNumber(minDurationInput),
+    maxDuration: optionalNumber(maxDurationInput),
+    minPeriod: optionalNumber(minPeriodInput),
+    maxPeriod: optionalNumber(maxPeriodInput),
+  };
+}
+
+function updateDetectionReadouts() {
+  strictnessValue.value = `${Number(strictnessInput.value).toFixed(2)}x`;
+  smoothingValue.value = `${Number(smoothingInput.value).toFixed(2)}x`;
+}
+
+function resetDetectionControls() {
+  strictnessInput.value = '1';
+  smoothingInput.value = '1';
+  minDepthInput.value = '';
+  minDurationInput.value = '';
+  maxDurationInput.value = '';
+  minPeriodInput.value = '';
+  maxPeriodInput.value = '';
+  updateDetectionReadouts();
+}
+
+function markDetectionControlsChanged() {
+  if (currentResult && selectedFiles.length) {
+    setStatus('Detection controls changed. Run Analyze files to apply.');
+  }
+}
+
+function canEditBoxes() {
+  return Boolean(currentResult && editBoxesEnabled && currentView !== 'phase');
+}
+
+function syncEditButton() {
+  editBoxesButton.disabled = !currentResult || currentView === 'phase';
+  editBoxesButton.classList.toggle('active', editBoxesEnabled && !editBoxesButton.disabled);
+  if (editBoxesButton.disabled) {
+    canvas.classList.remove('editing');
+  }
+}
+
+function syncExportButtons() {
+  const disabled = !currentResult;
+  exportCsvButton.disabled = disabled;
+  exportPngButton.disabled = disabled;
+  exportJsonButton.disabled = disabled;
+  exportAnalysisPdfButton.disabled = disabled;
+  exportBatchPdfButton.disabled = !batchResults.some(item => item.result);
+}
+
+function clearResultView() {
+  currentResult = null;
+  currentViewport = null;
+  selectedTransitIndex = null;
+  boxDragState = null;
+  transitBoxCache = [];
+  editBoxesEnabled = false;
+  emptyEl.style.display = 'grid';
+  metricsEl.innerHTML = `
+    <div class="metric"><span>Data points</span><span>-</span></div>
+    <div class="metric"><span>Transits</span><span>-</span></div>
+    <div class="metric"><span>Orbital period</span><span>-</span></div>
+    <div class="metric"><span>Median depth</span><span>-</span></div>
+    <div class="metric"><span>Radius ratio</span><span>-</span></div>
+    <div class="metric"><span>Depth SNR</span><span>-</span></div>
+    <div class="metric"><span>Period SDE</span><span>-</span></div>
+    <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
+    <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
+    <div class="metric"><span>JD start</span><span>-</span></div>
+    <div class="metric"><span>Median flux</span><span>-</span></div>
+    <div class="metric"><span>Noise</span><span>-</span></div>
+  `;
+  periodCandidatesEl.innerHTML = `
+    <div class="warning-item info">
+      <strong>No candidates yet</strong>
+      <span>Period search results appear after analysis.</span>
+    </div>
+  `;
+  warningsEl.innerHTML = `
+    <div class="warning-item info">
+      <strong>No analysis yet</strong>
+      <span>Candidate checks appear after upload.</span>
+    </div>
+  `;
+  rowsEl.innerHTML = '<tr><td colspan="10" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>';
+  updateChartHeading();
+  syncEditButton();
+  syncExportButtons();
+  drawChart();
+}
+
+function appendDetectionOptions(formData, options) {
+  formData.append('strictness', options.strictness);
+  formData.append('smoothing', options.smoothing);
+  if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
+  if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
+  if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
+  if (options.minPeriod !== null) formData.append('minPeriod', options.minPeriod);
+  if (options.maxPeriod !== null) formData.append('maxPeriod', options.maxPeriod);
+}
+
+async function analyzeFile(file, options) {
+  const formData = new FormData();
+  formData.append('datafile', file);
+  appendDetectionOptions(formData, options);
+  const response = await fetch('/analyze', { method: 'POST', body: formData });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || 'Analysis failed.');
+  payload.source_file = file.name;
+  payload.original_period = payload.period;
+  payload.original_period_method = payload.period_method;
+  payload.boxesEdited = false;
+  return payload;
+}
+
+function selectBatchResult(index) {
+  const item = batchResults[index];
+  if (!item || !item.result) return;
+  currentBatchIndex = index;
+  selectedFile = item.file;
+  currentResult = item.result;
+  currentViewport = null;
+  selectedTransitIndex = null;
+  boxDragState = null;
+  transitBoxCache = [];
+  editBoxesEnabled = false;
+  renderBatchSelect();
+  renderResult(currentResult);
+  setStatus(`Showing ${item.file.name}.`);
+}
+
+fileInput.addEventListener('change', () => setFiles(fileInput.files));
+[strictnessInput, smoothingInput].forEach(input => {
+  input.addEventListener('input', () => {
+    updateDetectionReadouts();
+    markDetectionControlsChanged();
+  });
+});
+[minDepthInput, minDurationInput, maxDurationInput, minPeriodInput, maxPeriodInput].forEach(input => {
+  input.addEventListener('change', markDetectionControlsChanged);
+});
+resetDetectionButton.addEventListener('click', () => {
+  resetDetectionControls();
+  markDetectionControlsChanged();
+});
+updateDetectionReadouts();
+
+['dragenter', 'dragover'].forEach(name => {
+  dropzone.addEventListener(name, event => {
+    event.preventDefault();
+    dropzone.classList.add('dragging');
+  });
+});
+
+['dragleave', 'drop'].forEach(name => {
+  dropzone.addEventListener(name, event => {
+    event.preventDefault();
+    dropzone.classList.remove('dragging');
+  });
+});
+
+dropzone.addEventListener('drop', event => {
+  if (event.dataTransfer.files.length) {
+    fileInput.files = event.dataTransfer.files;
+    setFiles(event.dataTransfer.files);
+  }
+});
+
+analyzeButton.addEventListener('click', async () => {
+  if (!selectedFiles.length) return;
+  const filesToAnalyze = selectedFiles.slice(0, MAX_BATCH_FILES);
+  const options = detectionOptions();
+  setStatus(`Analyzing 1/${filesToAnalyze.length}: ${filesToAnalyze[0].name}`);
+  analyzeButton.disabled = true;
+  batchInProgress = true;
+  batchResults = [];
+  currentBatchIndex = -1;
+  renderBatchSelect();
+  clearResultView();
+  try {
+    for (let index = 0; index < filesToAnalyze.length; index++) {
+      const file = filesToAnalyze[index];
+      setStatus(`Analyzing ${index + 1}/${filesToAnalyze.length}: ${file.name}`);
+      try {
+        const result = await analyzeFile(file, options);
+        batchResults.push({ file, result, error: null });
+        if (currentBatchIndex === -1) {
+          selectBatchResult(batchResults.length - 1);
+        } else {
+          renderBatchSelect();
+        }
+      } catch (error) {
+        batchResults.push({ file, result: null, error: error.message });
+        renderBatchSelect();
+      }
+    }
+
+    const successCount = batchResults.filter(item => item.result).length;
+    const failureCount = batchResults.length - successCount;
+    if (successCount && currentBatchIndex === -1) {
+      const firstSuccessIndex = batchResults.findIndex(item => item.result);
+      selectBatchResult(firstSuccessIndex);
+    }
+    setStatus(
+      failureCount
+        ? `Batch complete: ${successCount}/${batchResults.length} processed, ${failureCount} failed.`
+        : `Batch complete: ${successCount}/${batchResults.length} processed.`
+    , failureCount > 0 && successCount === 0);
+  } finally {
+    batchInProgress = false;
+    analyzeButton.disabled = !selectedFiles.length;
+    renderBatchSelect();
+  }
+});
+
+resultSelect.addEventListener('change', () => {
+  selectBatchResult(Number(resultSelect.value));
+});
+
+viewButtons.forEach(button => {
+  button.addEventListener('click', () => {
+    currentView = button.dataset.view;
+    currentViewport = null;
+    viewButtons.forEach(item => item.classList.toggle('active', item === button));
+    updateChartHeading();
+    syncEditButton();
+    drawChart();
+  });
+});
+
+editBoxesButton.addEventListener('click', () => {
+  editBoxesEnabled = !editBoxesEnabled;
+  if (!editBoxesEnabled) selectedTransitIndex = null;
+  syncEditButton();
+  renderTransitRows();
+  drawChart();
+});
+
+function hasPhaseFold() {
+  return Boolean(currentResult && currentResult.phase_folded && currentResult.phase_folded.phase.length);
+}
+
+function updateChartHeading() {
+  if (!currentResult) {
+    chartTitleEl.textContent = 'Flux Over Time';
+    subtitleEl.textContent = 'Transit boxes appear after analysis.';
+    return;
+  }
+
+  if (currentView === 'phase') {
+    chartTitleEl.textContent = 'Phase-Folded Light Curve';
+    if (hasPhaseFold()) {
+      subtitleEl.textContent = `${currentResult.phase_folded.phase.length.toLocaleString()} folded points centered on phase 0 using a ${fmt(currentResult.phase_folded.period)} day period.`;
+    } else {
+      subtitleEl.textContent = 'Phase folding needs a detected orbital period.';
+    }
+    return;
+  }
+
+  chartTitleEl.textContent = 'Flux Over Time';
+  subtitleEl.textContent = `${currentResult.plot.time.length.toLocaleString()} plotted points shown from ${currentResult.total_points.toLocaleString()} total samples. Time is shown as Julian days since JD ${fmt(currentResult.time_reference, 5)}.`;
+}
+
+function estimatePeriodFromTransitBoxes() {
+  const centers = currentResult.transits
+    .map(transit => Number(transit.center))
+    .filter(value => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (centers.length < 2) return { period: null, scatter: null, count: 0 };
+
+  const originalPeriod = Number(currentResult.original_period ?? currentResult.period);
+  let periodSamples = [];
+  if (Number.isFinite(originalPeriod) && originalPeriod > 0) {
+    for (let left = 0; left < centers.length; left++) {
+      for (let right = left + 1; right < centers.length; right++) {
+        const gap = centers[right] - centers[left];
+        const cycles = Math.round(gap / originalPeriod);
+        if (cycles < 1) continue;
+        const normalizedGap = gap / cycles;
+        if (Math.abs(normalizedGap - originalPeriod) / originalPeriod <= 0.3) {
+          periodSamples.push(normalizedGap);
+        }
+      }
+    }
+  }
+
+  if (!periodSamples.length) {
+    periodSamples = centers.slice(1).map((center, index) => center - centers[index]);
+  }
+
+  const period = average(periodSamples);
+  return {
+    period,
+    scatter: standardDeviation(periodSamples, period),
+    count: periodSamples.length,
+  };
+}
+
+function estimatePValueFromTransitBoxes() {
+  if (!currentResult || !currentResult.transits.length) return null;
+  const times = currentResult.plot.time;
+  const flux = currentResult.plot.smooth_flux;
+  const usableFlux = [];
+  const inTransit = [];
+
+  for (let i = 0; i < times.length; i++) {
+    const value = Number(flux[i]);
+    if (!Number.isFinite(value)) continue;
+    usableFlux.push(value);
+    inTransit.push(currentResult.transits.some(transit => times[i] >= transit.start && times[i] <= transit.end));
+  }
+
+  const inValues = usableFlux.filter((value, index) => inTransit[index]);
+  const outValues = usableFlux.filter((value, index) => !inTransit[index]);
+  if (inValues.length < 3 || outValues.length < 3) return null;
+
+  const baseline = average(usableFlux);
+  const flatResiduals = usableFlux.map(value => value - baseline);
+  const residualMedian = median(flatResiduals) ?? 0;
+  const mad = median(flatResiduals.map(value => Math.abs(value - residualMedian))) ?? 0;
+  const sigma = Math.max(1.4826 * mad, standardDeviation(flatResiduals, 0) ?? 0, 1e-9);
+  const inLevel = average(inValues);
+  const outLevel = average(outValues);
+  if (inLevel === null || outLevel === null || inLevel >= outLevel) return null;
+
+  const chiFlat = usableFlux.reduce((sum, value) => sum + ((value - baseline) / sigma) ** 2, 0);
+  const chiBox = usableFlux.reduce((sum, value, index) => {
+    const model = inTransit[index] ? inLevel : outLevel;
+    return sum + ((value - model) / sigma) ** 2;
+  }, 0);
+  const delta = Math.max(0, chiFlat - chiBox);
+  return {
+    pValue: chiSquareOneDegreePValue(delta),
+    deltaChiSquared: delta,
+  };
+}
+
+function currentAnalysisMetrics() {
+  const depthFractions = currentResult.transits
+    .map(transit => Number(transit.depth_fraction))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const radiusRatios = currentResult.transits
+    .map(transit => Number(transit.radius_ratio))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const metrics = {
+    period: currentResult.period,
+    periodMethod: currentResult.period_method,
+    periodScatter: currentResult.period_scatter,
+    periodMatchCount: currentResult.period_match_count,
+    pValue: currentResult.p_value,
+    deltaChiSquared: currentResult.delta_chi_squared,
+    reducedChiSquared: currentResult.reduced_chi_squared_box,
+    periodSde: currentResult.period_sde,
+    medianDepthFraction: median(depthFractions),
+    medianRadiusRatio: median(radiusRatios),
+    detectionSnr: currentResult.detection_snr,
+    oddEvenDepthMismatch: currentResult.odd_even_depth_mismatch,
+    depthScatterRatio: currentResult.depth_scatter_ratio,
+  };
+
+  if (currentResult.boxesEdited) {
+    const periodStats = estimatePeriodFromTransitBoxes();
+    if (periodStats.period !== null) {
+      metrics.period = periodStats.period;
+      metrics.periodMethod = 'edited boxes';
+      metrics.periodScatter = periodStats.scatter;
+      metrics.periodMatchCount = periodStats.count;
+    }
+
+    const pValueStats = estimatePValueFromTransitBoxes();
+    if (pValueStats && pValueStats.pValue !== null) {
+      metrics.pValue = pValueStats.pValue;
+      metrics.deltaChiSquared = pValueStats.deltaChiSquared;
+    }
+  }
+
+  return metrics;
+}
+
+function currentWarnings(metrics = currentAnalysisMetrics()) {
+  if (!currentResult) return [];
+  const transits = currentResult.transits || [];
+  const warnings = [];
+  const depths = transits
+    .map(transit => Number(transit.depth_ppm ?? transit.depth))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const rawDepths = transits
+    .map(transit => Number(transit.depth))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const radii = transits
+    .map(transit => Number(transit.radius_ratio))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const points = transits
+    .map(transit => Number(transit.points))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const oddDepths = depths.filter((_, index) => index % 2 === 0);
+  const evenDepths = depths.filter((_, index) => index % 2 === 1);
+  const oddMedian = median(oddDepths);
+  const evenMedian = median(evenDepths);
+  const depthCenter = median(depths);
+  const depthScatterRatio = coefficientOfVariation(depths);
+  const oddEvenMismatch = (
+    oddMedian !== null && evenMedian !== null && Math.max(oddMedian, evenMedian) > 0
+  ) ? Math.abs(oddMedian - evenMedian) / Math.max(oddMedian, evenMedian) : null;
+  const rawDepthCenter = median(rawDepths);
+  const snr = currentResult.boxesEdited || !Number.isFinite(Number(metrics.detectionSnr)) ? (
+    rawDepthCenter !== null && Number.isFinite(Number(currentResult.robust_noise)) && currentResult.robust_noise > 0
+      ? rawDepthCenter / currentResult.robust_noise
+      : null
+  ) : Number(metrics.detectionSnr);
+  const medianPoints = median(points);
+  const maxRadius = radii.length ? Math.max(...radii) : null;
+
+  if (!transits.length) {
+    warnings.push({
+      severity: 'caution',
+      title: 'No transit candidates',
+      detail: 'Try lowering strictness or checking the input columns and flux units.',
+    });
+  }
+  if (transits.length > 0 && transits.length < 3) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Few observed transits',
+      detail: 'A single event or pair of events is harder to separate from systematics.',
+    });
+  }
+  if (metrics.period === null || metrics.period === undefined) {
+    warnings.push({
+      severity: 'caution',
+      title: 'No stable period',
+      detail: 'The app could not estimate a repeating orbital period.',
+    });
+  }
+  if (metrics.periodMethod && metrics.periodMethod !== 'BLS') {
+    warnings.push({
+      severity: 'info',
+      title: 'Period is provisional',
+      detail: `Period came from ${metrics.periodMethod}, not a BLS peak.`,
+    });
+  }
+  if (metrics.pValue !== null && metrics.pValue !== undefined && metrics.pValue > 0.01) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Weak model significance',
+      detail: 'The box model is not much better than a flat light curve by the current chi-squared estimate.',
+    });
+  }
+  if (snr !== null && snr < 7) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Low depth SNR',
+      detail: `Median transit depth is about ${fmt(snr, 2)}x the robust noise.`,
+    });
+  }
+  if (oddEvenMismatch !== null && oddEvenMismatch > 0.5 && oddDepths.length >= 2 && evenDepths.length >= 2) {
+    warnings.push({
+      severity: 'danger',
+      title: 'Odd/even depth mismatch',
+      detail: 'Alternating transit depths can indicate an eclipsing binary or blended source.',
+    });
+  }
+  if (depthScatterRatio !== null && depthScatterRatio > 0.8 && depths.length >= 4) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Inconsistent transit depths',
+      detail: 'Detected depths vary substantially across events.',
+    });
+  }
+  if (maxRadius !== null && maxRadius > 0.2) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Large radius ratio',
+      detail: 'Rp/Rs above 0.2 is large for many planet candidates and deserves closer inspection.',
+    });
+  }
+  if (medianPoints !== null && medianPoints < 4) {
+    warnings.push({
+      severity: 'info',
+      title: 'Sparse transit sampling',
+      detail: 'Some events have very few points inside the detected box.',
+    });
+  }
+  return warnings;
+}
+
+function renderWarnings() {
+  if (!currentResult) return;
+  const warnings = currentWarnings();
+  if (!warnings.length) {
+    warningsEl.innerHTML = `
+      <div class="warning-item info">
+        <strong>No major warnings</strong>
+        <span>These checks are heuristic and do not prove the candidate is planetary.</span>
+      </div>
+    `;
+    return;
+  }
+  warningsEl.innerHTML = warnings.map(warning => `
+    <div class="warning-item ${warning.severity}">
+      <strong>${warning.title}</strong>
+      <span>${warning.detail}</span>
+    </div>
+  `).join('');
+}
+
+function renderPeriodCandidates() {
+  if (!currentResult) return;
+  const candidates = (currentResult.period_candidates || []).slice(0, 5);
+  if (!candidates.length) {
+    periodCandidatesEl.innerHTML = `
+      <div class="warning-item info">
+        <strong>No period grid</strong>
+        <span>Only candidate-box spacing is available for this run.</span>
+      </div>
+    `;
+    return;
+  }
+  periodCandidatesEl.innerHTML = candidates.map((candidate, index) => `
+    <div class="warning-item ${index === 0 ? 'info' : 'caution'}">
+      <strong>${fmt(candidate.period, 4)} days</strong>
+      <span>Power ${fmt(candidate.power, 2)}${candidate.sde === null || candidate.sde === undefined ? '' : `, SDE ${fmt(candidate.sde, 2)}`}</span>
+    </div>
+  `).join('');
+}
+
+function renderMetrics() {
+  if (!currentResult) return;
+  const metrics = currentAnalysisMetrics();
+  const period = metrics.period === null || metrics.period === undefined
+    ? 'Not enough transits'
+    : `${fmt(metrics.period)} days${metrics.periodMethod ? ` (${metrics.periodMethod})` : ''}`;
+
+  metricsEl.innerHTML = `
+    <div class="metric"><span>Data points</span><span>${currentResult.total_points.toLocaleString()}</span></div>
+    <div class="metric"><span>Transits</span><span>${currentResult.transits.length}</span></div>
+    <div class="metric"><span>Orbital period</span><span>${period}</span></div>
+    <div class="metric"><span>Median depth</span><span>${fmtDepthPercent(metrics.medianDepthFraction)} / ${fmtPpm(metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000)} ppm</span></div>
+    <div class="metric"><span>Radius ratio</span><span>${fmt(metrics.medianRadiusRatio)}</span></div>
+    <div class="metric"><span>Depth SNR</span><span>${fmt(metrics.detectionSnr, 2)}</span></div>
+    <div class="metric"><span>Period SDE</span><span>${fmt(metrics.periodSde, 2)}</span></div>
+    <div class="metric"><span>Chi-sq p-value</span><span>${fmtPercent(metrics.pValue)}</span></div>
+    <div class="metric"><span>Reduced chi-sq</span><span>${fmt(metrics.reducedChiSquared, 3)}</span></div>
+    <div class="metric"><span>JD start</span><span>${fmt(currentResult.time_reference, 5)}</span></div>
+    <div class="metric"><span>Median flux</span><span>${fmt(currentResult.median_flux)}</span></div>
+    <div class="metric"><span>Noise</span><span>${fmt(currentResult.robust_noise)}</span></div>
+  `;
+  renderPeriodCandidates();
+  renderWarnings();
+}
+
+function renderResult(result) {
+  emptyEl.style.display = 'none';
+  renderMetrics();
+  updateChartHeading();
+  syncEditButton();
+  syncExportButtons();
+  renderTransitRows();
+  drawChart();
+}
+
+function renderTransitRows() {
+  if (!currentResult) return;
+  rowsEl.innerHTML = currentResult.transits.length ? currentResult.transits.map((t, index) => `
+    <tr data-transit-index="${index}" class="${index === selectedTransitIndex ? 'selected' : ''}">
+      <td>Transit ${index + 1}</td>
+      <td>${fmt(t.start)}</td>
+      <td>${fmt(t.center)}</td>
+      <td>${fmt(t.end)}</td>
+      <td>${fmt(t.duration)}</td>
+      <td>${fmt(t.depth)}</td>
+      <td>${fmtDepthPercent(t.depth_fraction)}</td>
+      <td>${fmtPpm(t.depth_ppm)}</td>
+      <td>${fmt(t.radius_ratio)}</td>
+      <td>${t.points}</td>
+    </tr>
+  `).join('') : '<tr><td colspan="10" style="text-align:left;color:#60656f;">No statistically strong transit candidates found.</td></tr>';
+}
+
+rowsEl.addEventListener('click', event => {
+  const row = event.target.closest('tr[data-transit-index]');
+  if (!row || !currentResult) return;
+  selectedTransitIndex = Number(row.dataset.transitIndex);
+  renderTransitRows();
+  drawChart();
+});
+
+function exportBaseName() {
+  const fileStem = selectedFile
+    ? selectedFile.name.replace(/\.[^/.]+$/, '')
+    : 'transit-analysis';
+  const safeStem = fileStem.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '');
+  return safeStem || 'transit-analysis';
+}
+
+function downloadBlob(content, filename, type) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function transitRowsForExport() {
+  return currentResult.transits.map((transit, index) => ({
+    transit: index + 1,
+    start_day: transit.start,
+    center_day: transit.center,
+    end_day: transit.end,
+    start_jd: currentResult.time_reference + transit.start,
+    center_jd: currentResult.time_reference + transit.center,
+    end_jd: currentResult.time_reference + transit.end,
+    duration_days: transit.duration,
+    depth: transit.depth,
+    depth_fraction: transit.depth_fraction,
+    depth_percent: transit.depth_percent,
+    depth_ppm: transit.depth_ppm,
+    radius_ratio: transit.radius_ratio,
+    depth_basis: transit.depth_basis,
+    points: transit.points,
+    manually_edited: Boolean(transit.manually_edited),
+  }));
+}
+
+function exportTransitCsv() {
+  if (!currentResult) return;
+  const rows = transitRowsForExport();
+  const headers = [
+    'transit',
+    'start_day',
+    'center_day',
+    'end_day',
+    'start_jd',
+    'center_jd',
+    'end_jd',
+    'duration_days',
+    'depth',
+    'depth_fraction',
+    'depth_percent',
+    'depth_ppm',
+    'radius_ratio',
+    'depth_basis',
+    'points',
+    'manually_edited',
+  ];
+  const csv = [
+    headers.join(','),
+    ...rows.map(row => headers.map(header => csvCell(row[header])).join(',')),
+  ].join('\n');
+  downloadBlob(csv, `${exportBaseName()}-transits.csv`, 'text/csv;charset=utf-8');
+  setStatus('Transit CSV exported.');
+}
+
+function summaryForExport() {
+  const metrics = currentAnalysisMetrics();
+  const warnings = currentWarnings(metrics);
+  return {
+    exported_at: new Date().toISOString(),
+    source_file: selectedFile ? selectedFile.name : null,
+    chart_view: currentView,
+    total_points: currentResult.total_points,
+    time_reference_jd: currentResult.time_reference,
+    time_unit: currentResult.time_unit,
+    flux_unit: currentResult.flux_unit,
+    normalization: currentResult.normalization,
+    detection_options: currentResult.detection_options,
+    boxes_edited: Boolean(currentResult.boxesEdited),
+    warnings,
+    diagnostics: {
+      detection_snr: metrics.detectionSnr,
+      odd_even_depth_mismatch: metrics.oddEvenDepthMismatch,
+      depth_scatter_ratio: metrics.depthScatterRatio,
+    },
+    metrics: {
+      transit_count: currentResult.transits.length,
+      orbital_period_days: metrics.period,
+      orbital_period_method: metrics.periodMethod,
+      orbital_period_scatter: metrics.periodScatter,
+      period_sample_count: metrics.periodMatchCount,
+      median_depth_fraction: metrics.medianDepthFraction,
+      median_depth_percent: metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 100,
+      median_depth_ppm: metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000,
+      median_radius_ratio: metrics.medianRadiusRatio,
+      chi_square_p_value: metrics.pValue,
+      chi_square_p_value_percent: metrics.pValue === null || metrics.pValue === undefined ? null : metrics.pValue * 100,
+      delta_chi_squared: metrics.deltaChiSquared,
+      reduced_chi_squared: metrics.reducedChiSquared,
+      detection_snr: metrics.detectionSnr,
+      period_sde: metrics.periodSde,
+      median_flux: currentResult.median_flux,
+      robust_noise: currentResult.robust_noise,
+    },
+    period_candidates: currentResult.period_candidates || [],
+    period_search: currentResult.period_search || null,
+    transits: transitRowsForExport(),
+  };
+}
+
+function metricsForResult(result) {
+  const previousResult = currentResult;
+  currentResult = result;
+  try {
+    return currentAnalysisMetrics();
+  } finally {
+    currentResult = previousResult;
+  }
+}
+
+const analysisPdfColumns = [
+  { key: 'file', label: 'File', width: 150, align: 'left' },
+  { key: 'points', label: 'Data points', width: 55, align: 'right' },
+  { key: 'transits', label: 'Transits', width: 45, align: 'right' },
+  { key: 'period', label: 'Period d', width: 70, align: 'right' },
+  { key: 'method', label: 'Method', width: 55, align: 'left' },
+  { key: 'depthPercent', label: 'Depth %', width: 60, align: 'right' },
+  { key: 'depthPpm', label: 'Depth ppm', width: 65, align: 'right' },
+  { key: 'radiusRatio', label: 'Rp/Rs', width: 50, align: 'right' },
+  { key: 'snr', label: 'Depth SNR', width: 55, align: 'right' },
+  { key: 'sde', label: 'Period SDE', width: 55, align: 'right' },
+  { key: 'pValue', label: 'Chi-sq p %', width: 65, align: 'right' },
+  { key: 'reducedChi', label: 'Red chi-sq', width: 60, align: 'right' },
+  { key: 'jdStart', label: 'JD start', width: 75, align: 'right' },
+  { key: 'medianFlux', label: 'Med flux', width: 60, align: 'right' },
+  { key: 'noise', label: 'Noise', width: 60, align: 'right' },
+];
+
+function analysisPdfRow(fileName, result) {
+  const metrics = metricsForResult(result);
+  const depthPpm = metrics.medianDepthFraction === null || metrics.medianDepthFraction === undefined
+    ? null
+    : metrics.medianDepthFraction * 1000000;
+  const pValuePercent = metrics.pValue === null || metrics.pValue === undefined
+    ? null
+    : metrics.pValue * 100;
+  return {
+    file: fileName || result.source_file || 'analysis',
+    points: result.total_points.toLocaleString(),
+    transits: result.transits.length.toString(),
+    period: fmt(metrics.period, 6),
+    method: metrics.periodMethod || '-',
+    depthPercent: fmtDepthPercent(metrics.medianDepthFraction),
+    depthPpm: fmtPpm(depthPpm),
+    radiusRatio: fmt(metrics.medianRadiusRatio, 6),
+    snr: fmt(metrics.detectionSnr, 2),
+    sde: fmt(metrics.periodSde, 2),
+    pValue: pValuePercent === null ? '-' : `${fmt(pValuePercent, 6)}%`,
+    reducedChi: fmt(metrics.reducedChiSquared, 3),
+    jdStart: fmt(result.time_reference, 5),
+    medianFlux: fmt(result.median_flux, 6),
+    noise: fmt(result.robust_noise, 6),
+  };
+}
+
+function pdfSafeText(value) {
+  return String(value ?? '-')
+    .replace(/[^\x20-\x7E]/g, '?')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+function fitPdfText(value, maxChars) {
+  const text = String(value ?? '-').replace(/\s+/g, ' ').trim();
+  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}...` : text;
+}
+
+function pdfText(x, y, text, size = 7, font = 'F1') {
+  return `BT /${font} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${pdfSafeText(text)}) Tj ET\n`;
+}
+
+function pdfLine(x1, y1, x2, y2) {
+  return `${x1.toFixed(2)} ${y1.toFixed(2)} m ${x2.toFixed(2)} ${y2.toFixed(2)} l S\n`;
+}
+
+function pdfRect(x, y, width, height) {
+  return `${x.toFixed(2)} ${y.toFixed(2)} ${width.toFixed(2)} ${height.toFixed(2)} re S\n`;
+}
+
+function buildPdfBlob(pageContents, pageWidth, pageHeight) {
+  const objects = [null];
+  objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  objects[2] = '';
+  objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+  const pageIds = [];
+
+  pageContents.forEach(content => {
+    const contentId = objects.length;
+    objects.push(`<< /Length ${content.length} >>\nstream\n${content}endstream`);
+    const pageId = objects.length;
+    pageIds.push(pageId);
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`);
+  });
+
+  objects[2] = `<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] /Count ${pageIds.length} >>`;
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let index = 1; index < objects.length; index++) {
+    offsets[index] = pdf.length;
+    pdf += `${index} 0 obj\n${objects[index]}\nendobj\n`;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+  for (let index = 1; index < objects.length; index++) {
+    pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  return new Blob([pdf], { type: 'application/pdf' });
+}
+
+function buildAnalysisPdf(rows, title) {
+  const pageWidth = 1224;
+  const pageHeight = 792;
+  const margin = 24;
+  const tableWidth = analysisPdfColumns.reduce((sum, column) => sum + column.width, 0);
+  const rowHeight = 22;
+  const headerHeight = 24;
+  const rowsPerPage = Math.max(1, Math.floor((pageHeight - 96 - headerHeight) / rowHeight));
+  const pages = [];
+  const pageCount = Math.max(1, Math.ceil(rows.length / rowsPerPage));
+
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+    const pageRows = rows.slice(pageIndex * rowsPerPage, (pageIndex + 1) * rowsPerPage);
+    let content = '0.8 w\n';
+    const titleY = pageHeight - margin - 12;
+    content += pdfText(margin, titleY, title, 13, 'F2');
+    content += pdfText(pageWidth - margin - 88, titleY, `Page ${pageIndex + 1}/${pageCount}`, 8, 'F1');
+    content += pdfText(margin, titleY - 16, `Generated ${new Date().toLocaleString()}`, 8, 'F1');
+
+    let y = pageHeight - margin - 54;
+    let x = margin;
+    content += pdfRect(margin, y - headerHeight + 4, tableWidth, headerHeight);
+    analysisPdfColumns.forEach(column => {
+      content += pdfLine(x, y + 4, x, y - headerHeight + 4);
+      content += pdfText(x + 3, y - 11, column.label, 7, 'F2');
+      x += column.width;
+    });
+    content += pdfLine(margin + tableWidth, y + 4, margin + tableWidth, y - headerHeight + 4);
+    y -= headerHeight;
+
+    pageRows.forEach(row => {
+      x = margin;
+      content += pdfRect(margin, y - rowHeight + 4, tableWidth, rowHeight);
+      analysisPdfColumns.forEach(column => {
+        const rawValue = row[column.key] ?? '-';
+        const maxChars = Math.max(4, Math.floor(column.width / 4.2));
+        const value = fitPdfText(rawValue, maxChars);
+        const textWidth = value.length * 3.7;
+        const textX = column.align === 'right'
+          ? Math.max(x + 3, x + column.width - textWidth - 4)
+          : x + 3;
+        content += pdfLine(x, y + 4, x, y - rowHeight + 4);
+        content += pdfText(textX, y - 10, value, 7, 'F1');
+        x += column.width;
+      });
+      content += pdfLine(margin + tableWidth, y + 4, margin + tableWidth, y - rowHeight + 4);
+      y -= rowHeight;
+    });
+
+    pages.push(content);
+  }
+
+  return buildPdfBlob(pages, pageWidth, pageHeight);
+}
+
+function successfulBatchItems() {
+  return batchResults.filter(item => item.result);
+}
+
+function exportAnalysisPdf() {
+  if (!currentResult) return;
+  const fileName = selectedFile ? selectedFile.name : currentResult.source_file;
+  const rows = [analysisPdfRow(fileName, currentResult)];
+  const pdf = buildAnalysisPdf(rows, 'Transit Finder Analysis');
+  downloadBlob(pdf, `${exportBaseName()}-analysis.pdf`, 'application/pdf');
+  setStatus('Analysis PDF exported.');
+}
+
+function exportBatchAnalysisPdf() {
+  const items = successfulBatchItems();
+  if (!items.length) return;
+  const rows = items.map(item => analysisPdfRow(item.file.name, item.result));
+  const pdf = buildAnalysisPdf(rows, 'Transit Finder Batch Analysis');
+  downloadBlob(pdf, `${exportBaseName()}-batch-analysis.pdf`, 'application/pdf');
+  setStatus(`Batch analysis PDF exported for ${rows.length} file${rows.length === 1 ? '' : 's'}.`);
+}
+
+function exportSummaryJson() {
+  if (!currentResult) return;
+  downloadBlob(
+    JSON.stringify(summaryForExport(), null, 2),
+    `${exportBaseName()}-summary.json`,
+    'application/json;charset=utf-8'
+  );
+  setStatus('Summary JSON exported.');
+}
+
+function exportGraphPng() {
+  if (!currentResult) return;
+  drawChart();
+  canvas.toBlob(blob => {
+    if (!blob) {
+      setStatus('Graph PNG export failed.', true);
+      return;
+    }
+    downloadBlob(blob, `${exportBaseName()}-${currentView}-graph.png`, 'image/png');
+    setStatus('Graph PNG exported.');
+  }, 'image/png');
+}
+
+exportCsvButton.addEventListener('click', exportTransitCsv);
+exportPngButton.addEventListener('click', exportGraphPng);
+exportJsonButton.addEventListener('click', exportSummaryJson);
+exportAnalysisPdfButton.addEventListener('click', exportAnalysisPdf);
+exportBatchPdfButton.addEventListener('click', exportBatchAnalysisPdf);
+
+function resizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+  canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+
+function getChartGeometry() {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  return {
+    width,
+    height,
+    pad: chartPad,
+    innerW: Math.max(1, width - chartPad.left - chartPad.right),
+    innerH: Math.max(1, height - chartPad.top - chartPad.bottom),
+  };
+}
+
+function getInitialDomain() {
+  if (!currentResult) return null;
+  if (currentView === 'phase') {
+    if (!hasPhaseFold()) return null;
+    const phaseDomain = currentResult.phase_folded.focus_domain || currentResult.phase_folded.domain;
+    return {
+      xMin: phaseDomain.time_min,
+      xMax: phaseDomain.time_max,
+      yMin: phaseDomain.flux_min,
+      yMax: phaseDomain.flux_max,
+    };
+  }
+  const zoomReady = currentView === 'zoom' && currentResult.zoom_domain;
+  const yDomain = zoomReady ? currentResult.zoom_domain : (currentView === 'raw' ? currentResult.raw_domain : currentResult.clean_domain);
+  return {
+    xMin: zoomReady ? currentResult.zoom_domain.time_min : currentResult.domain.time_min,
+    xMax: zoomReady ? currentResult.zoom_domain.time_max : currentResult.domain.time_max,
+    yMin: yDomain.flux_min,
+    yMax: yDomain.flux_max,
+  };
+}
+
+function getLimitDomain() {
+  if (!currentResult) return null;
+  if (currentView === 'phase') {
+    if (!hasPhaseFold()) return null;
+    const phaseDomain = currentResult.phase_folded.domain;
+    return {
+      xMin: phaseDomain.time_min,
+      xMax: phaseDomain.time_max,
+      yMin: phaseDomain.flux_min,
+      yMax: phaseDomain.flux_max,
+    };
+  }
+  const yDomain = currentView === 'raw' ? currentResult.raw_domain : currentResult.clean_domain;
+  return {
+    xMin: currentResult.domain.time_min,
+    xMax: currentResult.domain.time_max,
+    yMin: yDomain.flux_min,
+    yMax: yDomain.flux_max,
+  };
+}
+
+function cloneDomain(domain) {
+  return { xMin: domain.xMin, xMax: domain.xMax, yMin: domain.yMin, yMax: domain.yMax };
+}
+
+function clampRange(min, max, limitMin, limitMax) {
+  const limitSpan = Math.max(1e-12, limitMax - limitMin);
+  let span = Math.max(1e-12, max - min);
+  const minSpan = limitSpan * 0.0005;
+  if (span < minSpan) {
+    const center = (min + max) / 2;
+    span = minSpan;
+    min = center - span / 2;
+    max = center + span / 2;
+  }
+  if (span >= limitSpan) return [limitMin, limitMax];
+  if (min < limitMin) {
+    max += limitMin - min;
+    min = limitMin;
+  }
+  if (max > limitMax) {
+    min -= max - limitMax;
+    max = limitMax;
+  }
+  return [min, max];
+}
+
+function clampViewport(viewport) {
+  const limit = getLimitDomain();
+  if (!limit) return viewport;
+  const [xMin, xMax] = clampRange(viewport.xMin, viewport.xMax, limit.xMin, limit.xMax);
+  const [yMin, yMax] = clampRange(viewport.yMin, viewport.yMax, limit.yMin, limit.yMax);
+  return { xMin, xMax, yMin, yMax };
+}
+
+function getViewport() {
+  if (!currentViewport) {
+    const initial = getInitialDomain();
+    if (!initial) return null;
+    currentViewport = clampViewport(cloneDomain(initial));
+  }
+  return currentViewport;
+}
+
+function pointerPosition(event) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
+}
+
+function clampPointerToPlot(point) {
+  const geo = getChartGeometry();
+  return {
+    x: Math.min(geo.width - geo.pad.right, Math.max(geo.pad.left, point.x)),
+    y: Math.min(geo.height - geo.pad.bottom, Math.max(geo.pad.top, point.y)),
+  };
+}
+
+function dataAtCanvasPoint(point, viewport) {
+  const geo = getChartGeometry();
+  const clamped = clampPointerToPlot(point);
+  const xRatio = (clamped.x - geo.pad.left) / geo.innerW;
+  const yRatio = (clamped.y - geo.pad.top) / geo.innerH;
+  return {
+    x: viewport.xMin + xRatio * (viewport.xMax - viewport.xMin),
+    y: viewport.yMax - yRatio * (viewport.yMax - viewport.yMin),
+  };
+}
+
+function zoomAtPointer(scale, axis = 'both') {
+  const viewport = getViewport();
+  if (!viewport) return;
+  const geo = getChartGeometry();
+  const point = lastPointer || {
+    x: geo.pad.left + geo.innerW / 2,
+    y: geo.pad.top + geo.innerH / 2,
+  };
+  const anchor = dataAtCanvasPoint(point, viewport);
+  currentViewport = clampViewport({
+    xMin: axis === 'y' ? viewport.xMin : anchor.x - (anchor.x - viewport.xMin) * scale,
+    xMax: axis === 'y' ? viewport.xMax : anchor.x + (viewport.xMax - anchor.x) * scale,
+    yMin: axis === 'x' ? viewport.yMin : anchor.y - (anchor.y - viewport.yMin) * scale,
+    yMax: axis === 'x' ? viewport.yMax : anchor.y + (viewport.yMax - anchor.y) * scale,
+  });
+  drawChart();
+}
+
+function transitFluxRange(transit, flux) {
+  if (Number.isFinite(transit.flux_min) && Number.isFinite(transit.flux_max)) {
+    const padding = Math.max((transit.flux_max - transit.flux_min) * 0.14, Math.abs(transit.depth || 0) * 0.04, 1e-9);
+    return { low: transit.flux_min - padding, high: transit.flux_max + padding };
+  }
+  let low = Infinity;
+  let high = -Infinity;
+  let count = 0;
+  for (let i = 0; i < currentResult.plot.time.length; i++) {
+    const time = currentResult.plot.time[i];
+    if (time < transit.start || time > transit.end) continue;
+    const value = flux[i];
+    if (!Number.isFinite(value)) continue;
+    low = Math.min(low, value);
+    high = Math.max(high, value);
+    count += 1;
+  }
+  if (!count) return null;
+  const padding = Math.max((high - low) * 0.22, Math.abs(transit.depth || 0) * 0.08, 1e-9);
+  return { low: low - padding, high: high + padding };
+}
+
+function minimumTransitDuration() {
+  if (!currentResult) return 1e-6;
+  const span = Math.max(1e-9, currentResult.domain.time_max - currentResult.domain.time_min);
+  return Math.max(span * 0.00025, 1e-6);
+}
+
+function applyDepthMetrics(transit, baseline) {
+  if (!transit || !Number.isFinite(Number(transit.depth)) || Number(transit.depth) < 0) {
+    transit.depth_fraction = null;
+    transit.depth_percent = null;
+    transit.depth_ppm = null;
+    transit.radius_ratio = null;
+    transit.depth_basis = null;
+    return;
+  }
+  const depth = Number(transit.depth);
+  const normalizedFraction = Number.isFinite(Number(baseline)) && baseline > 0
+    ? depth / Number(baseline)
+    : null;
+  const useNormalizedFlux = normalizedFraction !== null && normalizedFraction <= 0.5;
+  const depthFraction = useNormalizedFlux ? normalizedFraction : depth / 1000000;
+  transit.depth_fraction = depthFraction;
+  transit.depth_percent = depthFraction * 100;
+  transit.depth_ppm = depthFraction * 1000000;
+  transit.radius_ratio = Math.sqrt(depthFraction);
+  transit.depth_basis = useNormalizedFlux ? 'fractional flux' : 'ppm flux';
+}
+
+function clampTransitBounds(start, end) {
+  const minDuration = minimumTransitDuration();
+  const domain = currentResult.domain;
+  start = Math.max(domain.time_min, Math.min(domain.time_max - minDuration, start));
+  end = Math.max(start + minDuration, Math.min(domain.time_max, end));
+  return { start, end };
+}
+
+function refreshTransitStats(transit) {
+  const times = currentResult.plot.time;
+  const flux = currentResult.plot.smooth_flux;
+  let low = Infinity;
+  let high = -Infinity;
+  let count = 0;
+  for (let i = 0; i < times.length; i++) {
+    if (times[i] < transit.start || times[i] > transit.end) continue;
+    const value = flux[i];
+    if (!Number.isFinite(value)) continue;
+    low = Math.min(low, value);
+    high = Math.max(high, value);
+    count += 1;
+  }
+  if (count > 0) {
+    transit.flux_min = low;
+    transit.flux_max = high;
+    transit.points = count;
+    const baseline = Number.isFinite(currentResult.median_flux) ? currentResult.median_flux : high;
+    transit.depth = Math.max(0, baseline - low);
+    applyDepthMetrics(transit, baseline);
+  }
+}
+
+function setTransitBounds(index, start, end) {
+  const transit = currentResult.transits[index];
+  if (!transit) return;
+  const bounds = clampTransitBounds(start, end);
+  transit.start = bounds.start;
+  transit.end = bounds.end;
+  transit.center = (bounds.start + bounds.end) / 2;
+  transit.duration = bounds.end - bounds.start;
+  transit.manually_edited = true;
+  currentResult.boxesEdited = true;
+  refreshTransitStats(transit);
+  renderMetrics();
+}
+
+function hitTestTransitBox(point) {
+  if (!canEditBoxes()) return null;
+  for (let i = transitBoxCache.length - 1; i >= 0; i--) {
+    const box = transitBoxCache[i];
+    const xMin = Math.min(box.x1, box.x2);
+    const xMax = Math.max(box.x1, box.x2);
+    const yMin = Math.min(box.y1, box.y2);
+    const yMax = Math.max(box.y1, box.y2);
+    if (point.x < xMin - 6 || point.x > xMax + 6 || point.y < yMin - 6 || point.y > yMax + 6) {
+      continue;
+    }
+    const leftDistance = Math.abs(point.x - xMin);
+    const rightDistance = Math.abs(point.x - xMax);
+    if (leftDistance <= 8) return { index: box.index, mode: 'left' };
+    if (rightDistance <= 8) return { index: box.index, mode: 'right' };
+    return { index: box.index, mode: 'move' };
+  }
+  return null;
+}
+
+function updateCanvasCursor(point = lastPointer) {
+  if (dragState) {
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
+  if (boxDragState) {
+    canvas.style.cursor = boxDragState.mode === 'move' ? 'move' : 'ew-resize';
+    return;
+  }
+  if (point && canEditBoxes()) {
+    const hit = hitTestTransitBox(point);
+    if (hit) {
+      canvas.style.cursor = hit.mode === 'move' ? 'move' : 'ew-resize';
+      return;
+    }
+  }
+  canvas.style.cursor = 'grab';
+}
+
+function drawNotice(message, width, height) {
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = '#60656f';
+  ctx.font = '700 14px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(message, width / 2, height / 2);
+}
+
+canvas.addEventListener('pointermove', event => {
+  lastPointer = pointerPosition(event);
+  if (boxDragState && currentResult) {
+    const pointData = dataAtCanvasPoint(lastPointer, boxDragState.viewport);
+    const original = boxDragState.original;
+    const minDuration = minimumTransitDuration();
+    if (boxDragState.mode === 'left') {
+      setTransitBounds(boxDragState.index, Math.min(pointData.x, original.end - minDuration), original.end);
+    } else if (boxDragState.mode === 'right') {
+      setTransitBounds(boxDragState.index, original.start, Math.max(pointData.x, original.start + minDuration));
+    } else {
+      const shift = pointData.x - boxDragState.anchorData.x;
+      let start = original.start + shift;
+      let end = original.end + shift;
+      if (start < currentResult.domain.time_min) {
+        end += currentResult.domain.time_min - start;
+        start = currentResult.domain.time_min;
+      }
+      if (end > currentResult.domain.time_max) {
+        start -= end - currentResult.domain.time_max;
+        end = currentResult.domain.time_max;
+      }
+      setTransitBounds(boxDragState.index, start, end);
+    }
+    renderTransitRows();
+    drawChart();
+    updateCanvasCursor(lastPointer);
+    return;
+  }
+  if (!dragState || !currentResult) {
+    updateCanvasCursor(lastPointer);
+    return;
+  }
+  const geo = getChartGeometry();
+  const dx = lastPointer.x - dragState.x;
+  const dy = lastPointer.y - dragState.y;
+  const xSpan = dragState.viewport.xMax - dragState.viewport.xMin;
+  const ySpan = dragState.viewport.yMax - dragState.viewport.yMin;
+  const xShift = -dx / geo.innerW * xSpan;
+  const yShift = dy / geo.innerH * ySpan;
+  currentViewport = clampViewport({
+    xMin: dragState.viewport.xMin + xShift,
+    xMax: dragState.viewport.xMax + xShift,
+    yMin: dragState.viewport.yMin + yShift,
+    yMax: dragState.viewport.yMax + yShift,
+  });
+  drawChart();
+  updateCanvasCursor(lastPointer);
+});
+
+canvas.addEventListener('pointerdown', event => {
+  if (!currentResult || event.button !== 0) return;
+  event.preventDefault();
+  const point = pointerPosition(event);
+  lastPointer = point;
+  const viewport = getViewport();
+  if (!viewport) return;
+  const hit = hitTestTransitBox(point);
+  if (hit) {
+    const transit = currentResult.transits[hit.index];
+    selectedTransitIndex = hit.index;
+    boxDragState = {
+      index: hit.index,
+      mode: hit.mode,
+      anchorData: dataAtCanvasPoint(point, viewport),
+      viewport: cloneDomain(viewport),
+      original: {
+        start: transit.start,
+        end: transit.end,
+      },
+    };
+    canvas.classList.add('editing');
+    renderTransitRows();
+    drawChart();
+    updateCanvasCursor(point);
+    canvas.setPointerCapture(event.pointerId);
+    return;
+  }
+  if (canEditBoxes()) {
+    selectedTransitIndex = null;
+    renderTransitRows();
+    drawChart();
+  }
+  dragState = {
+    x: point.x,
+    y: point.y,
+    viewport: cloneDomain(viewport),
+  };
+  canvas.classList.add('dragging');
+  canvas.setPointerCapture(event.pointerId);
+});
+
+function finishDrag(event) {
+  if (boxDragState) {
+    boxDragState = null;
+    canvas.classList.remove('editing');
+    updateCanvasCursor(lastPointer);
+    if (event && canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+    return;
+  }
+  if (!dragState) return;
+  dragState = null;
+  canvas.classList.remove('dragging');
+  updateCanvasCursor(lastPointer);
+  if (event && canvas.hasPointerCapture(event.pointerId)) {
+    canvas.releasePointerCapture(event.pointerId);
+  }
+}
+
+canvas.addEventListener('pointerup', finishDrag);
+canvas.addEventListener('pointercancel', finishDrag);
+canvas.addEventListener('pointerleave', event => {
+  if (!dragState) lastPointer = null;
+  updateCanvasCursor(lastPointer);
+});
+
+document.addEventListener('keydown', event => {
+  if (!currentResult) return;
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    zoomAtPointer(0.72);
+  } else if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    zoomAtPointer(1.28);
+  } else if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    zoomAtPointer(1.28, 'x');
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    zoomAtPointer(0.72, 'x');
+  }
+});
+
+function drawPhaseChart(geo) {
+  transitBoxCache = [];
+  const width = geo.width;
+  const height = geo.height;
+  const pad = geo.pad;
+  const innerW = geo.innerW;
+  const innerH = geo.innerH;
+  if (!hasPhaseFold()) {
+    drawNotice('Phase folding needs a detected orbital period.', width, height);
+    return;
+  }
+
+  const folded = currentResult.phase_folded;
+  const viewport = getViewport();
+  if (!viewport) {
+    drawNotice('Phase folding needs a detected orbital period.', width, height);
+    return;
+  }
+
+  const xMin = viewport.xMin;
+  const xMax = viewport.xMax;
+  const yMin = viewport.yMin;
+  const yMax = viewport.yMax;
+  const xScale = value => pad.left + ((value - xMin) / (xMax - xMin || 1)) * innerW;
+  const yScale = value => pad.top + (1 - ((value - yMin) / (yMax - yMin || 1))) * innerH;
+
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, width, height);
+
+  if (Number.isFinite(folded.duration) && folded.duration > 0) {
+    const start = Math.max(xMin, -folded.duration / 2);
+    const end = Math.min(xMax, folded.duration / 2);
+    if (end > start) {
+      ctx.fillStyle = 'rgba(180, 83, 9, 0.12)';
+      ctx.fillRect(xScale(start), pad.top, Math.max(1, xScale(end) - xScale(start)), innerH);
+    }
+  }
+
+  ctx.strokeStyle = '#d6dde5';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#5f6874';
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (innerH * i / 5);
+    const value = yMax - ((yMax - yMin) * i / 5);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 4), pad.left - 8, y);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= 6; i++) {
+    const x = pad.left + (innerW * i / 6);
+    const value = xMin + ((xMax - xMin) * i / 6);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.top + innerH);
+    ctx.lineTo(x, pad.top + innerH + 5);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
+  }
+
+  const zeroX = xScale(0);
+  if (zeroX >= pad.left && zeroX <= width - pad.right) {
+    ctx.strokeStyle = 'rgba(180, 83, 9, 0.75)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(zeroX, pad.top);
+    ctx.lineTo(zeroX, pad.top + innerH);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, innerW, innerH);
+  ctx.clip();
+
+  ctx.fillStyle = 'rgba(15, 118, 110, 0.18)';
+  const pointSize = folded.phase.length > 8000 ? 1.2 : 1.8;
+  for (let i = 0; i < folded.phase.length; i++) {
+    const phase = folded.phase[i];
+    const value = folded.raw_flux[i];
+    if (phase < xMin || phase > xMax || value < yMin || value > yMax) continue;
+    const x = xScale(phase);
+    const y = yScale(value);
+    ctx.fillRect(x - pointSize / 2, y - pointSize / 2, pointSize, pointSize);
+  }
+
+  ctx.strokeStyle = '#063f3b';
+  ctx.lineWidth = 2.6;
+  ctx.beginPath();
+  let hasBinPoint = false;
+  for (let i = 0; i < folded.binned_phase.length; i++) {
+    const phase = folded.binned_phase[i];
+    const value = folded.binned_flux[i];
+    if (phase < xMin || phase > xMax) continue;
+    const x = xScale(phase);
+    const y = yScale(value);
+    if (!hasBinPoint) {
+      ctx.moveTo(x, y);
+      hasBinPoint = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = '#202124';
+  ctx.font = '700 12px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('Folded flux', 14, 16);
+  ctx.textAlign = 'right';
+  ctx.fillText('Phase days from transit center', width - 22, height - 22);
+  updateCanvasCursor(lastPointer);
+}
+
+function drawChart() {
+  resizeCanvas();
+  const geo = getChartGeometry();
+  const width = geo.width;
+  const height = geo.height;
+  ctx.clearRect(0, 0, width, height);
+  if (!currentResult) return;
+
+  if (currentView === 'phase') {
+    drawPhaseChart(geo);
+    return;
+  }
+
+  const times = currentResult.plot.time;
+  const rawFlux = currentResult.plot.raw_flux;
+  const smoothFlux = currentResult.plot.smooth_flux;
+  const flux = currentView === 'raw' ? rawFlux : smoothFlux;
+  if (!times.length) return;
+
+  const pad = geo.pad;
+  const innerW = geo.innerW;
+  const innerH = geo.innerH;
+  const viewport = getViewport();
+  const xMin = viewport.xMin;
+  const xMax = viewport.xMax;
+  const yMin = viewport.yMin;
+  const yMax = viewport.yMax;
+  const xScale = value => pad.left + ((value - xMin) / (xMax - xMin || 1)) * innerW;
+  const yScale = value => pad.top + (1 - ((value - yMin) / (yMax - yMin || 1))) * innerH;
+
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, width, height);
+  transitBoxCache = [];
+
+  currentResult.transits.forEach((t, index) => {
+    if (t.end < xMin || t.start > xMax) return;
+    const range = transitFluxRange(t, flux);
+    if (!range) return;
+    const x1 = Math.max(pad.left, xScale(t.start));
+    const x2 = Math.min(width - pad.right, xScale(t.end));
+    const y1 = Math.max(pad.top, Math.min(pad.top + innerH, yScale(range.high)));
+    const y2 = Math.max(pad.top, Math.min(pad.top + innerH, yScale(range.low)));
+    const boxWidth = Math.max(8, x2 - x1);
+    const boxTop = Math.min(y1, y2);
+    const boxHeight = Math.max(8, Math.abs(y2 - y1));
+    transitBoxCache.push({
+      index,
+      x1,
+      x2: x1 + boxWidth,
+      y1: boxTop,
+      y2: boxTop + boxHeight,
+    });
+    ctx.fillStyle = 'rgba(180, 83, 9, 0.22)';
+    ctx.fillRect(x1, boxTop, boxWidth, boxHeight);
+    const selected = index === selectedTransitIndex;
+    ctx.strokeStyle = selected ? 'rgba(15, 118, 110, 1)' : 'rgba(180, 83, 9, 1)';
+    ctx.lineWidth = selected ? 3.2 : 2.5;
+    ctx.strokeRect(x1, boxTop, boxWidth, boxHeight);
+    if (selected && canEditBoxes()) {
+      ctx.fillStyle = 'rgba(15, 118, 110, 0.95)';
+      ctx.fillRect(x1 - 3, boxTop, 6, boxHeight);
+      ctx.fillRect(x1 + boxWidth - 3, boxTop, 6, boxHeight);
+    }
+    ctx.fillStyle = '#8a3f06';
+    ctx.font = '700 12px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    if (boxWidth > 18 || currentView === 'zoom') {
+      ctx.fillText(`T${index + 1}`, Math.max(pad.left + 4, x1 + 5), Math.max(pad.top + 4, boxTop + 5));
+    }
+  });
+
+  ctx.strokeStyle = '#d6dde5';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#5f6874';
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (innerH * i / 5);
+    const value = yMax - ((yMax - yMin) * i / 5);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 4), pad.left - 8, y);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= 6; i++) {
+    const x = pad.left + (innerW * i / 6);
+    const value = xMin + ((xMax - xMin) * i / 6);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.top + innerH);
+    ctx.lineTo(x, pad.top + innerH + 5);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
+  }
+
+  if (currentView !== 'raw') {
+    ctx.strokeStyle = 'rgba(15, 118, 110, 0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let hasRawPoint = false;
+    for (let i = 0; i < times.length; i++) {
+      if (times[i] < xMin || times[i] > xMax) continue;
+      const x = xScale(times[i]);
+      const y = yScale(rawFlux[i]);
+      if (!hasRawPoint) {
+        ctx.moveTo(x, y);
+        hasRawPoint = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = currentView === 'raw' ? '#0f766e' : '#063f3b';
+  ctx.lineWidth = currentView === 'raw' ? 1.2 : 2.4;
+  ctx.beginPath();
+  let hasPoint = false;
+  for (let i = 0; i < times.length; i++) {
+    if (times[i] < xMin || times[i] > xMax) continue;
+    const x = xScale(times[i]);
+    const y = yScale(flux[i]);
+    if (!hasPoint) {
+      ctx.moveTo(x, y);
+      hasPoint = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = '#202124';
+  ctx.font = '700 12px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(currentView === 'raw' ? 'Flux' : 'Smoothed flux', 14, 16);
+  ctx.textAlign = 'right';
+  ctx.fillText('Julian days', width - 22, height - 22);
+  updateCanvasCursor(lastPointer);
+}
+
+window.addEventListener('resize', drawChart);

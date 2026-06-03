@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Exoplanet Transit Finder</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <aside class="sidebar">
+      <div>
+        <h1>Transit Finder</h1>
+        <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
+      </div>
+
+      <label id="dropzone" class="dropzone" for="fileInput">
+        <span>
+          <strong>Drop CSV or FITS files here</strong>
+          or click to choose files
+        </span>
+      </label>
+      <input id="fileInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits" multiple>
+      <button id="analyzeButton" disabled>Analyze files</button>
+      <div id="status" class="status">No file selected.</div>
+
+      <section>
+        <h2>Batch Results</h2>
+        <div class="controls">
+          <div class="control-row">
+            <label class="control-label" for="resultSelect">
+              <span>Processed file</span>
+              <output id="batchCount">0/0</output>
+            </label>
+            <select id="resultSelect" disabled>
+              <option>No processed files</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Detection</h2>
+        <div class="controls">
+          <div class="control-row">
+            <label class="control-label" for="strictnessInput">
+              <span>Strictness</span>
+              <output id="strictnessValue">1.00x</output>
+            </label>
+            <input id="strictnessInput" type="range" min="0.5" max="2" step="0.05" value="1">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="smoothingInput">
+              <span>Smoothing</span>
+              <output id="smoothingValue">1.00x</output>
+            </label>
+            <input id="smoothingInput" type="range" min="0.5" max="2.5" step="0.05" value="1">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="minDepthInput">
+              <span>Min depth</span>
+              <output>auto</output>
+            </label>
+            <input id="minDepthInput" type="number" min="0" step="0.001" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="minDurationInput">
+              <span>Min duration days</span>
+              <output>auto</output>
+            </label>
+            <input id="minDurationInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="maxDurationInput">
+              <span>Max duration days</span>
+              <output>auto</output>
+            </label>
+            <input id="maxDurationInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="minPeriodInput">
+              <span>Min period days</span>
+              <output>auto</output>
+            </label>
+            <input id="minPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="maxPeriodInput">
+              <span>Max period days</span>
+              <output>auto</output>
+            </label>
+            <input id="maxPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <button id="resetDetectionButton" class="view-button" type="button">Reset detection</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Analysis</h2>
+        <div class="meta" id="metrics">
+          <div class="metric"><span>Data points</span><span>-</span></div>
+          <div class="metric"><span>Transits</span><span>-</span></div>
+          <div class="metric"><span>Orbital period</span><span>-</span></div>
+          <div class="metric"><span>Median depth</span><span>-</span></div>
+          <div class="metric"><span>Radius ratio</span><span>-</span></div>
+          <div class="metric"><span>Depth SNR</span><span>-</span></div>
+          <div class="metric"><span>Period SDE</span><span>-</span></div>
+          <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
+          <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
+          <div class="metric"><span>JD start</span><span>-</span></div>
+          <div class="metric"><span>Median flux</span><span>-</span></div>
+          <div class="metric"><span>Noise</span><span>-</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Period Candidates</h2>
+        <div class="warning-list" id="periodCandidates">
+          <div class="warning-item info">
+            <strong>No candidates yet</strong>
+            <span>Period search results appear after analysis.</span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Warnings</h2>
+        <div class="warning-list" id="warnings">
+          <div class="warning-item info">
+            <strong>No analysis yet</strong>
+            <span>Candidate checks appear after upload.</span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Export</h2>
+        <div class="controls">
+          <button id="exportCsvButton" class="view-button" type="button" disabled>Transit CSV</button>
+          <button id="exportPngButton" class="view-button" type="button" disabled>Graph PNG</button>
+          <button id="exportJsonButton" class="view-button" type="button" disabled>Summary JSON</button>
+          <button id="exportAnalysisPdfButton" class="view-button" type="button" disabled>Analysis PDF</button>
+          <button id="exportBatchPdfButton" class="view-button" type="button" disabled>Batch PDF</button>
+        </div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <div class="topbar">
+        <div>
+          <h2 id="chartTitle">Flux Over Time</h2>
+          <p id="subtitle">Transit boxes appear after analysis.</p>
+        </div>
+        <div class="view-controls" aria-label="Chart view">
+          <button class="view-button active" type="button" data-view="zoom">Transit zoom</button>
+          <button class="view-button" type="button" data-view="clean">Full cleaned</button>
+          <button class="view-button" type="button" data-view="raw">Raw clipped</button>
+          <button class="view-button" type="button" data-view="phase">Phase folded</button>
+          <button id="editBoxesButton" class="view-button" type="button" disabled>Edit boxes</button>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="chart"></canvas>
+        <div id="empty" class="empty">Waiting for a light curve.</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Transit</th>
+              <th>Start day</th>
+              <th>Center day</th>
+              <th>End day</th>
+              <th>Duration</th>
+              <th>Depth</th>
+              <th>Depth %</th>
+              <th>Depth ppm</th>
+              <th>Rp/Rs</th>
+              <th>Points</th>
+            </tr>
+          </thead>
+          <tbody id="transitRows">
+            <tr><td colspan="10" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
