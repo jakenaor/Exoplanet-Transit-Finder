@@ -503,6 +503,8 @@ INDEX_HTML = r"""<!doctype html>
           <button id="exportCsvButton" class="view-button" type="button" disabled>Transit CSV</button>
           <button id="exportPngButton" class="view-button" type="button" disabled>Graph PNG</button>
           <button id="exportJsonButton" class="view-button" type="button" disabled>Summary JSON</button>
+          <button id="exportAnalysisPdfButton" class="view-button" type="button" disabled>Analysis PDF</button>
+          <button id="exportBatchPdfButton" class="view-button" type="button" disabled>Batch PDF</button>
         </div>
       </section>
     </aside>
@@ -578,6 +580,8 @@ INDEX_HTML = r"""<!doctype html>
     const exportCsvButton = document.getElementById('exportCsvButton');
     const exportPngButton = document.getElementById('exportPngButton');
     const exportJsonButton = document.getElementById('exportJsonButton');
+    const exportAnalysisPdfButton = document.getElementById('exportAnalysisPdfButton');
+    const exportBatchPdfButton = document.getElementById('exportBatchPdfButton');
     const resultSelect = document.getElementById('resultSelect');
     const batchCount = document.getElementById('batchCount');
     const MAX_BATCH_FILES = 100;
@@ -698,6 +702,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!batchResults.length) {
         resultSelect.disabled = true;
         resultSelect.innerHTML = '<option>No processed files</option>';
+        syncExportButtons();
         return;
       }
 
@@ -710,6 +715,7 @@ INDEX_HTML = r"""<!doctype html>
           : `${item.result.transits.length} transits`;
         return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
       }).join('');
+      syncExportButtons();
     }
 
     function setFiles(fileList) {
@@ -789,6 +795,8 @@ INDEX_HTML = r"""<!doctype html>
       exportCsvButton.disabled = disabled;
       exportPngButton.disabled = disabled;
       exportJsonButton.disabled = disabled;
+      exportAnalysisPdfButton.disabled = disabled;
+      exportBatchPdfButton.disabled = !batchResults.some(item => item.result);
     }
 
     function clearResultView() {
@@ -1449,6 +1457,196 @@ INDEX_HTML = r"""<!doctype html>
       };
     }
 
+    function metricsForResult(result) {
+      const previousResult = currentResult;
+      currentResult = result;
+      try {
+        return currentAnalysisMetrics();
+      } finally {
+        currentResult = previousResult;
+      }
+    }
+
+    const analysisPdfColumns = [
+      { key: 'file', label: 'File', width: 150, align: 'left' },
+      { key: 'points', label: 'Data points', width: 55, align: 'right' },
+      { key: 'transits', label: 'Transits', width: 45, align: 'right' },
+      { key: 'period', label: 'Period d', width: 70, align: 'right' },
+      { key: 'method', label: 'Method', width: 55, align: 'left' },
+      { key: 'depthPercent', label: 'Depth %', width: 60, align: 'right' },
+      { key: 'depthPpm', label: 'Depth ppm', width: 65, align: 'right' },
+      { key: 'radiusRatio', label: 'Rp/Rs', width: 50, align: 'right' },
+      { key: 'snr', label: 'Depth SNR', width: 55, align: 'right' },
+      { key: 'sde', label: 'Period SDE', width: 55, align: 'right' },
+      { key: 'pValue', label: 'Chi-sq p %', width: 65, align: 'right' },
+      { key: 'reducedChi', label: 'Red chi-sq', width: 60, align: 'right' },
+      { key: 'jdStart', label: 'JD start', width: 75, align: 'right' },
+      { key: 'medianFlux', label: 'Med flux', width: 60, align: 'right' },
+      { key: 'noise', label: 'Noise', width: 60, align: 'right' },
+    ];
+
+    function analysisPdfRow(fileName, result) {
+      const metrics = metricsForResult(result);
+      const depthPpm = metrics.medianDepthFraction === null || metrics.medianDepthFraction === undefined
+        ? null
+        : metrics.medianDepthFraction * 1000000;
+      const pValuePercent = metrics.pValue === null || metrics.pValue === undefined
+        ? null
+        : metrics.pValue * 100;
+      return {
+        file: fileName || result.source_file || 'analysis',
+        points: result.total_points.toLocaleString(),
+        transits: result.transits.length.toString(),
+        period: fmt(metrics.period, 6),
+        method: metrics.periodMethod || '-',
+        depthPercent: fmtDepthPercent(metrics.medianDepthFraction),
+        depthPpm: fmtPpm(depthPpm),
+        radiusRatio: fmt(metrics.medianRadiusRatio, 6),
+        snr: fmt(metrics.detectionSnr, 2),
+        sde: fmt(metrics.periodSde, 2),
+        pValue: pValuePercent === null ? '-' : `${fmt(pValuePercent, 6)}%`,
+        reducedChi: fmt(metrics.reducedChiSquared, 3),
+        jdStart: fmt(result.time_reference, 5),
+        medianFlux: fmt(result.median_flux, 6),
+        noise: fmt(result.robust_noise, 6),
+      };
+    }
+
+    function pdfSafeText(value) {
+      return String(value ?? '-')
+        .replace(/[^\x20-\x7E]/g, '?')
+        .replace(/\\/g, '\\\\')
+        .replace(/\(/g, '\\(')
+        .replace(/\)/g, '\\)');
+    }
+
+    function fitPdfText(value, maxChars) {
+      const text = String(value ?? '-').replace(/\s+/g, ' ').trim();
+      return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}...` : text;
+    }
+
+    function pdfText(x, y, text, size = 7, font = 'F1') {
+      return `BT /${font} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${pdfSafeText(text)}) Tj ET\n`;
+    }
+
+    function pdfLine(x1, y1, x2, y2) {
+      return `${x1.toFixed(2)} ${y1.toFixed(2)} m ${x2.toFixed(2)} ${y2.toFixed(2)} l S\n`;
+    }
+
+    function pdfRect(x, y, width, height) {
+      return `${x.toFixed(2)} ${y.toFixed(2)} ${width.toFixed(2)} ${height.toFixed(2)} re S\n`;
+    }
+
+    function buildPdfBlob(pageContents, pageWidth, pageHeight) {
+      const objects = [null];
+      objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+      objects[2] = '';
+      objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+      objects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+      const pageIds = [];
+
+      pageContents.forEach(content => {
+        const contentId = objects.length;
+        objects.push(`<< /Length ${content.length} >>\nstream\n${content}endstream`);
+        const pageId = objects.length;
+        pageIds.push(pageId);
+        objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`);
+      });
+
+      objects[2] = `<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] /Count ${pageIds.length} >>`;
+
+      let pdf = '%PDF-1.4\n';
+      const offsets = [0];
+      for (let index = 1; index < objects.length; index++) {
+        offsets[index] = pdf.length;
+        pdf += `${index} 0 obj\n${objects[index]}\nendobj\n`;
+      }
+      const xrefStart = pdf.length;
+      pdf += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+      for (let index = 1; index < objects.length; index++) {
+        pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+      }
+      pdf += `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+      return new Blob([pdf], { type: 'application/pdf' });
+    }
+
+    function buildAnalysisPdf(rows, title) {
+      const pageWidth = 1224;
+      const pageHeight = 792;
+      const margin = 24;
+      const tableWidth = analysisPdfColumns.reduce((sum, column) => sum + column.width, 0);
+      const rowHeight = 22;
+      const headerHeight = 24;
+      const rowsPerPage = Math.max(1, Math.floor((pageHeight - 96 - headerHeight) / rowHeight));
+      const pages = [];
+      const pageCount = Math.max(1, Math.ceil(rows.length / rowsPerPage));
+
+      for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+        const pageRows = rows.slice(pageIndex * rowsPerPage, (pageIndex + 1) * rowsPerPage);
+        let content = '0.8 w\n';
+        const titleY = pageHeight - margin - 12;
+        content += pdfText(margin, titleY, title, 13, 'F2');
+        content += pdfText(pageWidth - margin - 88, titleY, `Page ${pageIndex + 1}/${pageCount}`, 8, 'F1');
+        content += pdfText(margin, titleY - 16, `Generated ${new Date().toLocaleString()}`, 8, 'F1');
+
+        let y = pageHeight - margin - 54;
+        let x = margin;
+        content += pdfRect(margin, y - headerHeight + 4, tableWidth, headerHeight);
+        analysisPdfColumns.forEach(column => {
+          content += pdfLine(x, y + 4, x, y - headerHeight + 4);
+          content += pdfText(x + 3, y - 11, column.label, 7, 'F2');
+          x += column.width;
+        });
+        content += pdfLine(margin + tableWidth, y + 4, margin + tableWidth, y - headerHeight + 4);
+        y -= headerHeight;
+
+        pageRows.forEach(row => {
+          x = margin;
+          content += pdfRect(margin, y - rowHeight + 4, tableWidth, rowHeight);
+          analysisPdfColumns.forEach(column => {
+            const rawValue = row[column.key] ?? '-';
+            const maxChars = Math.max(4, Math.floor(column.width / 4.2));
+            const value = fitPdfText(rawValue, maxChars);
+            const textWidth = value.length * 3.7;
+            const textX = column.align === 'right'
+              ? Math.max(x + 3, x + column.width - textWidth - 4)
+              : x + 3;
+            content += pdfLine(x, y + 4, x, y - rowHeight + 4);
+            content += pdfText(textX, y - 10, value, 7, 'F1');
+            x += column.width;
+          });
+          content += pdfLine(margin + tableWidth, y + 4, margin + tableWidth, y - rowHeight + 4);
+          y -= rowHeight;
+        });
+
+        pages.push(content);
+      }
+
+      return buildPdfBlob(pages, pageWidth, pageHeight);
+    }
+
+    function successfulBatchItems() {
+      return batchResults.filter(item => item.result);
+    }
+
+    function exportAnalysisPdf() {
+      if (!currentResult) return;
+      const fileName = selectedFile ? selectedFile.name : currentResult.source_file;
+      const rows = [analysisPdfRow(fileName, currentResult)];
+      const pdf = buildAnalysisPdf(rows, 'Transit Finder Analysis');
+      downloadBlob(pdf, `${exportBaseName()}-analysis.pdf`, 'application/pdf');
+      setStatus('Analysis PDF exported.');
+    }
+
+    function exportBatchAnalysisPdf() {
+      const items = successfulBatchItems();
+      if (!items.length) return;
+      const rows = items.map(item => analysisPdfRow(item.file.name, item.result));
+      const pdf = buildAnalysisPdf(rows, 'Transit Finder Batch Analysis');
+      downloadBlob(pdf, `${exportBaseName()}-batch-analysis.pdf`, 'application/pdf');
+      setStatus(`Batch analysis PDF exported for ${rows.length} file${rows.length === 1 ? '' : 's'}.`);
+    }
+
     function exportSummaryJson() {
       if (!currentResult) return;
       downloadBlob(
@@ -1475,6 +1673,8 @@ INDEX_HTML = r"""<!doctype html>
     exportCsvButton.addEventListener('click', exportTransitCsv);
     exportPngButton.addEventListener('click', exportGraphPng);
     exportJsonButton.addEventListener('click', exportSummaryJson);
+    exportAnalysisPdfButton.addEventListener('click', exportAnalysisPdf);
+    exportBatchPdfButton.addEventListener('click', exportBatchAnalysisPdf);
 
     function resizeCanvas() {
       const rect = canvas.getBoundingClientRect();
