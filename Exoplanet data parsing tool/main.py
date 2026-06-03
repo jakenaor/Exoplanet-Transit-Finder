@@ -275,7 +275,7 @@ INDEX_HTML = r"""<!doctype html>
       accent-color: var(--accent);
     }
 
-    input[type="number"] {
+    input[type="number"], select {
       width: 100%;
       border: 1px solid #c8d0da;
       border-radius: 6px;
@@ -375,18 +375,33 @@ INDEX_HTML = r"""<!doctype html>
     <aside class="sidebar">
       <div>
         <h1>Transit Finder</h1>
-        <p>Upload a CSV or FITS light curve with time and flux columns.</p>
+        <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
       </div>
 
       <label id="dropzone" class="dropzone" for="fileInput">
         <span>
-          <strong>Drop CSV or FITS here</strong>
-          or click to choose a file
+          <strong>Drop CSV or FITS files here</strong>
+          or click to choose files
         </span>
       </label>
-      <input id="fileInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits">
-      <button id="analyzeButton" disabled>Analyze file</button>
+      <input id="fileInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits" multiple>
+      <button id="analyzeButton" disabled>Analyze files</button>
       <div id="status" class="status">No file selected.</div>
+
+      <section>
+        <h2>Batch Results</h2>
+        <div class="controls">
+          <div class="control-row">
+            <label class="control-label" for="resultSelect">
+              <span>Processed file</span>
+              <output id="batchCount">0/0</output>
+            </label>
+            <select id="resultSelect" disabled>
+              <option>No processed files</option>
+            </select>
+          </div>
+        </div>
+      </section>
 
       <section>
         <h2>Detection</h2>
@@ -563,7 +578,14 @@ INDEX_HTML = r"""<!doctype html>
     const exportCsvButton = document.getElementById('exportCsvButton');
     const exportPngButton = document.getElementById('exportPngButton');
     const exportJsonButton = document.getElementById('exportJsonButton');
+    const resultSelect = document.getElementById('resultSelect');
+    const batchCount = document.getElementById('batchCount');
+    const MAX_BATCH_FILES = 100;
+    let selectedFiles = [];
     let selectedFile = null;
+    let batchResults = [];
+    let currentBatchIndex = -1;
+    let batchInProgress = false;
     let currentResult = null;
     let currentView = 'zoom';
     let currentViewport = null;
@@ -599,6 +621,16 @@ INDEX_HTML = r"""<!doctype html>
       if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
       return fmt(Number(value), 1);
     };
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[character]));
+    }
 
     function average(values) {
       if (!values.length) return null;
@@ -660,10 +692,44 @@ INDEX_HTML = r"""<!doctype html>
       statusEl.className = isError ? 'status error' : 'status';
     }
 
-    function setFile(file) {
-      selectedFile = file;
-      analyzeButton.disabled = !file;
-      setStatus(file ? file.name : 'No file selected.');
+    function renderBatchSelect() {
+      const successCount = batchResults.filter(item => item.result).length;
+      batchCount.value = `${successCount}/${batchResults.length || selectedFiles.length || 0}`;
+      if (!batchResults.length) {
+        resultSelect.disabled = true;
+        resultSelect.innerHTML = '<option>No processed files</option>';
+        return;
+      }
+
+      resultSelect.disabled = batchInProgress || successCount === 0;
+      resultSelect.innerHTML = batchResults.map((item, index) => {
+        const selected = index === currentBatchIndex ? ' selected' : '';
+        const disabled = item.error ? ' disabled' : '';
+        const detail = item.error
+          ? 'failed'
+          : `${item.result.transits.length} transits`;
+        return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
+      }).join('');
+    }
+
+    function setFiles(fileList) {
+      const files = Array.from(fileList || []);
+      selectedFiles = files.slice(0, MAX_BATCH_FILES);
+      selectedFile = selectedFiles[0] || null;
+      batchResults = [];
+      currentBatchIndex = -1;
+      renderBatchSelect();
+      clearResultView();
+      analyzeButton.disabled = !selectedFiles.length;
+      if (!selectedFiles.length) {
+        setStatus('No file selected.');
+      } else if (files.length > MAX_BATCH_FILES) {
+        setStatus(`Selected first ${MAX_BATCH_FILES} of ${files.length} files.`);
+      } else {
+        setStatus(selectedFiles.length === 1
+          ? selectedFiles[0].name
+          : `${selectedFiles.length} files selected.`);
+      }
     }
 
     function optionalNumber(input) {
@@ -701,8 +767,8 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function markDetectionControlsChanged() {
-      if (currentResult && selectedFile) {
-        setStatus('Detection controls changed. Run Analyze file to apply.');
+      if (currentResult && selectedFiles.length) {
+        setStatus('Detection controls changed. Run Analyze files to apply.');
       }
     }
 
@@ -725,7 +791,88 @@ INDEX_HTML = r"""<!doctype html>
       exportJsonButton.disabled = disabled;
     }
 
-    fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+    function clearResultView() {
+      currentResult = null;
+      currentViewport = null;
+      selectedTransitIndex = null;
+      boxDragState = null;
+      transitBoxCache = [];
+      editBoxesEnabled = false;
+      emptyEl.style.display = 'grid';
+      metricsEl.innerHTML = `
+        <div class="metric"><span>Data points</span><span>-</span></div>
+        <div class="metric"><span>Transits</span><span>-</span></div>
+        <div class="metric"><span>Orbital period</span><span>-</span></div>
+        <div class="metric"><span>Median depth</span><span>-</span></div>
+        <div class="metric"><span>Radius ratio</span><span>-</span></div>
+        <div class="metric"><span>Depth SNR</span><span>-</span></div>
+        <div class="metric"><span>Period SDE</span><span>-</span></div>
+        <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
+        <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
+        <div class="metric"><span>JD start</span><span>-</span></div>
+        <div class="metric"><span>Median flux</span><span>-</span></div>
+        <div class="metric"><span>Noise</span><span>-</span></div>
+      `;
+      periodCandidatesEl.innerHTML = `
+        <div class="warning-item info">
+          <strong>No candidates yet</strong>
+          <span>Period search results appear after analysis.</span>
+        </div>
+      `;
+      warningsEl.innerHTML = `
+        <div class="warning-item info">
+          <strong>No analysis yet</strong>
+          <span>Candidate checks appear after upload.</span>
+        </div>
+      `;
+      rowsEl.innerHTML = '<tr><td colspan="10" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>';
+      updateChartHeading();
+      syncEditButton();
+      syncExportButtons();
+      drawChart();
+    }
+
+    function appendDetectionOptions(formData, options) {
+      formData.append('strictness', options.strictness);
+      formData.append('smoothing', options.smoothing);
+      if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
+      if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
+      if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
+      if (options.minPeriod !== null) formData.append('minPeriod', options.minPeriod);
+      if (options.maxPeriod !== null) formData.append('maxPeriod', options.maxPeriod);
+    }
+
+    async function analyzeFile(file, options) {
+      const formData = new FormData();
+      formData.append('datafile', file);
+      appendDetectionOptions(formData, options);
+      const response = await fetch('/analyze', { method: 'POST', body: formData });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'Analysis failed.');
+      payload.source_file = file.name;
+      payload.original_period = payload.period;
+      payload.original_period_method = payload.period_method;
+      payload.boxesEdited = false;
+      return payload;
+    }
+
+    function selectBatchResult(index) {
+      const item = batchResults[index];
+      if (!item || !item.result) return;
+      currentBatchIndex = index;
+      selectedFile = item.file;
+      currentResult = item.result;
+      currentViewport = null;
+      selectedTransitIndex = null;
+      boxDragState = null;
+      transitBoxCache = [];
+      editBoxesEnabled = false;
+      renderBatchSelect();
+      renderResult(currentResult);
+      setStatus(`Showing ${item.file.name}.`);
+    }
+
+    fileInput.addEventListener('change', () => setFiles(fileInput.files));
     [strictnessInput, smoothingInput].forEach(input => {
       input.addEventListener('input', () => {
         updateDetectionReadouts();
@@ -756,43 +903,61 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     dropzone.addEventListener('drop', event => {
-      const file = event.dataTransfer.files[0];
-      if (file) {
+      if (event.dataTransfer.files.length) {
         fileInput.files = event.dataTransfer.files;
-        setFile(file);
+        setFiles(event.dataTransfer.files);
       }
     });
 
     analyzeButton.addEventListener('click', async () => {
-      if (!selectedFile) return;
-      setStatus('Analyzing light curve...');
+      if (!selectedFiles.length) return;
+      const filesToAnalyze = selectedFiles.slice(0, MAX_BATCH_FILES);
+      const options = detectionOptions();
+      setStatus(`Analyzing 1/${filesToAnalyze.length}: ${filesToAnalyze[0].name}`);
       analyzeButton.disabled = true;
+      batchInProgress = true;
+      batchResults = [];
+      currentBatchIndex = -1;
+      renderBatchSelect();
+      clearResultView();
       try {
-        const formData = new FormData();
-        formData.append('datafile', selectedFile);
-        const options = detectionOptions();
-        formData.append('strictness', options.strictness);
-        formData.append('smoothing', options.smoothing);
-        if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
-        if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
-        if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
-        if (options.minPeriod !== null) formData.append('minPeriod', options.minPeriod);
-        if (options.maxPeriod !== null) formData.append('maxPeriod', options.maxPeriod);
-        const response = await fetch('/analyze', { method: 'POST', body: formData });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || 'Analysis failed.');
-        currentResult = payload;
-        currentViewport = null;
-        selectedTransitIndex = null;
-        boxDragState = null;
-        transitBoxCache = [];
-        renderResult(payload);
-        setStatus('Analysis complete.');
-      } catch (error) {
-        setStatus(error.message, true);
+        for (let index = 0; index < filesToAnalyze.length; index++) {
+          const file = filesToAnalyze[index];
+          setStatus(`Analyzing ${index + 1}/${filesToAnalyze.length}: ${file.name}`);
+          try {
+            const result = await analyzeFile(file, options);
+            batchResults.push({ file, result, error: null });
+            if (currentBatchIndex === -1) {
+              selectBatchResult(batchResults.length - 1);
+            } else {
+              renderBatchSelect();
+            }
+          } catch (error) {
+            batchResults.push({ file, result: null, error: error.message });
+            renderBatchSelect();
+          }
+        }
+
+        const successCount = batchResults.filter(item => item.result).length;
+        const failureCount = batchResults.length - successCount;
+        if (successCount && currentBatchIndex === -1) {
+          const firstSuccessIndex = batchResults.findIndex(item => item.result);
+          selectBatchResult(firstSuccessIndex);
+        }
+        setStatus(
+          failureCount
+            ? `Batch complete: ${successCount}/${batchResults.length} processed, ${failureCount} failed.`
+            : `Batch complete: ${successCount}/${batchResults.length} processed.`
+        , failureCount > 0 && successCount === 0);
       } finally {
-        analyzeButton.disabled = false;
+        batchInProgress = false;
+        analyzeButton.disabled = !selectedFiles.length;
+        renderBatchSelect();
       }
+    });
+
+    resultSelect.addEventListener('change', () => {
+      selectBatchResult(Number(resultSelect.value));
     });
 
     viewButtons.forEach(button => {
@@ -1129,9 +1294,6 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderResult(result) {
       emptyEl.style.display = 'none';
-      result.original_period = result.period;
-      result.original_period_method = result.period_method;
-      result.boxesEdited = false;
       renderMetrics();
       updateChartHeading();
       syncEditButton();
