@@ -47,6 +47,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 ## Current Working Features
 
 - Localhost app served by `python3 main.py` using Python stdlib HTTP serving.
+- Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - Split app structure:
   - `main.py` handles HTTP routes, static assets, and `/analyze`.
   - `parsers.py` handles CSV and FITS ingestion.

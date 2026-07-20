@@ -4,7 +4,10 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import threading
+import time
 from urllib.parse import unquote, urlparse
+import webbrowser
 
 from analysis import analyze, parse_detection_options
 from parsers import parse_light_curve_upload
@@ -15,10 +18,25 @@ DEFAULT_PORT = 8000
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 INDEX_PATH = STATIC_DIR / "index.html"
+BROWSER_OPT_OUT_ENV = "TRANSIT_FINDER_NO_BROWSER"
 
 
 def read_static_file(path):
     return path.read_bytes()
+
+
+def open_browser_soon(url):
+    if os.environ.get(BROWSER_OPT_OUT_ENV):
+        return
+
+    def open_browser():
+        time.sleep(0.4)
+        try:
+            webbrowser.open(url, new=2)
+        except Exception as exc:
+            print(f"Could not open browser automatically: {exc}")
+
+    threading.Thread(target=open_browser, daemon=True).start()
 
 
 class TransitRequestHandler(BaseHTTPRequestHandler):
@@ -107,8 +125,10 @@ def main():
     if server is None:
         raise OSError(f"Could not bind to any port from {DEFAULT_PORT} to {DEFAULT_PORT + 10}.")
 
-    print(f"Transit Finder running at http://{HOST}:{server.server_port}")
+    url = f"http://{HOST}:{server.server_port}/"
+    print(f"Transit Finder running at {url}")
     print("Press Ctrl+C to stop.")
+    open_browser_soon(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
