@@ -66,6 +66,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
+- Periodogram chart mode that plots compact BLS power/SDE over searched periods and marks top candidates.
 - Ephemeris audit chart mode:
   - Shows predicted period windows from the recovered ephemeris.
   - Colors detected boxes green when they align with the predicted ephemeris.
@@ -319,7 +320,7 @@ Additional useful future features after step 12:
 
 - Transit prediction from period and epoch.
 - Better candidate-period ranking with explicit harmonic/alias grouping.
-- Periodogram/SDE-ogram view with top candidate periods, aliases, and raw vs smoothed power.
+- Periodogram alias grouping and raw vs smoothed power comparison.
 - TLS-style transit model overlay on phase-folded and time-series views.
 - User-entered stellar priors and limb-darkening coefficients.
 - SDE, FAP, SNR, period uncertainty, reduced chi-squared, and odd/even mismatch statistics.

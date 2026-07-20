@@ -20,6 +20,7 @@ except Exception:
 
 
 MAX_PLOT_POINTS = 12000
+MAX_PERIODOGRAM_POINTS = 1600
 DEFAULT_DETECTION_OPTIONS = {
     "strictness": 1.0,
     "smoothing": 1.0,
@@ -280,6 +281,62 @@ def period_grid(min_period, max_period, count):
     return np.sort(periods.astype(float))
 
 
+def build_periodogram_payload(periods, powers, power_median=None, power_std=None, method=None, selected_period=None):
+    periods = np.asarray(periods, dtype=float)
+    powers = np.asarray(powers, dtype=float)
+    size = min(periods.size, powers.size)
+    if size == 0:
+        return None
+
+    periods = periods[:size]
+    powers = powers[:size]
+    valid = np.isfinite(periods) & np.isfinite(powers) & (periods > 0)
+    if not np.any(valid):
+        return None
+
+    periods = periods[valid]
+    powers = powers[valid]
+    order = np.argsort(periods)
+    periods = periods[order]
+    powers = powers[order]
+    point_count = int(periods.size)
+
+    finite_powers = powers[np.isfinite(powers)]
+    if power_median is None or power_std is None:
+        if finite_powers.size >= 5:
+            power_median = float(np.median(finite_powers))
+            power_std = max(float(np.std(finite_powers)), 1e-9)
+    if power_median is not None and power_std is not None and power_std > 0:
+        sdes = (powers - float(power_median)) / float(power_std)
+    else:
+        sdes = np.full(periods.shape, np.nan, dtype=float)
+
+    keep = set(np.linspace(0, point_count - 1, min(point_count, MAX_PERIODOGRAM_POINTS), dtype=int).tolist())
+    top_count = min(80, point_count)
+    if top_count:
+        top_indices = np.argpartition(powers, point_count - top_count)[-top_count:]
+        keep.update(int(index) for index in top_indices)
+    if selected_period is not None and math.isfinite(float(selected_period)) and selected_period > 0:
+        keep.add(int(np.argmin(np.abs(periods - float(selected_period)))))
+
+    keep_indices = np.asarray(sorted(keep), dtype=int)
+    shown_periods = periods[keep_indices]
+    shown_powers = powers[keep_indices]
+    shown_sdes = sdes[keep_indices]
+
+    return {
+        "periods": [float(value) for value in shown_periods],
+        "power": [float(value) for value in shown_powers],
+        "sde": [float(value) if math.isfinite(float(value)) else None for value in shown_sdes],
+        "method": method,
+        "selected_period": float(selected_period) if selected_period is not None and math.isfinite(float(selected_period)) and selected_period > 0 else None,
+        "power_median": float(power_median) if power_median is not None and math.isfinite(float(power_median)) else None,
+        "power_std": float(power_std) if power_std is not None and math.isfinite(float(power_std)) else None,
+        "point_count": point_count,
+        "shown_count": int(shown_periods.size),
+    }
+
+
 def constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options=None):
     max_duration = min(max_duration, min_period * 0.5)
     if min_duration >= max_duration:
@@ -364,6 +421,8 @@ def estimate_period_with_binned_bls(time, flux, options=None):
 
     powers = np.asarray(powers, dtype=float)
     finite_powers = powers[np.isfinite(powers)]
+    power_median = None
+    power_std = None
     if finite_powers.size >= 5:
         power_median = float(np.median(finite_powers))
         power_std = max(float(np.std(finite_powers)), 1e-9)
@@ -402,6 +461,14 @@ def estimate_period_with_binned_bls(time, flux, options=None):
         "power": best["power"],
         "sde": sde,
         "candidates": candidates,
+        "periodogram": build_periodogram_payload(
+            periods,
+            powers,
+            power_median=power_median,
+            power_std=power_std,
+            method="binned BLS fallback",
+            selected_period=best["period"],
+        ),
         "search_min_period": float(min_period),
         "search_max_period": float(max_period),
         "search_min_duration": float(min_duration),
@@ -476,6 +543,14 @@ def estimate_period_with_bls(time, flux, options=None):
         "power": power,
         "sde": (power - power_median) / power_std,
         "candidates": candidates,
+        "periodogram": build_periodogram_payload(
+            result.period,
+            result.power,
+            power_median=power_median,
+            power_std=power_std,
+            method="BLS",
+            selected_period=period,
+        ),
         "search_min_period": float(min_period),
         "search_max_period": float(max_period),
         "search_min_duration": float(min_duration),
@@ -1221,6 +1296,7 @@ def detect_transits(time, flux, options=None):
     period_sde = None
     period_candidates = []
     period_search = None
+    periodogram = bls_period.get("periodogram") if bls_period is not None else None
     if bls_period is not None and not use_regularity_period:
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
@@ -1311,6 +1387,7 @@ def detect_transits(time, flux, options=None):
         "period_sde": period_sde,
         "period_candidates": period_candidates,
         "period_search": period_search,
+        "periodogram": periodogram,
         "p_value": p_value,
         "p_value_percent": None if p_value is None else p_value * 100.0,
         "chi_squared_flat": chi_squared_flat,

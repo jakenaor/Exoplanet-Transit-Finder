@@ -303,11 +303,11 @@ function markDetectionControlsChanged() {
 }
 
 function canEditBoxes() {
-  return Boolean(currentResult && editBoxesEnabled && currentView !== 'phase');
+  return Boolean(currentResult && editBoxesEnabled && currentView !== 'phase' && currentView !== 'periodogram');
 }
 
 function syncEditButton() {
-  editBoxesButton.disabled = !currentResult || currentView === 'phase';
+  editBoxesButton.disabled = !currentResult || currentView === 'phase' || currentView === 'periodogram';
   editBoxesButton.classList.toggle('active', editBoxesEnabled && !editBoxesButton.disabled);
   if (editBoxesButton.disabled) {
     canvas.classList.remove('editing');
@@ -543,6 +543,61 @@ function hasPhaseFold() {
   return Boolean(currentResult && currentResult.phase_folded && currentResult.phase_folded.phase.length);
 }
 
+function periodogramSeries() {
+  if (!currentResult || !currentResult.periodogram) return null;
+  const payload = currentResult.periodogram;
+  const periods = Array.isArray(payload.periods) ? payload.periods : [];
+  const powers = Array.isArray(payload.power) ? payload.power : [];
+  const sdes = Array.isArray(payload.sde) ? payload.sde : [];
+  const hasSde = sdes.some(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
+  const points = periods.map((period, index) => {
+    const x = Number(period);
+    const power = Number(powers[index]);
+    const sde = sdes[index] === null || sdes[index] === undefined ? NaN : Number(sdes[index]);
+    const value = hasSde ? sde : power;
+    return {
+      period: x,
+      value,
+      power,
+      sde,
+    };
+  }).filter(point => Number.isFinite(point.period) && point.period > 0 && Number.isFinite(point.value))
+    .sort((a, b) => a.period - b.period);
+  if (!points.length) return null;
+  return {
+    points,
+    yLabel: hasSde ? 'SDE' : 'BLS power',
+    valueKey: hasSde ? 'sde' : 'power',
+    method: payload.method || currentResult.period_method || 'period search',
+    fullCount: Number.isFinite(Number(payload.point_count)) ? Number(payload.point_count) : points.length,
+    shownCount: Number.isFinite(Number(payload.shown_count)) ? Number(payload.shown_count) : points.length,
+  };
+}
+
+function hasPeriodogram() {
+  const series = periodogramSeries();
+  return Boolean(series && series.points.length);
+}
+
+function domainForPeriodogram() {
+  const series = periodogramSeries();
+  if (!series) return null;
+  const xValues = series.points.map(point => point.period);
+  const yValues = series.points.map(point => point.value);
+  const xMin = Math.min(...xValues);
+  const xMax = Math.max(...xValues);
+  const yMinRaw = Math.min(...yValues, 0);
+  const yMaxRaw = Math.max(...yValues, 0);
+  const xPad = Math.max((xMax - xMin) * 0.015, xMax * 0.001, 1e-6);
+  const yPad = Math.max((yMaxRaw - yMinRaw) * 0.12, 0.5);
+  return {
+    xMin: Math.max(0, xMin - xPad),
+    xMax: xMax + xPad,
+    yMin: yMinRaw - yPad,
+    yMax: yMaxRaw + yPad,
+  };
+}
+
 function updateChartHeading() {
   if (!currentResult) {
     chartTitleEl.textContent = 'Flux Over Time';
@@ -556,6 +611,17 @@ function updateChartHeading() {
       subtitleEl.textContent = `${currentResult.phase_folded.phase.length.toLocaleString()} folded points centered on phase 0 using a ${fmt(currentResult.phase_folded.period)} day period.`;
     } else {
       subtitleEl.textContent = 'Phase folding needs a detected orbital period.';
+    }
+    return;
+  }
+
+  if (currentView === 'periodogram') {
+    chartTitleEl.textContent = 'Periodogram';
+    const series = periodogramSeries();
+    if (series) {
+      subtitleEl.textContent = `${series.shownCount.toLocaleString()} plotted periods from ${series.fullCount.toLocaleString()} searched. Higher ${series.yLabel} means a stronger repeating transit candidate.`;
+    } else {
+      subtitleEl.textContent = 'Periodogram data is not available for this run.';
     }
     return;
   }
@@ -1694,6 +1760,7 @@ function summaryForExport() {
     },
     period_candidates: currentResult.period_candidates || [],
     period_search: currentResult.period_search || null,
+    periodogram: currentResult.periodogram || null,
     transits: transitRowsForExport(),
   };
 }
@@ -1963,6 +2030,9 @@ function getInitialDomain() {
       yMax: phaseDomain.flux_max,
     };
   }
+  if (currentView === 'periodogram') {
+    return domainForPeriodogram();
+  }
   const zoomReady = currentView === 'zoom' && currentResult.zoom_domain;
   const yDomain = zoomReady ? currentResult.zoom_domain : (currentView === 'raw' ? currentResult.raw_domain : currentResult.clean_domain);
   return {
@@ -1984,6 +2054,9 @@ function getLimitDomain() {
       yMin: phaseDomain.flux_min,
       yMax: phaseDomain.flux_max,
     };
+  }
+  if (currentView === 'periodogram') {
+    return domainForPeriodogram();
   }
   const yDomain = currentView === 'raw' ? currentResult.raw_domain : currentResult.clean_domain;
   return {
@@ -2225,6 +2298,224 @@ function drawNotice(message, width, height) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(message, width / 2, height / 2);
+}
+
+function nearestPeriodogramPoint(points, period) {
+  const target = Number(period);
+  if (!Number.isFinite(target) || target <= 0) return null;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  points.forEach(point => {
+    const distance = Math.abs(point.period - target);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = point;
+    }
+  });
+  return nearest;
+}
+
+function drawPeriodogramLegend(geo, series) {
+  const { width, pad } = geo;
+  const selectedPeriod = Number(currentResult.period);
+  const items = [
+    { color: '#063f3b', text: series.yLabel },
+    { color: '#202124', text: Number.isFinite(selectedPeriod) ? `Selected ${fmt(selectedPeriod, 4)} d` : 'Selected period' },
+    { color: '#b45309', text: 'Top candidates' },
+  ];
+  ctx.save();
+  ctx.font = '700 11px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  const itemWidths = items.map(item => 18 + ctx.measureText(item.text).width + 10);
+  const legendWidth = Math.min(
+    width - pad.left - pad.right,
+    itemWidths.reduce((sum, value) => sum + value, 0) + 12
+  );
+  const xStart = Math.max(pad.left + 8, width - pad.right - legendWidth - 6);
+  let x = xStart + 8;
+  const y = pad.top + 15;
+  ctx.fillStyle = 'rgba(251, 252, 253, 0.9)';
+  ctx.strokeStyle = 'rgba(215, 220, 227, 0.95)';
+  ctx.lineWidth = 1;
+  ctx.fillRect(xStart, pad.top + 4, legendWidth, 22);
+  ctx.strokeRect(xStart, pad.top + 4, legendWidth, 22);
+  items.forEach(item => {
+    const widthNeeded = 18 + ctx.measureText(item.text).width + 10;
+    if (x + widthNeeded > xStart + legendWidth) return;
+    ctx.fillStyle = item.color;
+    ctx.fillRect(x, y - 4, 9, 8);
+    ctx.fillStyle = '#3f4650';
+    ctx.fillText(item.text, x + 14, y);
+    x += widthNeeded;
+  });
+  ctx.restore();
+}
+
+function drawPeriodogramMarker(geo, viewport, xScale, period, color, label, offset = 0, dashed = false) {
+  const periodValue = Number(period);
+  if (!Number.isFinite(periodValue) || periodValue <= 0 || periodValue < viewport.xMin || periodValue > viewport.xMax) return;
+  const { pad, innerH } = geo;
+  const x = xScale(periodValue);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  if (dashed) ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x, pad.top);
+  ctx.lineTo(x, pad.top + innerH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (label) {
+    ctx.fillStyle = color;
+    ctx.font = '700 11px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    const labelX = Math.min(geo.width - pad.right - 72, Math.max(pad.left + 4, x + 5));
+    ctx.fillText(label, labelX, pad.top + 34 + offset);
+  }
+  ctx.restore();
+}
+
+function drawPeriodogramChart(geo) {
+  transitBoxCache = [];
+  const width = geo.width;
+  const height = geo.height;
+  const pad = geo.pad;
+  const innerW = geo.innerW;
+  const innerH = geo.innerH;
+  const series = periodogramSeries();
+  if (!series) {
+    drawNotice('Periodogram data is not available for this run.', width, height);
+    return;
+  }
+
+  const viewport = getViewport();
+  if (!viewport) {
+    drawNotice('Periodogram data is not available for this run.', width, height);
+    return;
+  }
+
+  const xMin = viewport.xMin;
+  const xMax = viewport.xMax;
+  const yMin = viewport.yMin;
+  const yMax = viewport.yMax;
+  const xScale = value => pad.left + ((value - xMin) / (xMax - xMin || 1)) * innerW;
+  const yScale = value => pad.top + (1 - ((value - yMin) / (yMax - yMin || 1))) * innerH;
+
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = '#d6dde5';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#5f6874';
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (innerH * i / 5);
+    const value = yMax - ((yMax - yMin) * i / 5);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 3), pad.left - 8, y);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= 6; i++) {
+    const x = pad.left + (innerW * i / 6);
+    const value = xMin + ((xMax - xMin) * i / 6);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.top + innerH);
+    ctx.lineTo(x, pad.top + innerH + 5);
+    ctx.stroke();
+    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
+  }
+
+  if (yMin < 0 && yMax > 0) {
+    const zeroY = yScale(0);
+    ctx.strokeStyle = 'rgba(95, 104, 116, 0.45)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, zeroY);
+    ctx.lineTo(width - pad.right, zeroY);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, innerW, innerH);
+  ctx.clip();
+
+  ctx.strokeStyle = '#063f3b';
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  let hasLinePoint = false;
+  series.points.forEach(point => {
+    if (point.period < xMin || point.period > xMax) return;
+    const x = xScale(point.period);
+    const y = yScale(point.value);
+    if (!hasLinePoint) {
+      ctx.moveTo(x, y);
+      hasLinePoint = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  if (hasLinePoint) ctx.stroke();
+
+  ctx.fillStyle = 'rgba(15, 118, 110, 0.26)';
+  const pointSize = series.points.length > 1800 ? 1.2 : 1.8;
+  series.points.forEach(point => {
+    if (point.period < xMin || point.period > xMax || point.value < yMin || point.value > yMax) return;
+    ctx.fillRect(xScale(point.period) - pointSize / 2, yScale(point.value) - pointSize / 2, pointSize, pointSize);
+  });
+
+  const candidates = (currentResult.period_candidates || [])
+    .map(candidate => Number(candidate.period))
+    .filter(period => Number.isFinite(period) && period > 0)
+    .filter((period, index, periods) => periods.findIndex(other => Math.abs(other - period) / Math.max(period, 1e-9) < 0.001) === index)
+    .slice(0, 6);
+  candidates.forEach((period, index) => {
+    const nearest = nearestPeriodogramPoint(series.points, period);
+    if (!nearest || nearest.period < xMin || nearest.period > xMax || nearest.value < yMin || nearest.value > yMax) return;
+    const x = xScale(nearest.period);
+    const y = yScale(nearest.value);
+    ctx.fillStyle = index === 0 ? '#0f766e' : '#b45309';
+    ctx.strokeStyle = '#fbfcfd';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x, y, index === 0 ? 4.5 : 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+  ctx.restore();
+
+  candidates.forEach((period, index) => {
+    drawPeriodogramMarker(
+      geo,
+      viewport,
+      xScale,
+      period,
+      index === 0 ? '#0f766e' : '#b45309',
+      index < 3 ? `${fmt(period, 4)} d` : '',
+      index * 13,
+      true
+    );
+  });
+  drawPeriodogramMarker(geo, viewport, xScale, currentResult.period, '#202124', 'Selected', 0, false);
+  drawPeriodogramLegend(geo, series);
+
+  ctx.fillStyle = '#202124';
+  ctx.font = '700 12px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(series.yLabel, 14, 16);
+  ctx.textAlign = 'right';
+  ctx.fillText('Period days', width - 22, height - 22);
+  updateCanvasCursor(lastPointer);
 }
 
 canvas.addEventListener('pointermove', event => {
@@ -2608,6 +2899,11 @@ function drawChart() {
   const height = geo.height;
   ctx.clearRect(0, 0, width, height);
   if (!currentResult) return;
+
+  if (currentView === 'periodogram') {
+    drawPeriodogramChart(geo);
+    return;
+  }
 
   if (currentView === 'phase') {
     drawPhaseChart(geo);
