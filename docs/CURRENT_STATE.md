@@ -75,6 +75,10 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
+- BLS harmonic de-aliasing:
+  - Checks strong longer-period candidates near `2x`, `3x`, or `4x` the top BLS peak.
+  - Promotes the longer BLS candidate when it matches nearly the same boxed transits and avoids the short-period harmonic.
+  - Keeps the original short alias in the candidate list for inspection.
 - Transit-regularity period override:
   - Scores candidate periods by how many unique predicted transit events are covered by detected boxes.
   - Can replace a long BLS alias when a shorter cadence explains substantially more events.
@@ -175,6 +179,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Ephemeris audit view made the irregular false-positive failure mode visible instead of only numeric.
 - The Kepler desktop sample now selects the denser transit-box regularity instead of the sparse `~294` day BLS alias while keeping the verdict cautious.
 - The TRAPPIST-1 desktop sample now prefers a dense short-period regularity instead of the sparse `~6.08` day BLS alias.
+- The WASP-4 desktop sample now promotes the `~1.3457` day BLS candidate over the `~0.6679` day half-period alias.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -235,6 +240,7 @@ Observed verification results from recent work:
 - 2026-07-20 clean synthetic transit after ephemeris vetting: `strong_candidate`, score `100`, ephemeris fit `8/8`.
 - 2026-07-20 Kepler desktop sample after transit-regularity override: `possible_candidate`, score `48`, selected period about `55.36` days, `19/26` predicted events covered; irregular false-positive fixture remains `no_planet_like_signal`.
 - 2026-07-20 TRAPPIST-1 desktop sample after dense-regularity tuning: `possible_candidate`, score `51`, selected period about `0.75` days, ephemeris fit `18/30`; irregular false-positive fixture remains `no_planet_like_signal`.
+- 2026-07-20 WASP-4 desktop sample after BLS harmonic de-aliasing: `strong_candidate`, score `100`, selected period about `1.3457` days; the previous `~0.6679` day half-period remains in the candidate list.
 
 Commands used for basic checks:
 

@@ -790,6 +790,140 @@ def should_prefer_regularity_period(regularity_period, bls_period, transits, tim
     )
 
 
+def dealiased_bls_period(bls_period, transits, time, flux):
+    if bls_period is None or len(transits) < 3:
+        return bls_period
+
+    top_period = finite_number(bls_period.get("period"))
+    top_power = finite_number(bls_period.get("power"))
+    if top_period is None or top_period <= 0 or top_power is None or top_power <= 0:
+        return bls_period
+
+    candidates = [
+        candidate
+        for candidate in bls_period.get("candidates", [])
+        if finite_number(candidate.get("period")) is not None
+    ]
+    if len(candidates) < 2:
+        return bls_period
+
+    centers = np.asarray([item["center"] for item in transits], dtype=float)
+    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
+    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
+    top_score = score_transit_regularity_period(
+        centers,
+        durations,
+        depths,
+        float(time[0]),
+        float(time[-1]),
+        top_period,
+    )
+    if top_score is None:
+        return bls_period
+
+    best = None
+    for candidate in candidates:
+        candidate_period = finite_number(candidate.get("period"))
+        candidate_power = finite_number(candidate.get("power"))
+        candidate_sde = finite_number(candidate.get("sde"))
+        if candidate_period is None or candidate_power is None:
+            continue
+        if candidate_period <= top_period * 1.5:
+            continue
+
+        ratio = candidate_period / top_period
+        harmonic = int(round(ratio))
+        if harmonic < 2 or harmonic > 4:
+            continue
+        if abs(ratio / harmonic - 1.0) > 0.035:
+            continue
+        if candidate_power / top_power < 0.75:
+            continue
+        if candidate_sde is not None and candidate_sde < 5.0:
+            continue
+
+        candidate_score = score_transit_regularity_period(
+            centers,
+            durations,
+            depths,
+            float(time[0]),
+            float(time[-1]),
+            candidate_period,
+        )
+        if candidate_score is None:
+            continue
+
+        top_box_count = int(top_score.get("box_match_count", 0))
+        top_event_count = int(top_score.get("event_match_count", 0))
+        candidate_box_count = int(candidate_score.get("box_match_count", 0))
+        candidate_event_count = int(candidate_score.get("event_match_count", 0))
+        if candidate_box_count < max(3, int(math.floor(top_box_count * 0.9))):
+            continue
+        if candidate_event_count < max(3, int(math.floor(top_event_count * 0.9))):
+            continue
+        if candidate_score["expected_count"] >= top_score["expected_count"] * 0.75:
+            continue
+
+        selection_key = (
+            candidate_box_count,
+            candidate_event_count,
+            candidate_power / top_power,
+            candidate_sde if candidate_sde is not None else 0.0,
+            candidate_period,
+        )
+        if best is None or selection_key > best["selection_key"]:
+            best = {
+                "candidate": candidate,
+                "score": candidate_score,
+                "harmonic": harmonic,
+                "selection_key": selection_key,
+            }
+
+    if best is None:
+        return bls_period
+
+    candidate = best["candidate"]
+    score = best["score"]
+    flattened_flux = flattened_flux_for_period_search(time, flux)
+    chi_squared = None if flattened_flux is None else chi_squared_transit_probability(
+        time,
+        flattened_flux,
+        score["period"],
+        score["duration"],
+        score["transit_time"],
+    )
+
+    selected_period = score["period"]
+    selected_candidates = []
+    selected_seen = set()
+    for item in [candidate, *candidates]:
+        item_period = finite_number(item.get("period"))
+        if item_period is None:
+            continue
+        key = round(item_period, 10)
+        if key in selected_seen:
+            continue
+        selected_seen.add(key)
+        selected_candidates.append(item)
+
+    return {
+        **bls_period,
+        "period": selected_period,
+        "scatter": score["scatter"],
+        "count": score["expected_count"],
+        "duration": score["duration"],
+        "transit_time": score["transit_time"],
+        "power": finite_number(candidate.get("power")) or bls_period.get("power"),
+        "sde": finite_number(candidate.get("sde")),
+        "candidates": selected_candidates,
+        "harmonic_alias_corrected": True,
+        "harmonic_alias_period": top_period,
+        "harmonic_alias_factor": best["harmonic"],
+        "harmonic_alias_power_ratio": (finite_number(candidate.get("power")) or 0.0) / top_power,
+        **(chi_squared or {}),
+    }
+
+
 def time_at_fractional_index(time, index_position):
     if index_position <= 0:
         return float(time[0])
@@ -1074,6 +1208,7 @@ def detect_transits(time, flux, options=None):
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
     bls_period = estimate_period_with_bls(time, flux, options)
+    bls_period = dealiased_bls_period(bls_period, transits, time, flux)
     regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
     use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
     p_value = None
@@ -1086,6 +1221,10 @@ def detect_transits(time, flux, options=None):
     period_sde = None
     period_candidates = []
     period_search = None
+    harmonic_alias_corrected = False
+    harmonic_alias_period = None
+    harmonic_alias_factor = None
+    harmonic_alias_power_ratio = None
     if bls_period is not None and not use_regularity_period:
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
@@ -1100,6 +1239,10 @@ def detect_transits(time, flux, options=None):
         period_duration = bls_period.get("duration")
         period_sde = bls_period.get("sde")
         period_candidates = bls_period.get("candidates", [])
+        harmonic_alias_corrected = bool(bls_period.get("harmonic_alias_corrected"))
+        harmonic_alias_period = bls_period.get("harmonic_alias_period")
+        harmonic_alias_factor = bls_period.get("harmonic_alias_factor")
+        harmonic_alias_power_ratio = bls_period.get("harmonic_alias_power_ratio")
         if regularity_period is not None:
             period_candidates = [
                 {
@@ -1139,6 +1282,10 @@ def detect_transits(time, flux, options=None):
             *(bls_period.get("candidates", []) if bls_period is not None else []),
         ]
         if bls_period is not None:
+            harmonic_alias_corrected = bool(bls_period.get("harmonic_alias_corrected"))
+            harmonic_alias_period = bls_period.get("harmonic_alias_period")
+            harmonic_alias_factor = bls_period.get("harmonic_alias_factor")
+            harmonic_alias_power_ratio = bls_period.get("harmonic_alias_power_ratio")
             period_search = {
                 "min_period": bls_period.get("search_min_period"),
                 "max_period": bls_period.get("search_max_period"),
@@ -1176,6 +1323,10 @@ def detect_transits(time, flux, options=None):
         "period_sde": period_sde,
         "period_candidates": period_candidates,
         "period_search": period_search,
+        "harmonic_alias_corrected": harmonic_alias_corrected,
+        "harmonic_alias_period": harmonic_alias_period,
+        "harmonic_alias_factor": harmonic_alias_factor,
+        "harmonic_alias_power_ratio": harmonic_alias_power_ratio,
         "p_value": p_value,
         "p_value_percent": None if p_value is None else p_value * 100.0,
         "chi_squared_flat": chi_squared_flat,
