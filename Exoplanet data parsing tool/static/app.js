@@ -2,6 +2,7 @@ const fileInput = document.getElementById('fileInput');
 const dropzone = document.getElementById('dropzone');
 const analyzeButton = document.getElementById('analyzeButton');
 const statusEl = document.getElementById('status');
+const assessmentEl = document.getElementById('assessment');
 const metricsEl = document.getElementById('metrics');
 const warningsEl = document.getElementById('warnings');
 const periodCandidatesEl = document.getElementById('periodCandidates');
@@ -158,7 +159,7 @@ function renderBatchSelect() {
     const disabled = item.error ? ' disabled' : '';
     const detail = item.error
       ? 'failed'
-      : `${item.result.transits.length} transits`;
+      : `${assessmentForResult(item.result).shortLabel}; ${item.result.transits.length} transits`;
     return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
   }).join('');
   syncExportButtons();
@@ -253,6 +254,15 @@ function clearResultView() {
   transitBoxCache = [];
   editBoxesEnabled = false;
   emptyEl.style.display = 'grid';
+  assessmentEl.innerHTML = `
+    <div class="assessment-card pending">
+      <div class="assessment-head">
+        <strong>No dataset analyzed</strong>
+        <span>-</span>
+      </div>
+      <p>Candidate verdict appears after analysis.</p>
+    </div>
+  `;
   metricsEl.innerHTML = `
     <div class="metric"><span>Data points</span><span>-</span></div>
     <div class="metric"><span>Transits</span><span>-</span></div>
@@ -394,14 +404,24 @@ analyzeButton.addEventListener('click', async () => {
 
     const successCount = batchResults.filter(item => item.result).length;
     const failureCount = batchResults.length - successCount;
+    const assessments = batchResults
+      .filter(item => item.result)
+      .map(item => assessmentForResult(item.result));
+    const signalCount = assessments.filter(assessment => (
+      assessment.status === 'strong_candidate' || assessment.status === 'possible_candidate'
+    )).length;
+    const noSignalCount = assessments.filter(assessment => assessment.status === 'no_planet_like_signal').length;
+    const verdictSummary = successCount
+      ? ` ${signalCount} candidate-like, ${noSignalCount} no credible signal.`
+      : '';
     if (successCount && currentBatchIndex === -1) {
       const firstSuccessIndex = batchResults.findIndex(item => item.result);
       selectBatchResult(firstSuccessIndex);
     }
     setStatus(
       failureCount
-        ? `Batch complete: ${successCount}/${batchResults.length} processed, ${failureCount} failed.`
-        : `Batch complete: ${successCount}/${batchResults.length} processed.`
+        ? `Batch complete: ${successCount}/${batchResults.length} processed, ${failureCount} failed.${verdictSummary}`
+        : `Batch complete: ${successCount}/${batchResults.length} processed.${verdictSummary}`
     , failureCount > 0 && successCount === 0);
   } finally {
     batchInProgress = false;
@@ -539,6 +559,20 @@ function currentAnalysisMetrics() {
   const radiusRatios = currentResult.transits
     .map(transit => Number(transit.radius_ratio))
     .filter(value => Number.isFinite(value) && value >= 0);
+  const rawDepths = currentResult.transits
+    .map(transit => Number(transit.depth))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const transitPoints = currentResult.transits
+    .map(transit => Number(transit.points))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  const oddDepths = rawDepths.filter((_, index) => index % 2 === 0);
+  const evenDepths = rawDepths.filter((_, index) => index % 2 === 1);
+  const oddMedian = median(oddDepths);
+  const evenMedian = median(evenDepths);
+  const editedOddEvenMismatch = (
+    oddMedian !== null && evenMedian !== null && Math.max(oddMedian, evenMedian) > 0
+  ) ? Math.abs(oddMedian - evenMedian) / Math.max(oddMedian, evenMedian) : null;
+  const editedDepthScatterRatio = coefficientOfVariation(rawDepths);
   const metrics = {
     period: currentResult.period,
     periodMethod: currentResult.period_method,
@@ -551,8 +585,10 @@ function currentAnalysisMetrics() {
     medianDepthFraction: median(depthFractions),
     medianRadiusRatio: median(radiusRatios),
     detectionSnr: currentResult.detection_snr,
-    oddEvenDepthMismatch: currentResult.odd_even_depth_mismatch,
-    depthScatterRatio: currentResult.depth_scatter_ratio,
+    oddEvenDepthMismatch: currentResult.boxesEdited ? editedOddEvenMismatch : currentResult.odd_even_depth_mismatch,
+    depthScatterRatio: currentResult.boxesEdited ? editedDepthScatterRatio : currentResult.depth_scatter_ratio,
+    medianTransitPoints: median(transitPoints),
+    maxRadiusRatio: radiusRatios.length ? Math.max(...radiusRatios) : null,
   };
 
   if (currentResult.boxesEdited) {
@@ -681,10 +717,280 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
   return warnings;
 }
 
-function renderWarnings() {
+function scoreBand(value, bands) {
+  if (!Number.isFinite(Number(value))) return null;
+  const numeric = Number(value);
+  for (const [threshold, points, title, detail] of bands) {
+    if (numeric >= threshold) return { points, title, detail };
+  }
+  return null;
+}
+
+function buildPlanetAssessment(metrics, warnings) {
+  const transits = currentResult ? currentResult.transits || [] : [];
+  const transitCount = transits.length;
+  const period = Number.isFinite(Number(metrics.period)) ? Number(metrics.period) : null;
+  const periodMethod = metrics.periodMethod || null;
+  const periodSde = Number.isFinite(Number(metrics.periodSde)) ? Number(metrics.periodSde) : null;
+  const detectionSnr = Number.isFinite(Number(metrics.detectionSnr)) ? Number(metrics.detectionSnr) : null;
+  const pValue = Number.isFinite(Number(metrics.pValue)) ? Number(metrics.pValue) : null;
+  const depthScatterRatio = Number.isFinite(Number(metrics.depthScatterRatio)) ? Number(metrics.depthScatterRatio) : null;
+  const oddEvenMismatch = Number.isFinite(Number(metrics.oddEvenDepthMismatch)) ? Number(metrics.oddEvenDepthMismatch) : null;
+  const maxRadiusRatio = Number.isFinite(Number(metrics.maxRadiusRatio)) ? Number(metrics.maxRadiusRatio) : null;
+  const medianTransitPoints = Number.isFinite(Number(metrics.medianTransitPoints)) ? Number(metrics.medianTransitPoints) : null;
+  const supportingEvidence = [];
+  const limitingEvidence = [];
+  let score = 0;
+
+  const support = (title, detail, points) => {
+    score += points;
+    supportingEvidence.push({ title, detail, points });
+  };
+  const limit = (title, detail, points) => {
+    score += points;
+    limitingEvidence.push({ title, detail, points });
+  };
+
+  if (transitCount >= 3) {
+    support('Repeated transit-like events', `${transitCount} candidate dips were boxed.`, 20);
+  } else if (transitCount > 0) {
+    support('Transit-like dip found', `${transitCount} candidate dip${transitCount === 1 ? ' was' : 's were'} boxed.`, 6);
+    limit('Too few events', 'Fewer than three events is weak evidence for an orbital period.', -8);
+  } else {
+    limit('No boxed transit events', 'The detector did not find statistically strong local dips.', -28);
+  }
+
+  if (period !== null && period > 0 && periodMethod === 'BLS') {
+    support('Stable BLS period', `Best period is ${fmt(period, 6)} days from the BLS search.`, 22);
+  } else if (period !== null && period > 0) {
+    support('Provisional period', `Estimated period is ${fmt(period, 6)} days from ${periodMethod || 'candidate spacing'}.`, 10);
+    limit('Period is not a BLS peak', 'The repeating period needs manual confirmation.', -4);
+  } else {
+    limit('No stable period', 'A repeating orbital period was not recovered.', -18);
+  }
+
+  const sdeBand = scoreBand(periodSde, [
+    [10, 22, 'Very strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
+    [7, 17, 'Strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
+    [5, 8, 'Moderate period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
+  ]);
+  if (sdeBand) {
+    support(sdeBand.title, sdeBand.detail, sdeBand.points);
+  } else if (periodSde !== null) {
+    limit('Weak period peak', `Period SDE is only ${fmt(periodSde, 2)}.`, -10);
+  }
+
+  const snrBand = scoreBand(detectionSnr, [
+    [10, 22, 'High transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
+    [7, 16, 'Good transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
+    [5, 8, 'Marginal transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
+  ]);
+  if (snrBand) {
+    support(snrBand.title, snrBand.detail, snrBand.points);
+  } else if (detectionSnr !== null) {
+    limit('Low transit depth SNR', `Median depth is only ${fmt(detectionSnr, 2)}x the robust noise.`, -14);
+  }
+
+  if (pValue !== null) {
+    if (pValue <= 1e-6) {
+      support('Very significant box model', 'The transit model strongly beats a flat light curve.', 16);
+    } else if (pValue <= 1e-4) {
+      support('Significant box model', 'The transit model clearly beats a flat light curve.', 12);
+    } else if (pValue <= 0.01) {
+      support('Useful box-model improvement', 'The transit model improves over a flat light curve.', 8);
+    } else {
+      limit('Weak box-model significance', 'The transit model is not much better than a flat light curve.', -12);
+    }
+  }
+
+  if (depthScatterRatio !== null && transitCount >= 4) {
+    if (depthScatterRatio <= 0.35) {
+      support('Consistent transit depths', `Depth scatter ratio is ${fmt(depthScatterRatio, 2)}.`, 7);
+    } else if (depthScatterRatio > 0.8) {
+      limit('Inconsistent transit depths', `Depth scatter ratio is ${fmt(depthScatterRatio, 2)}.`, -12);
+    } else if (depthScatterRatio > 0.5) {
+      limit('Moderately inconsistent depths', `Depth scatter ratio is ${fmt(depthScatterRatio, 2)}.`, -6);
+    }
+  }
+
+  if (oddEvenMismatch !== null && transitCount >= 4) {
+    if (oddEvenMismatch <= 0.25) {
+      support('Odd/even depths agree', `Odd/even mismatch is ${fmt(oddEvenMismatch, 2)}.`, 6);
+    } else if (oddEvenMismatch > 0.5) {
+      limit('Odd/even depth mismatch', 'Alternating depths can indicate an eclipsing binary or blend.', -18);
+    } else if (oddEvenMismatch > 0.35) {
+      limit('Possible odd/even mismatch', `Odd/even mismatch is ${fmt(oddEvenMismatch, 2)}.`, -8);
+    }
+  }
+
+  if (maxRadiusRatio !== null) {
+    if (maxRadiusRatio <= 0.2) {
+      support('Planet-sized radius ratio', `Maximum Rp/Rs estimate is ${fmt(maxRadiusRatio, 3)}.`, 4);
+    } else if (maxRadiusRatio > 0.3) {
+      limit('Very large radius ratio', `Maximum Rp/Rs estimate is ${fmt(maxRadiusRatio, 3)}.`, -16);
+    } else {
+      limit('Large radius ratio', `Maximum Rp/Rs estimate is ${fmt(maxRadiusRatio, 3)}.`, -8);
+    }
+  }
+
+  if (medianTransitPoints !== null) {
+    if (medianTransitPoints >= 8) {
+      support('Well-sampled events', `Median transit has ${fmt(medianTransitPoints, 0)} plotted points.`, 4);
+    } else if (medianTransitPoints < 4) {
+      limit('Sparse transit sampling', `Median transit has only ${fmt(medianTransitPoints, 0)} plotted points.`, -6);
+    }
+  }
+
+  const dangerCount = warnings.filter(warning => warning.severity === 'danger').length;
+  const cautionCount = warnings.filter(warning => warning.severity === 'caution').length;
+  if (dangerCount) score -= dangerCount * 10;
+  if (cautionCount >= 3) score -= 6;
+
+  const candidateScore = Math.round(Math.max(0, Math.min(100, score)));
+  const strongRequirementsMet = (
+    transitCount >= 3
+    && period !== null
+    && periodMethod === 'BLS'
+    && detectionSnr !== null
+    && detectionSnr >= 7
+    && (periodSde === null || periodSde >= 5)
+    && dangerCount === 0
+  );
+
+  let status;
+  let title;
+  let shortLabel;
+  let summary;
+  let recommendation;
+
+  if (transitCount === 0) {
+    const hasUnboxedPeriodSignal = (
+      candidateScore >= 35
+      && periodSde !== null
+      && periodSde >= 7
+      && (pValue === null || pValue <= 0.01)
+    );
+    if (hasUnboxedPeriodSignal) {
+      status = 'inconclusive';
+      title = 'Period signal needs review';
+      shortLabel = 'Inconclusive';
+      summary = 'The period search found some signal, but the local detector did not box credible transit events. This needs manual review before calling it an exoplanet candidate.';
+      recommendation = 'Inspect the phase-folded view and try adjusted duration/strictness bounds.';
+    } else {
+      status = 'no_planet_like_signal';
+      title = 'No planet-like transit detected';
+      shortLabel = 'No credible signal';
+      summary = 'No statistically credible repeating transit signal was found. This dataset may not contain a detectable transiting exoplanet at the current settings.';
+      recommendation = 'Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve.';
+    }
+  } else if (candidateScore >= 75 && strongRequirementsMet) {
+    status = 'strong_candidate';
+    title = 'Strong planet-like transit candidate';
+    shortLabel = 'Strong candidate';
+    summary = 'Repeated dips align with a stable period and pass the current signal-strength checks. This is a strong candidate, not a confirmed planet.';
+    recommendation = 'Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed.';
+  } else if (candidateScore >= 45 && transitCount >= 2) {
+    status = 'possible_candidate';
+    title = 'Possible transit candidate';
+    shortLabel = 'Possible candidate';
+    summary = 'The dataset contains some planet-like transit evidence, but one or more checks are not strong enough for a confident candidate call.';
+    recommendation = 'Review warnings, period aliases, and the phase-folded view.';
+  } else {
+    status = 'no_planet_like_signal';
+    title = 'No credible planet-like signal';
+    shortLabel = 'No credible signal';
+    summary = 'Detected dips do not currently pass enough planet-likeness checks. This dataset may not contain a detectable transiting exoplanet.';
+    recommendation = 'Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious.';
+  }
+
+  return {
+    status,
+    title,
+    shortLabel,
+    short_label: shortLabel,
+    candidateScore,
+    candidate_score: candidateScore,
+    summary,
+    recommendation,
+    supportingEvidence,
+    supporting_evidence: supportingEvidence,
+    limitingEvidence,
+    limiting_evidence: limitingEvidence,
+    inputs: {
+      transit_count: transitCount,
+      period,
+      period_method: periodMethod,
+      period_sde: periodSde,
+      detection_snr: detectionSnr,
+      p_value: pValue,
+      depth_scatter_ratio: depthScatterRatio,
+      odd_even_depth_mismatch: oddEvenMismatch,
+      max_radius_ratio: maxRadiusRatio,
+      median_transit_points: medianTransitPoints,
+      warning_count: warnings.length,
+      danger_warning_count: dangerCount,
+      caution_warning_count: cautionCount,
+    },
+  };
+}
+
+function currentPlanetAssessment(metrics = null, warnings = null) {
+  if (!currentResult) return null;
+  const resolvedMetrics = metrics || currentAnalysisMetrics();
+  const resolvedWarnings = warnings || currentWarnings(resolvedMetrics);
+  return buildPlanetAssessment(resolvedMetrics, resolvedWarnings);
+}
+
+function assessmentForResult(result) {
+  const previousResult = currentResult;
+  currentResult = result;
+  try {
+    const metrics = currentAnalysisMetrics();
+    return currentPlanetAssessment(metrics, currentWarnings(metrics));
+  } finally {
+    currentResult = previousResult;
+  }
+}
+
+function evidenceListHtml(items) {
+  return items.slice(0, 3).map(item => `
+    <div>
+      <strong>${escapeHtml(item.title)}</strong>
+      <span>${escapeHtml(item.detail)}</span>
+    </div>
+  `).join('');
+}
+
+function renderAssessment(metrics = null, warnings = null) {
   if (!currentResult) return;
-  const warnings = currentWarnings();
-  if (!warnings.length) {
+  const resolvedMetrics = metrics || currentAnalysisMetrics();
+  const resolvedWarnings = warnings || currentWarnings(resolvedMetrics);
+  const assessment = currentPlanetAssessment(resolvedMetrics, resolvedWarnings);
+  const evidenceHtml = evidenceListHtml(
+    assessment.status === 'strong_candidate'
+      ? assessment.supportingEvidence
+      : [...assessment.limitingEvidence, ...assessment.supportingEvidence]
+  );
+  assessmentEl.innerHTML = `
+    <div class="assessment-card ${assessment.status}">
+      <div class="assessment-head">
+        <strong>${escapeHtml(assessment.title)}</strong>
+        <span>${assessment.candidateScore}/100</span>
+      </div>
+      <p>${escapeHtml(assessment.summary)}</p>
+      <div class="score-track" aria-label="Candidate score">
+        <div class="score-fill" style="width: ${assessment.candidateScore}%;"></div>
+      </div>
+      <p>${escapeHtml(assessment.recommendation)}</p>
+      ${evidenceHtml ? `<div class="assessment-evidence">${evidenceHtml}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderWarnings(warnings = null) {
+  if (!currentResult) return;
+  const resolvedWarnings = warnings || currentWarnings();
+  if (!resolvedWarnings.length) {
     warningsEl.innerHTML = `
       <div class="warning-item info">
         <strong>No major warnings</strong>
@@ -693,7 +999,7 @@ function renderWarnings() {
     `;
     return;
   }
-  warningsEl.innerHTML = warnings.map(warning => `
+  warningsEl.innerHTML = resolvedWarnings.map(warning => `
     <div class="warning-item ${warning.severity}">
       <strong>${warning.title}</strong>
       <span>${warning.detail}</span>
@@ -724,10 +1030,12 @@ function renderPeriodCandidates() {
 function renderMetrics() {
   if (!currentResult) return;
   const metrics = currentAnalysisMetrics();
+  const warnings = currentWarnings(metrics);
   const period = metrics.period === null || metrics.period === undefined
     ? 'Not enough transits'
     : `${fmt(metrics.period)} days${metrics.periodMethod ? ` (${metrics.periodMethod})` : ''}`;
 
+  renderAssessment(metrics, warnings);
   metricsEl.innerHTML = `
     <div class="metric"><span>Data points</span><span>${currentResult.total_points.toLocaleString()}</span></div>
     <div class="metric"><span>Transits</span><span>${currentResult.transits.length}</span></div>
@@ -743,7 +1051,7 @@ function renderMetrics() {
     <div class="metric"><span>Noise</span><span>${fmt(currentResult.robust_noise)}</span></div>
   `;
   renderPeriodCandidates();
-  renderWarnings();
+  renderWarnings(warnings);
 }
 
 function renderResult(result) {
@@ -861,6 +1169,7 @@ function exportTransitCsv() {
 function summaryForExport() {
   const metrics = currentAnalysisMetrics();
   const warnings = currentWarnings(metrics);
+  const planetAssessment = currentPlanetAssessment(metrics, warnings);
   return {
     exported_at: new Date().toISOString(),
     source_file: selectedFile ? selectedFile.name : null,
@@ -872,6 +1181,7 @@ function summaryForExport() {
     normalization: currentResult.normalization,
     detection_options: currentResult.detection_options,
     boxes_edited: Boolean(currentResult.boxesEdited),
+    planet_assessment: planetAssessment,
     warnings,
     diagnostics: {
       detection_snr: metrics.detectionSnr,
@@ -914,25 +1224,28 @@ function metricsForResult(result) {
 }
 
 const analysisPdfColumns = [
-  { key: 'file', label: 'File', width: 150, align: 'left' },
+  { key: 'file', label: 'File', width: 135, align: 'left' },
+  { key: 'assessment', label: 'Assessment', width: 110, align: 'left' },
+  { key: 'score', label: 'Score', width: 42, align: 'right' },
   { key: 'points', label: 'Data points', width: 55, align: 'right' },
   { key: 'transits', label: 'Transits', width: 45, align: 'right' },
-  { key: 'period', label: 'Period d', width: 70, align: 'right' },
-  { key: 'method', label: 'Method', width: 55, align: 'left' },
-  { key: 'depthPercent', label: 'Depth %', width: 60, align: 'right' },
-  { key: 'depthPpm', label: 'Depth ppm', width: 65, align: 'right' },
-  { key: 'radiusRatio', label: 'Rp/Rs', width: 50, align: 'right' },
-  { key: 'snr', label: 'Depth SNR', width: 55, align: 'right' },
-  { key: 'sde', label: 'Period SDE', width: 55, align: 'right' },
-  { key: 'pValue', label: 'Chi-sq p %', width: 65, align: 'right' },
-  { key: 'reducedChi', label: 'Red chi-sq', width: 60, align: 'right' },
-  { key: 'jdStart', label: 'JD start', width: 75, align: 'right' },
-  { key: 'medianFlux', label: 'Med flux', width: 60, align: 'right' },
-  { key: 'noise', label: 'Noise', width: 60, align: 'right' },
+  { key: 'period', label: 'Period d', width: 62, align: 'right' },
+  { key: 'method', label: 'Method', width: 48, align: 'left' },
+  { key: 'depthPercent', label: 'Depth %', width: 54, align: 'right' },
+  { key: 'depthPpm', label: 'Depth ppm', width: 58, align: 'right' },
+  { key: 'radiusRatio', label: 'Rp/Rs', width: 46, align: 'right' },
+  { key: 'snr', label: 'Depth SNR', width: 50, align: 'right' },
+  { key: 'sde', label: 'Period SDE', width: 50, align: 'right' },
+  { key: 'pValue', label: 'Chi-sq p %', width: 58, align: 'right' },
+  { key: 'reducedChi', label: 'Red chi-sq', width: 54, align: 'right' },
+  { key: 'jdStart', label: 'JD start', width: 66, align: 'right' },
+  { key: 'medianFlux', label: 'Med flux', width: 52, align: 'right' },
+  { key: 'noise', label: 'Noise', width: 50, align: 'right' },
 ];
 
 function analysisPdfRow(fileName, result) {
   const metrics = metricsForResult(result);
+  const assessment = assessmentForResult(result);
   const depthPpm = metrics.medianDepthFraction === null || metrics.medianDepthFraction === undefined
     ? null
     : metrics.medianDepthFraction * 1000000;
@@ -941,6 +1254,8 @@ function analysisPdfRow(fileName, result) {
     : metrics.pValue * 100;
   return {
     file: fileName || result.source_file || 'analysis',
+    assessment: assessment.shortLabel,
+    score: assessment.candidateScore.toString(),
     points: result.total_points.toLocaleString(),
     transits: result.transits.length.toString(),
     period: fmt(metrics.period, 6),

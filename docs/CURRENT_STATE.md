@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-06-03
+Last updated: 2026-07-20
 
 ## Canonical Location
 
@@ -61,6 +61,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Batch upload support for up to `100` files.
 - Sequential batch processing through the existing `/analyze` endpoint.
 - Batch Results dropdown for switching between processed filenames.
+- Batch dropdown labels include the current planet-candidate verdict for each successful file.
 - Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
@@ -108,12 +109,18 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Warnings panel for low-SNR, few-transit, no-period, provisional-period, weak-significance, odd/even mismatch, inconsistent-depth, large-radius-ratio, and sparse-sampling cases.
   - Depth SNR, period SDE, and reduced chi-squared metrics in the Analysis panel.
   - Warning and diagnostic fields included in summary JSON exports.
+- Planet/no-planet assessment:
+  - Backend emits a `planet_assessment` object for every analysis.
+  - Frontend shows a `Planet Check` panel with a 0-100 candidate score.
+  - Verdict states include `strong_candidate`, `possible_candidate`, `inconclusive`, and `no_planet_like_signal`.
+  - The no-signal verdict is phrased as no detectable planet-like transit at the current settings, not proof that no planet exists.
+  - Manual box edits recompute the visible verdict client-side.
 - Export controls:
   - Transit CSV, including edited boxes and original JD columns.
   - Current graph PNG.
-  - Summary JSON with metrics, detection options, warnings, and transits.
-  - Analysis PDF for the currently selected file.
-  - Batch PDF table for all successfully processed uploaded files.
+  - Summary JSON with metrics, detection options, warnings, `planet_assessment`, and transits.
+  - Analysis PDF for the currently selected file, including assessment and candidate score.
+  - Batch PDF table for all successfully processed uploaded files, including assessment and candidate score.
 
 ## Important Implementation Decisions
 
@@ -130,6 +137,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
 - Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
 - Chi-squared p-value is an approximate model-vs-flat significance metric, not a literal probability that a planet is real.
+- The planet assessment is a heuristic vetting layer. It combines transit count, BLS period, period SDE, depth SNR, chi-squared improvement, depth consistency, odd/even mismatch, radius ratio, point counts, and warning severity.
+- `no_planet_like_signal` means the current data/settings do not contain a credible detectable transiting-exoplanet signal. It is not a universal statement that the target has no planets.
 - Exports are client-side downloads.
 - `docs/CURRENT_STATE.md` is now tracked in git. `docs/REPO_MAP.md` is still ignored by `.gitignore` unless it is intentionally force-added.
 
@@ -147,6 +156,9 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Batch uploads work for mixed successful/failed files and preserve filename switching.
 - PDF analysis exports work for both the selected file and all successful batch results.
 - Splitting the monolithic file made the code easier to navigate without changing the local startup command.
+- Synthetic positive/no-signal tests now demonstrate both sides of the new assessment layer:
+  - A clean injected-transit dataset returns `strong_candidate`.
+  - A flat/noisy dataset returns `no_planet_like_signal`.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -191,6 +203,10 @@ Observed verification results from recent work:
 - Batch CSV fixture 1: `8` transits, period about `1.69795663` days.
 - Batch CSV fixture 2: `6` transits, period about `2.29867111` days.
 - Earlier HD 209458 CSV run: `15` transits, BLS period about `3.5242522516600965` days, segment count `4`, SNR about `50.67`.
+- 2026-07-20 direct synthetic transit test: `strong_candidate`, score `100`, `8` transits, BLS period about `3.502190694763197` days, period SDE about `13.578`.
+- 2026-07-20 direct flat/noisy test: `no_planet_like_signal`, score `18`, `0` transits.
+- 2026-07-20 HTTP upload positive CSV test: `strong_candidate`, score `100`, `8` transits.
+- 2026-07-20 HTTP upload flat/noisy CSV test: `no_planet_like_signal`, score `0`, `0` transits.
 
 Commands used for basic checks:
 
@@ -205,12 +221,15 @@ PYTHONPYCACHEPREFIX=/private/tmp/transit-pycache .venv/bin/python -m py_compile 
 
 Browser JavaScript has also been syntax-checked with macOS `osascript -l JavaScript` when no in-app browser was available.
 
+As of 2026-07-20, the in-app browser surface was unavailable in the coding session, so visible UI verification was replaced with static asset `GET` checks and endpoint upload checks.
+
 ## Known Limitations
 
 - Manual box edits are not persisted after re-analysis or page reload.
 - The p-value recomputed after manual edits uses frontend plotted/smoothed data, not the full backend dataset. This is useful for feedback but less rigorous than a backend recompute.
 - Exports are client-side downloads.
 - False-positive warnings are heuristic and advisory; they do not prove or disprove that a candidate is planetary.
+- The Planet Check verdict is heuristic and should be treated as a candidate/no-detection triage layer, not confirmation or publication-grade validation.
 - Top period candidates are exposed, but harmonics/aliases are not yet analyzed deeply.
 - Broad automated period search can still prefer aliases. Use period min/max controls when a target period range is known.
 - Batch processing is sequential and client-driven. Very large batches can take a while and do not yet have cancellation or backend progress streaming.
@@ -262,7 +281,7 @@ This project is intended to become a more user-friendly version of Transit Least
 
 ## Planned Feature Order
 
-The user asked to proceed through features 1 through 8. Current status:
+Current feature sequence status:
 
 1. Phase-folded light curve: done.
 2. Manual transit box editing: done.
@@ -270,10 +289,11 @@ The user asked to proceed through features 1 through 8. Current status:
 4. Export results: done.
 5. Transit depth in percent/ppm and radius-ratio estimate: done.
 6. False-positive warnings: done.
-7. Data cleaning panel: next.
-8. Reset/home view button: pending.
+7. Planet/no-planet assessment: done.
+8. Data cleaning panel: next.
+9. Reset/home view button: pending.
 
-Additional useful future features after step 8:
+Additional useful future features after step 9:
 
 - Transit prediction from period and epoch.
 - Better candidate-period ranking with explicit harmonic/alias grouping.

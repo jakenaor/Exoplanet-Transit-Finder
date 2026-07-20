@@ -6,6 +6,8 @@
   --surface: #ffffff;
   --panel: #f5f7fa;
   --accent: #0f766e;
+  --signal: #15803d;
+  --quiet: #475569;
   --accent-2: #b45309;
   --danger: #b42318;
   --shadow: 0 16px 40px rgba(30, 41, 59, .12);
@@ -148,6 +150,87 @@ button:disabled {
 .metric:last-child { border-bottom: 0; }
 .metric span:first-child { color: var(--muted); }
 .metric span:last-child { font-weight: 750; text-align: right; }
+
+.assessment {
+  display: grid;
+  gap: 8px;
+}
+
+.assessment-card {
+  border: 1px solid #d7dce3;
+  border-left: 5px solid var(--quiet);
+  border-radius: 6px;
+  padding: 11px;
+  background: #fbfcfd;
+}
+
+.assessment-card.strong_candidate { border-left-color: var(--signal); }
+.assessment-card.possible_candidate { border-left-color: var(--accent-2); }
+.assessment-card.inconclusive { border-left-color: #2563eb; }
+.assessment-card.no_planet_like_signal { border-left-color: var(--danger); }
+.assessment-card.pending { border-left-color: var(--quiet); }
+
+.assessment-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.assessment-head strong {
+  font-size: 14px;
+}
+
+.assessment-head span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.assessment-card p {
+  font-size: 13px;
+}
+
+.score-track {
+  height: 7px;
+  margin: 10px 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e4e9ef;
+}
+
+.score-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--quiet);
+}
+
+.assessment-card.strong_candidate .score-fill { background: var(--signal); }
+.assessment-card.possible_candidate .score-fill { background: var(--accent-2); }
+.assessment-card.inconclusive .score-fill { background: #2563eb; }
+.assessment-card.no_planet_like_signal .score-fill { background: var(--danger); }
+
+.assessment-evidence {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.assessment-evidence div {
+  display: grid;
+  gap: 1px;
+  font-size: 12px;
+}
+
+.assessment-evidence strong {
+  color: var(--ink);
+}
+
+.assessment-evidence span {
+  color: var(--muted);
+}
 
 .warning-list {
   display: grid;

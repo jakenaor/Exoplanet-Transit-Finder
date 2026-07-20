@@ -861,6 +861,21 @@ def finite_values(values):
     return [float(value) for value in values if value is not None and math.isfinite(float(value))]
 
 
+def finite_number(value):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def format_metric(value, digits=2):
+    number = finite_number(value)
+    return "-" if number is None else f"{number:.{digits}f}"
+
+
 def median_or_none(values):
     clean = sorted(finite_values(values))
     if not clean:
@@ -971,6 +986,225 @@ def build_candidate_diagnostics(transits, detection):
         })
 
     return diagnostics, warnings
+
+
+def score_band(value, bands):
+    if value is None:
+        return None
+    for threshold, points, label, detail in bands:
+        if value >= threshold:
+            return points, label, detail
+    return None
+
+
+def build_planet_assessment(transits, detection, diagnostics, warnings):
+    transit_count = len(transits)
+    period = finite_number(detection.get("period"))
+    period_method = detection.get("period_method")
+    period_sde = finite_number(detection.get("period_sde"))
+    detection_snr = finite_number(diagnostics.get("detection_snr"))
+    p_value = finite_number(detection.get("p_value"))
+    depth_scatter_ratio = finite_number(diagnostics.get("depth_scatter_ratio"))
+    odd_even_mismatch = finite_number(diagnostics.get("odd_even_depth_mismatch"))
+    max_radius_ratio = finite_number(diagnostics.get("max_radius_ratio"))
+    median_transit_points = finite_number(diagnostics.get("median_transit_points"))
+
+    score = 0.0
+    supporting_evidence = []
+    limiting_evidence = []
+
+    def support(title, detail, points):
+        nonlocal score
+        score += points
+        supporting_evidence.append({
+            "title": title,
+            "detail": detail,
+            "points": points,
+        })
+
+    def limit(title, detail, points):
+        nonlocal score
+        score += points
+        limiting_evidence.append({
+            "title": title,
+            "detail": detail,
+            "points": points,
+        })
+
+    if transit_count >= 3:
+        support("Repeated transit-like events", f"{transit_count} candidate dips were boxed.", 20)
+    elif transit_count > 0:
+        support("Transit-like dip found", f"{transit_count} candidate dip{'s were' if transit_count != 1 else ' was'} boxed.", 6)
+        limit("Too few events", "Fewer than three events is weak evidence for an orbital period.", -8)
+    else:
+        limit("No boxed transit events", "The detector did not find statistically strong local dips.", -28)
+
+    if period is not None and period > 0 and period_method == "BLS":
+        support("Stable BLS period", f"Best period is {period:.6g} days from the BLS search.", 22)
+    elif period is not None and period > 0:
+        support("Provisional period", f"Estimated period is {period:.6g} days from {period_method or 'candidate spacing'}.", 10)
+        limit("Period is not a BLS peak", "The repeating period needs manual confirmation.", -4)
+    else:
+        limit("No stable period", "A repeating orbital period was not recovered.", -18)
+
+    sde_result = score_band(period_sde, (
+        (10.0, 22, "Very strong period peak", f"Period SDE is {format_metric(period_sde)}."),
+        (7.0, 17, "Strong period peak", f"Period SDE is {format_metric(period_sde)}."),
+        (5.0, 8, "Moderate period peak", f"Period SDE is {format_metric(period_sde)}."),
+    ))
+    if sde_result is not None:
+        points, title, detail = sde_result
+        support(title, detail, points)
+    elif period_sde is not None:
+        limit("Weak period peak", f"Period SDE is only {period_sde:.2f}.", -10)
+
+    snr_result = score_band(detection_snr, (
+        (10.0, 22, "High transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
+        (7.0, 16, "Good transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
+        (5.0, 8, "Marginal transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
+    ))
+    if snr_result is not None:
+        points, title, detail = snr_result
+        support(title, detail, points)
+    elif detection_snr is not None:
+        limit("Low transit depth SNR", f"Median depth is only {detection_snr:.2f}x the robust noise.", -14)
+
+    if p_value is not None:
+        if p_value <= 1e-6:
+            support("Very significant box model", "The transit model strongly beats a flat light curve.", 16)
+        elif p_value <= 1e-4:
+            support("Significant box model", "The transit model clearly beats a flat light curve.", 12)
+        elif p_value <= 0.01:
+            support("Useful box-model improvement", "The transit model improves over a flat light curve.", 8)
+        else:
+            limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
+
+    if depth_scatter_ratio is not None and transit_count >= 4:
+        if depth_scatter_ratio <= 0.35:
+            support("Consistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", 7)
+        elif depth_scatter_ratio > 0.8:
+            limit("Inconsistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", -12)
+        elif depth_scatter_ratio > 0.5:
+            limit("Moderately inconsistent depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", -6)
+
+    if odd_even_mismatch is not None and transit_count >= 4:
+        if odd_even_mismatch <= 0.25:
+            support("Odd/even depths agree", f"Odd/even mismatch is {odd_even_mismatch:.2f}.", 6)
+        elif odd_even_mismatch > 0.5:
+            limit("Odd/even depth mismatch", "Alternating depths can indicate an eclipsing binary or blend.", -18)
+        elif odd_even_mismatch > 0.35:
+            limit("Possible odd/even mismatch", f"Odd/even mismatch is {odd_even_mismatch:.2f}.", -8)
+
+    if max_radius_ratio is not None:
+        if max_radius_ratio <= 0.2:
+            support("Planet-sized radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", 4)
+        elif max_radius_ratio > 0.3:
+            limit("Very large radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", -16)
+        else:
+            limit("Large radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", -8)
+
+    if median_transit_points is not None:
+        if median_transit_points >= 8:
+            support("Well-sampled events", f"Median transit has {median_transit_points:.0f} plotted points.", 4)
+        elif median_transit_points < 4:
+            limit("Sparse transit sampling", f"Median transit has only {median_transit_points:.0f} plotted points.", -6)
+
+    danger_count = sum(1 for warning in warnings if warning.get("severity") == "danger")
+    caution_count = sum(1 for warning in warnings if warning.get("severity") == "caution")
+    if danger_count:
+        score -= danger_count * 10
+    if caution_count >= 3:
+        score -= 6
+
+    candidate_score = int(round(clamp(score, 0, 100)))
+    strong_requirements_met = (
+        transit_count >= 3
+        and period is not None
+        and period_method == "BLS"
+        and detection_snr is not None
+        and detection_snr >= 7
+        and (period_sde is None or period_sde >= 5)
+        and danger_count == 0
+    )
+
+    if transit_count == 0:
+        has_unboxed_period_signal = (
+            candidate_score >= 35
+            and period_sde is not None
+            and period_sde >= 7
+            and (p_value is None or p_value <= 0.01)
+        )
+        if has_unboxed_period_signal:
+            status = "inconclusive"
+            title = "Period signal needs review"
+            short_label = "Inconclusive"
+            summary = (
+                "The period search found some signal, but the local detector did not box credible transit events. "
+                "This needs manual review before calling it an exoplanet candidate."
+            )
+            recommendation = "Inspect the phase-folded view and try adjusted duration/strictness bounds."
+        else:
+            status = "no_planet_like_signal"
+            title = "No planet-like transit detected"
+            short_label = "No credible signal"
+            summary = (
+                "No statistically credible repeating transit signal was found. "
+                "This dataset may not contain a detectable transiting exoplanet at the current settings."
+            )
+            recommendation = "Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve."
+    elif candidate_score >= 75 and strong_requirements_met:
+        status = "strong_candidate"
+        title = "Strong planet-like transit candidate"
+        short_label = "Strong candidate"
+        summary = (
+            "Repeated dips align with a stable period and pass the current signal-strength checks. "
+            "This is a strong candidate, not a confirmed planet."
+        )
+        recommendation = "Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed."
+    elif candidate_score >= 45 and transit_count >= 2:
+        status = "possible_candidate"
+        title = "Possible transit candidate"
+        short_label = "Possible candidate"
+        summary = (
+            "The dataset contains some planet-like transit evidence, but one or more checks are not strong enough "
+            "for a confident candidate call."
+        )
+        recommendation = "Review warnings, period aliases, and the phase-folded view."
+    else:
+        status = "no_planet_like_signal"
+        title = "No credible planet-like signal"
+        short_label = "No credible signal"
+        summary = (
+            "Detected dips do not currently pass enough planet-likeness checks. "
+            "This dataset may not contain a detectable transiting exoplanet."
+        )
+        recommendation = "Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious."
+
+    return {
+        "status": status,
+        "title": title,
+        "short_label": short_label,
+        "candidate_score": candidate_score,
+        "summary": summary,
+        "recommendation": recommendation,
+        "supporting_evidence": supporting_evidence,
+        "limiting_evidence": limiting_evidence,
+        "inputs": {
+            "transit_count": transit_count,
+            "period": period,
+            "period_method": period_method,
+            "period_sde": period_sde,
+            "detection_snr": detection_snr,
+            "p_value": p_value,
+            "depth_scatter_ratio": depth_scatter_ratio,
+            "odd_even_depth_mismatch": odd_even_mismatch,
+            "max_radius_ratio": max_radius_ratio,
+            "median_transit_points": median_transit_points,
+            "warning_count": len(warnings),
+            "danger_warning_count": danger_count,
+            "caution_warning_count": caution_count,
+        },
+    }
 
 
 def robust_flux_limits(values, sigma=4.0):
@@ -1125,6 +1359,7 @@ def analyze(time, flux, options=None):
         display_transit["end"] = float(transit["end"] - time_reference)
         display_transits.append(display_transit)
     diagnostics, warnings = build_candidate_diagnostics(display_transits, detection)
+    planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
 
     zoom_domain = None
     if display_transits:
@@ -1179,6 +1414,7 @@ def analyze(time, flux, options=None):
         "plot_smooth_points": smooth_width,
         "diagnostics": diagnostics,
         "warnings": warnings,
+        "planet_assessment": planet_assessment,
         "detection_snr": diagnostics["detection_snr"],
         "odd_even_depth_mismatch": diagnostics["odd_even_depth_mismatch"],
         "depth_scatter_ratio": diagnostics["depth_scatter_ratio"],
