@@ -63,7 +63,6 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Batch Results dropdown for switching between processed filenames.
 - Batch dropdown labels include the current planet-candidate verdict for each successful file.
 - Failed batch items are kept visible in the dropdown but disabled.
-- Per-file analysis progress bars showing pending, active, complete, and failed states during single-file and batch processing.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
 - Ephemeris audit chart mode:
@@ -76,21 +75,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
-- Detection search mode control:
-  - `BLS + regularity` is the default and preserves the existing period-selection flow.
-  - `TLS-style` runs a transit-shape matched-filter period search, then checks event-by-event depth coherence before selecting the period.
-- BLS harmonic de-aliasing:
-  - Checks strong longer-period candidates near `2x`, `3x`, or `4x` the top BLS peak.
-  - Promotes the longer BLS candidate when it matches nearly the same boxed transits and avoids the short-period harmonic.
-  - Keeps the original short alias in the candidate list for inspection.
-- Transit-regularity period override:
-  - Scores candidate periods by how many unique predicted transit events are covered by detected boxes.
-  - Can replace a long BLS alias when a shorter cadence explains substantially more events.
-  - Dense short-period matches can win even when full-span expected coverage is lower because of data gaps, as long as enough boxed events support the cadence.
-  - Rejects weak one-off regularities so the irregular false-positive fixture stays a no-signal case.
 - Period displayed in Julian days.
 - Period search controls:
-  - Search mode.
   - Minimum period.
   - Maximum period.
   - Period candidate list with power/SDE values.
@@ -113,7 +99,6 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Detection sensitivity controls:
   - Strictness.
   - Smoothing.
-  - Search mode: `BLS + regularity` or `TLS-style`.
   - Minimum depth.
   - Minimum duration.
   - Maximum duration.
@@ -154,10 +139,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Normalize gapped observing segments independently before transit detection. This fixed the HD 209458-style file where obvious dips existed in separate data zones but global noise/baseline handling hid them.
 - Use BLS for orbital period, because simple averaging of nearby detected boxes was badly wrong for real gapped datasets.
 - Treat broad automated period-search results as candidate rankings, not ground truth. The Kepler sample previously showed a strong alias around `294` days while a constrained `380-390` day search returned about `386.16` days.
-- When BLS selects a sparse alias, the backend now checks detected-box cadence and prefers the most frequent well-covered regularity. This is intentionally still labeled as `transit regularity`, not a confirmed BLS period.
 - Use phase-folding as the primary validation view for repeated transit structure.
 - Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
-- Batch progress is displayed as one row per uploaded file. Each active row uses a smooth in-flight estimate while its `/analyze` request is running, then locks to complete or failed.
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
 - Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
 - Chi-squared p-value is an approximate model-vs-flat significance metric, not a literal probability that a planet is real.
@@ -184,9 +167,6 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - A clean injected-transit dataset returns `strong_candidate`.
   - A flat/noisy dataset returns `no_planet_like_signal`.
 - Ephemeris audit view made the irregular false-positive failure mode visible instead of only numeric.
-- The Kepler desktop sample now selects the denser transit-box regularity instead of the sparse `~294` day BLS alias while keeping the verdict cautious.
-- The TRAPPIST-1 desktop sample now prefers a dense short-period regularity instead of the sparse `~6.08` day BLS alias.
-- The WASP-4 desktop sample now promotes the `~1.3457` day BLS candidate over the `~0.6679` day half-period alias.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -245,9 +225,6 @@ Observed verification results from recent work:
 - 2026-07-20 irregular false-positive test before ephemeris vetting: incorrectly returned `strong_candidate`, score `100`, `9` transits.
 - 2026-07-20 irregular false-positive test after ephemeris vetting: `no_planet_like_signal`, score `24`, `9` detected dips, ephemeris fit `3/9`, warnings `Irregular transit timing` and `Many off-period dips`.
 - 2026-07-20 clean synthetic transit after ephemeris vetting: `strong_candidate`, score `100`, ephemeris fit `8/8`.
-- 2026-07-20 Kepler desktop sample after transit-regularity override: `possible_candidate`, score `48`, selected period about `55.36` days, `19/26` predicted events covered; irregular false-positive fixture remains `no_planet_like_signal`.
-- 2026-07-20 TRAPPIST-1 desktop sample after dense-regularity tuning: `possible_candidate`, score `51`, selected period about `0.75` days, ephemeris fit `18/30`; irregular false-positive fixture remains `no_planet_like_signal`.
-- 2026-07-20 WASP-4 desktop sample after BLS harmonic de-aliasing: `strong_candidate`, score `100`, selected period about `1.3457` days; the previous `~0.6679` day half-period remains in the candidate list.
 
 Commands used for basic checks:
 
@@ -283,8 +260,7 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 This project is intended to become a more user-friendly version of Transit Least Squares (TLS). Missing TLS-inspired capabilities to add after the current feature sequence:
 
 - Transit-shaped model fitting:
-  - TLS-style search mode is implemented as a transit-shape matched-filter search with event-by-event coherence checks.
-  - True limb-darkened transit templates are still pending.
+  - Add an optional TLS-style search mode using limb-darkened transit templates instead of only BLS boxes/local dip boxes.
   - Show model overlays in time view and phase-folded view.
   - Support trapezoid/grazing-transit templates for V-shaped or box-like events.
 - Stellar parameter priors:
@@ -335,7 +311,7 @@ Current feature sequence status:
 8. Ephemeris audit view: done.
 9. Data cleaning panel: next.
 10. Sensitivity/no-planet upper-limit message: pending.
-11. TLS-style search mode: done.
+11. TLS-style search mode: pending.
 12. Reset/home view button: pending.
 
 Additional useful future features after step 12:
