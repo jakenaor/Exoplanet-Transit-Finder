@@ -2,6 +2,7 @@ const fileInput = document.getElementById('fileInput');
 const dropzone = document.getElementById('dropzone');
 const analyzeButton = document.getElementById('analyzeButton');
 const statusEl = document.getElementById('status');
+const analysisProgressEl = document.getElementById('analysisProgress');
 const assessmentEl = document.getElementById('assessment');
 const metricsEl = document.getElementById('metrics');
 const warningsEl = document.getElementById('warnings');
@@ -37,6 +38,8 @@ let selectedFile = null;
 let batchResults = [];
 let currentBatchIndex = -1;
 let batchInProgress = false;
+let progressTimer = null;
+let progressValues = [];
 let currentResult = null;
 let currentView = 'zoom';
 let currentViewport = null;
@@ -143,6 +146,76 @@ function setStatus(message, isError = false) {
   statusEl.className = isError ? 'status error' : 'status';
 }
 
+function clampProgress(value) {
+  if (!Number.isFinite(Number(value))) return 0;
+  return Math.max(0, Math.min(100, Number(value)));
+}
+
+function stopProgressTimer() {
+  if (progressTimer !== null) {
+    window.clearInterval(progressTimer);
+    progressTimer = null;
+  }
+}
+
+function resetAnalysisProgress() {
+  stopProgressTimer();
+  progressValues = [];
+  if (analysisProgressEl) {
+    analysisProgressEl.hidden = true;
+    analysisProgressEl.innerHTML = '';
+  }
+}
+
+function renderProgressRows(files) {
+  stopProgressTimer();
+  progressValues = files.map(() => 0);
+  if (!analysisProgressEl) return;
+  analysisProgressEl.hidden = files.length === 0;
+  analysisProgressEl.innerHTML = files.map((file, index) => `
+    <div class="progress-item pending" data-progress-index="${index}">
+      <div class="progress-header">
+        <span>${index + 1}. ${escapeHtml(file.name)}</span>
+        <span data-progress-percent>Pending</span>
+      </div>
+      <div class="progress-track" role="progressbar" aria-label="Analysis progress for ${escapeHtml(file.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="progress-fill"></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function setFileProgress(index, value, label, state = 'active') {
+  if (!analysisProgressEl) return;
+  const row = analysisProgressEl.querySelector(`[data-progress-index="${index}"]`);
+  if (!row) return;
+  const progressValue = clampProgress(value);
+  progressValues[index] = progressValue;
+  row.className = `progress-item ${state}`;
+  row.querySelector('[data-progress-percent]').textContent = label || `${Math.round(progressValue)}%`;
+  row.querySelector('[role="progressbar"]').setAttribute('aria-valuenow', String(Math.round(progressValue)));
+  row.querySelector('.progress-fill').style.width = `${progressValue}%`;
+}
+
+function beginFileProgress(index) {
+  stopProgressTimer();
+  const ceiling = 92;
+  setFileProgress(index, 0, '0%', 'active');
+  progressTimer = window.setInterval(() => {
+    const currentValue = progressValues[index] || 0;
+    const remaining = ceiling - currentValue;
+    if (remaining <= 0.1) return;
+    const step = Math.max(0.15, remaining * 0.08);
+    const nextValue = Math.min(ceiling, currentValue + step);
+    setFileProgress(index, nextValue, `${Math.round(nextValue)}%`, 'active');
+  }, 240);
+}
+
+function finishFileProgress(index, succeeded = true) {
+  stopProgressTimer();
+  setFileProgress(index, 100, succeeded ? 'Complete' : 'Failed', succeeded ? 'complete' : 'failed');
+}
+
 function renderBatchSelect() {
   const successCount = batchResults.filter(item => item.result).length;
   batchCount.value = `${successCount}/${batchResults.length || selectedFiles.length || 0}`;
@@ -171,6 +244,7 @@ function setFiles(fileList) {
   selectedFile = selectedFiles[0] || null;
   batchResults = [];
   currentBatchIndex = -1;
+  resetAnalysisProgress();
   renderBatchSelect();
   clearResultView();
   analyzeButton.disabled = !selectedFiles.length;
@@ -379,6 +453,7 @@ analyzeButton.addEventListener('click', async () => {
   const filesToAnalyze = selectedFiles.slice(0, MAX_BATCH_FILES);
   const options = detectionOptions();
   setStatus(`Analyzing 1/${filesToAnalyze.length}: ${filesToAnalyze[0].name}`);
+  renderProgressRows(filesToAnalyze);
   analyzeButton.disabled = true;
   batchInProgress = true;
   batchResults = [];
@@ -388,10 +463,13 @@ analyzeButton.addEventListener('click', async () => {
   try {
     for (let index = 0; index < filesToAnalyze.length; index++) {
       const file = filesToAnalyze[index];
+      let fileSucceeded = false;
       setStatus(`Analyzing ${index + 1}/${filesToAnalyze.length}: ${file.name}`);
+      beginFileProgress(index);
       try {
         const result = await analyzeFile(file, options);
         batchResults.push({ file, result, error: null });
+        fileSucceeded = true;
         if (currentBatchIndex === -1) {
           selectBatchResult(batchResults.length - 1);
         } else {
@@ -401,6 +479,7 @@ analyzeButton.addEventListener('click', async () => {
         batchResults.push({ file, result: null, error: error.message });
         renderBatchSelect();
       }
+      finishFileProgress(index, fileSucceeded);
     }
 
     const successCount = batchResults.filter(item => item.result).length;
@@ -425,6 +504,7 @@ analyzeButton.addEventListener('click', async () => {
         : `Batch complete: ${successCount}/${batchResults.length} processed.${verdictSummary}`
     , failureCount > 0 && successCount === 0);
   } finally {
+    stopProgressTimer();
     batchInProgress = false;
     analyzeButton.disabled = !selectedFiles.length;
     renderBatchSelect();

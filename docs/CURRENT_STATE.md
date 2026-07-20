@@ -63,6 +63,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Batch Results dropdown for switching between processed filenames.
 - Batch dropdown labels include the current planet-candidate verdict for each successful file.
 - Failed batch items are kept visible in the dropdown but disabled.
+- Per-file analysis progress bars showing pending, active, complete, and failed states during single-file and batch processing.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
 - Ephemeris audit chart mode:
@@ -151,6 +152,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - When BLS selects a sparse alias, the backend now checks detected-box cadence and prefers the most frequent well-covered regularity. This is intentionally still labeled as `transit regularity`, not a confirmed BLS period.
 - Use phase-folding as the primary validation view for repeated transit structure.
 - Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
+- Batch progress is displayed as one row per uploaded file. Each active row uses a smooth in-flight estimate while its `/analyze` request is running, then locks to complete or failed.
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
 - Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
 - Chi-squared p-value is an approximate model-vs-flat significance metric, not a literal probability that a planet is real.

@@ -380,6 +380,84 @@ th {
 
 .error { color: var(--danger); font-weight: 700; }
 
+.analysis-progress {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.analysis-progress[hidden] {
+  display: none;
+}
+
+.progress-item {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid #dbe1e8;
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.progress-item.active {
+  border-color: #9fb5d4;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.progress-header span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-header span:last-child {
+  color: var(--ink);
+  flex: 0 0 auto;
+}
+
+.progress-track {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid #c8d0da;
+  border-radius: 999px;
+  background: #eef3f7;
+}
+
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #2563eb);
+  transition: width .18s ease;
+}
+
+.progress-item.pending .progress-fill {
+  background: #9aa6b2;
+}
+
+.progress-item.complete .progress-fill {
+  background: var(--signal);
+}
+
+.progress-item.failed .progress-fill {
+  background: var(--danger);
+}
+
+.progress-item.failed .progress-header span:last-child {
+  color: var(--danger);
+}
+
 @media (max-width: 860px) {
   main { grid-template-columns: 1fr; }
   .topbar { align-items: flex-start; flex-direction: column; }
