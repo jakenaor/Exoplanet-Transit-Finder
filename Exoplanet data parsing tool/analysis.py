@@ -894,7 +894,74 @@ def coefficient_of_variation(values):
     return float(np.std(np.asarray(clean, dtype=float)) / center)
 
 
-def build_candidate_diagnostics(transits, detection):
+def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
+    period = finite_number(detection.get("period"))
+    epoch = finite_number(detection.get("period_epoch"))
+    period_duration = finite_number(detection.get("period_duration"))
+    expected_count = finite_number(detection.get("period_match_count"))
+    centers = finite_values([item.get("center") for item in transits])
+    durations = finite_values([item.get("duration") for item in transits])
+
+    empty = {
+        "ephemeris_match_count": None,
+        "ephemeris_match_fraction": None,
+        "off_ephemeris_transit_count": None,
+        "off_ephemeris_fraction": None,
+        "expected_transit_count": expected_count,
+        "expected_transit_coverage": None,
+        "timing_residual_median": None,
+        "timing_residual_max": None,
+        "timing_residual_tolerance": None,
+        "timing_residual_ratio": None,
+    }
+    if not centers or period is None or epoch is None or period <= 0:
+        return empty
+
+    epoch_relative = epoch - float(time_reference)
+    median_duration = median_or_none(durations)
+    duration_scale = max(
+        period_duration or 0.0,
+        median_duration or 0.0,
+        period * 0.035,
+    )
+    tolerance = max(duration_scale * 1.5, period * 0.025)
+    tolerance = min(tolerance, period * 0.18)
+    if tolerance <= 0:
+        return empty
+
+    residuals = []
+    matched_residuals = []
+    for center in centers:
+        cycles = round((center - epoch_relative) / period)
+        nearest_epoch = epoch_relative + cycles * period
+        residual = abs(center - nearest_epoch)
+        residuals.append(residual)
+        if residual <= tolerance:
+            matched_residuals.append(residual)
+
+    match_count = len(matched_residuals)
+    transit_count = len(centers)
+    off_count = transit_count - match_count
+    median_residual = median_or_none(residuals)
+    expected_coverage = None
+    if expected_count is not None and expected_count > 0:
+        expected_coverage = min(1.0, match_count / expected_count)
+
+    return {
+        "ephemeris_match_count": int(match_count),
+        "ephemeris_match_fraction": match_count / transit_count,
+        "off_ephemeris_transit_count": int(off_count),
+        "off_ephemeris_fraction": off_count / transit_count,
+        "expected_transit_count": expected_count,
+        "expected_transit_coverage": expected_coverage,
+        "timing_residual_median": median_residual,
+        "timing_residual_max": max(residuals) if residuals else None,
+        "timing_residual_tolerance": tolerance,
+        "timing_residual_ratio": None if median_residual is None else median_residual / tolerance,
+    }
+
+
+def build_candidate_diagnostics(transits, detection, time_reference=0.0):
     depths = finite_values([item.get("depth") for item in transits])
     radius_ratios = finite_values([item.get("radius_ratio") for item in transits])
     point_counts = finite_values([item.get("points") for item in transits])
@@ -912,6 +979,7 @@ def build_candidate_diagnostics(transits, detection):
     if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
         odd_even_depth_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
 
+    ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference)
     diagnostics = {
         "detection_snr": detection_snr,
         "median_transit_points": median_or_none(point_counts),
@@ -920,6 +988,7 @@ def build_candidate_diagnostics(transits, detection):
         "even_depth": even_depth,
         "odd_even_depth_mismatch": odd_even_depth_mismatch,
         "max_radius_ratio": max(radius_ratios) if radius_ratios else None,
+        **ephemeris,
     }
 
     warnings = []
@@ -972,6 +1041,35 @@ def build_candidate_diagnostics(transits, detection):
             "title": "Inconsistent transit depths",
             "detail": "Detected depths vary substantially across events.",
         })
+    if (
+        len(transits) >= 3
+        and detection.get("period_method") == "BLS"
+        and diagnostics["ephemeris_match_fraction"] is not None
+    ):
+        match_fraction = diagnostics["ephemeris_match_fraction"]
+        match_count = diagnostics["ephemeris_match_count"]
+        transit_count = len(transits)
+        if match_fraction < 0.55:
+            warnings.append({
+                "severity": "danger",
+                "title": "Irregular transit timing",
+                "detail": f"Only {match_count} of {transit_count} detected dips align with the BLS period.",
+            })
+        elif match_fraction < 0.75:
+            warnings.append({
+                "severity": "caution",
+                "title": "Weak ephemeris agreement",
+                "detail": f"{match_count} of {transit_count} detected dips align with the BLS period.",
+            })
+
+        off_count = diagnostics["off_ephemeris_transit_count"]
+        off_fraction = diagnostics["off_ephemeris_fraction"]
+        if off_count is not None and off_fraction is not None and off_count >= 3 and off_fraction >= 0.35:
+            warnings.append({
+                "severity": "caution",
+                "title": "Many off-period dips",
+                "detail": "Several detected dips do not land near the recovered period and may be systematics.",
+            })
     if diagnostics["max_radius_ratio"] is not None and diagnostics["max_radius_ratio"] > 0.2:
         warnings.append({
             "severity": "caution",
@@ -1008,6 +1106,12 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     odd_even_mismatch = finite_number(diagnostics.get("odd_even_depth_mismatch"))
     max_radius_ratio = finite_number(diagnostics.get("max_radius_ratio"))
     median_transit_points = finite_number(diagnostics.get("median_transit_points"))
+    ephemeris_match_fraction = finite_number(diagnostics.get("ephemeris_match_fraction"))
+    ephemeris_match_count = finite_number(diagnostics.get("ephemeris_match_count"))
+    off_ephemeris_count = finite_number(diagnostics.get("off_ephemeris_transit_count"))
+    off_ephemeris_fraction = finite_number(diagnostics.get("off_ephemeris_fraction"))
+    expected_transit_coverage = finite_number(diagnostics.get("expected_transit_coverage"))
+    timing_residual_ratio = finite_number(diagnostics.get("timing_residual_ratio"))
 
     score = 0.0
     supporting_evidence = []
@@ -1079,6 +1183,31 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         else:
             limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
 
+    if period_method == "BLS" and transit_count >= 3 and ephemeris_match_fraction is not None:
+        if ephemeris_match_fraction >= 0.8:
+            support("Detected dips follow the ephemeris", f"{int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", 16)
+        elif ephemeris_match_fraction >= 0.65:
+            support("Partial ephemeris agreement", f"{int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", 5)
+            limit("Some off-period dips", "Several detected dips do not belong to the recovered period.", -6)
+        elif ephemeris_match_fraction < 0.55:
+            limit("Irregular transit timing", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", -34)
+        else:
+            limit("Weak timing agreement", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", -18)
+
+    if (
+        off_ephemeris_count is not None
+        and off_ephemeris_fraction is not None
+        and off_ephemeris_count >= 3
+        and off_ephemeris_fraction >= 0.35
+    ):
+        limit("Many off-period dips", "The detector found too many transit-like dips away from the recovered ephemeris.", -24)
+
+    if expected_transit_coverage is not None and transit_count >= 3 and expected_transit_coverage < 0.5:
+        limit("Weak predicted-transit coverage", f"Only {expected_transit_coverage:.0%} of expected BLS events were matched.", -10)
+
+    if timing_residual_ratio is not None and timing_residual_ratio > 1.0 and transit_count >= 3:
+        limit("Large timing residuals", "Detected dip centers are not tightly clustered around the recovered ephemeris.", -10)
+
     if depth_scatter_ratio is not None and transit_count >= 4:
         if depth_scatter_ratio <= 0.35:
             support("Consistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", 7)
@@ -1124,7 +1253,17 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         and detection_snr is not None
         and detection_snr >= 7
         and (period_sde is None or period_sde >= 5)
+        and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.75)
+        and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.3)
         and danger_count == 0
+    )
+    severe_timing_mismatch = (
+        transit_count >= 3
+        and period_method == "BLS"
+        and ephemeris_match_fraction is not None
+        and ephemeris_match_fraction < 0.55
+        and off_ephemeris_count is not None
+        and off_ephemeris_count >= 2
     )
 
     if transit_count == 0:
@@ -1152,6 +1291,15 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
                 "This dataset may not contain a detectable transiting exoplanet at the current settings."
             )
             recommendation = "Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve."
+    elif severe_timing_mismatch:
+        status = "no_planet_like_signal"
+        title = "Transit-like dips are not periodic"
+        short_label = "No credible signal"
+        summary = (
+            "The detector found dip-shaped events, but most do not align with one repeating orbital schedule. "
+            "That pattern is more consistent with irregular variability or systematics than a single transiting exoplanet."
+        )
+        recommendation = "Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate."
     elif candidate_score >= 75 and strong_requirements_met:
         status = "strong_candidate"
         title = "Strong planet-like transit candidate"
@@ -1200,6 +1348,12 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "odd_even_depth_mismatch": odd_even_mismatch,
             "max_radius_ratio": max_radius_ratio,
             "median_transit_points": median_transit_points,
+            "ephemeris_match_fraction": ephemeris_match_fraction,
+            "ephemeris_match_count": ephemeris_match_count,
+            "off_ephemeris_transit_count": off_ephemeris_count,
+            "off_ephemeris_fraction": off_ephemeris_fraction,
+            "expected_transit_coverage": expected_transit_coverage,
+            "timing_residual_ratio": timing_residual_ratio,
             "warning_count": len(warnings),
             "danger_warning_count": danger_count,
             "caution_warning_count": caution_count,
@@ -1358,7 +1512,7 @@ def analyze(time, flux, options=None):
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
         display_transits.append(display_transit)
-    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection)
+    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference)
     planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
 
     zoom_domain = None

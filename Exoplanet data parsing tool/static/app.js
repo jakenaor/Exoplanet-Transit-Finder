@@ -271,6 +271,7 @@ function clearResultView() {
     <div class="metric"><span>Radius ratio</span><span>-</span></div>
     <div class="metric"><span>Depth SNR</span><span>-</span></div>
     <div class="metric"><span>Period SDE</span><span>-</span></div>
+    <div class="metric"><span>Ephemeris fit</span><span>-</span></div>
     <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
     <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
     <div class="metric"><span>JD start</span><span>-</span></div>
@@ -552,6 +553,72 @@ function estimatePValueFromTransitBoxes() {
   };
 }
 
+function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expectedCount) {
+  const centers = transits
+    .map(transit => Number(transit.center))
+    .filter(value => Number.isFinite(value));
+  const durations = transits
+    .map(transit => Number(transit.duration))
+    .filter(value => Number.isFinite(value) && value > 0);
+  const periodValue = Number(period);
+  const epochValue = Number(epoch);
+  const durationValue = Number(duration);
+  const expectedValue = Number(expectedCount);
+  const empty = {
+    ephemerisMatchCount: null,
+    ephemerisMatchFraction: null,
+    offEphemerisTransitCount: null,
+    offEphemerisFraction: null,
+    expectedTransitCount: Number.isFinite(expectedValue) ? expectedValue : null,
+    expectedTransitCoverage: null,
+    timingResidualMedian: null,
+    timingResidualMax: null,
+    timingResidualTolerance: null,
+    timingResidualRatio: null,
+  };
+
+  if (!centers.length || !Number.isFinite(periodValue) || periodValue <= 0 || !Number.isFinite(epochValue)) {
+    return empty;
+  }
+
+  const medianDuration = median(durations);
+  const durationScale = Math.max(
+    Number.isFinite(durationValue) ? durationValue : 0,
+    medianDuration || 0,
+    periodValue * 0.035
+  );
+  const tolerance = Math.min(
+    Math.max(durationScale * 1.5, periodValue * 0.025),
+    periodValue * 0.18
+  );
+  if (!Number.isFinite(tolerance) || tolerance <= 0) return empty;
+
+  const residuals = centers.map(center => {
+    const cycles = Math.round((center - epochValue) / periodValue);
+    return Math.abs(center - (epochValue + cycles * periodValue));
+  });
+  const matchedResiduals = residuals.filter(residual => residual <= tolerance);
+  const matchCount = matchedResiduals.length;
+  const offCount = centers.length - matchCount;
+  const residualMedian = median(residuals);
+  const expectedCoverage = Number.isFinite(expectedValue) && expectedValue > 0
+    ? Math.min(1, matchCount / expectedValue)
+    : null;
+
+  return {
+    ephemerisMatchCount: matchCount,
+    ephemerisMatchFraction: matchCount / centers.length,
+    offEphemerisTransitCount: offCount,
+    offEphemerisFraction: offCount / centers.length,
+    expectedTransitCount: Number.isFinite(expectedValue) ? expectedValue : null,
+    expectedTransitCoverage: expectedCoverage,
+    timingResidualMedian: residualMedian,
+    timingResidualMax: residuals.length ? Math.max(...residuals) : null,
+    timingResidualTolerance: tolerance,
+    timingResidualRatio: residualMedian === null ? null : residualMedian / tolerance,
+  };
+}
+
 function currentAnalysisMetrics() {
   const depthFractions = currentResult.transits
     .map(transit => Number(transit.depth_fraction))
@@ -581,6 +648,10 @@ function currentAnalysisMetrics() {
     pValue: currentResult.p_value,
     deltaChiSquared: currentResult.delta_chi_squared,
     reducedChiSquared: currentResult.reduced_chi_squared_box,
+    periodEpoch: Number.isFinite(Number(currentResult.period_epoch))
+      ? Number(currentResult.period_epoch) - Number(currentResult.time_reference || 0)
+      : null,
+    periodDuration: currentResult.period_duration,
     periodSde: currentResult.period_sde,
     medianDepthFraction: median(depthFractions),
     medianRadiusRatio: median(radiusRatios),
@@ -594,10 +665,19 @@ function currentAnalysisMetrics() {
   if (currentResult.boxesEdited) {
     const periodStats = estimatePeriodFromTransitBoxes();
     if (periodStats.period !== null) {
+      const centers = currentResult.transits
+        .map(transit => Number(transit.center))
+        .filter(value => Number.isFinite(value))
+        .sort((a, b) => a - b);
+      const durations = currentResult.transits
+        .map(transit => Number(transit.duration))
+        .filter(value => Number.isFinite(value) && value > 0);
       metrics.period = periodStats.period;
       metrics.periodMethod = 'edited boxes';
       metrics.periodScatter = periodStats.scatter;
       metrics.periodMatchCount = periodStats.count;
+      metrics.periodEpoch = centers.length ? centers[0] : metrics.periodEpoch;
+      metrics.periodDuration = median(durations);
     }
 
     const pValueStats = estimatePValueFromTransitBoxes();
@@ -606,6 +686,17 @@ function currentAnalysisMetrics() {
       metrics.deltaChiSquared = pValueStats.deltaChiSquared;
     }
   }
+
+  Object.assign(
+    metrics,
+    ephemerisDiagnosticsForTransits(
+      currentResult.transits,
+      metrics.period,
+      metrics.periodEpoch,
+      metrics.periodDuration,
+      metrics.periodMatchCount
+    )
+  );
 
   return metrics;
 }
@@ -700,6 +791,40 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
       detail: 'Detected depths vary substantially across events.',
     });
   }
+  if (
+    transits.length >= 3
+    && metrics.periodMethod === 'BLS'
+    && Number.isFinite(Number(metrics.ephemerisMatchFraction))
+  ) {
+    const matchFraction = Number(metrics.ephemerisMatchFraction);
+    const matchCount = Number(metrics.ephemerisMatchCount);
+    if (matchFraction < 0.55) {
+      warnings.push({
+        severity: 'danger',
+        title: 'Irregular transit timing',
+        detail: `Only ${matchCount} of ${transits.length} detected dips align with the BLS period.`,
+      });
+    } else if (matchFraction < 0.75) {
+      warnings.push({
+        severity: 'caution',
+        title: 'Weak ephemeris agreement',
+        detail: `${matchCount} of ${transits.length} detected dips align with the BLS period.`,
+      });
+    }
+
+    if (
+      Number.isFinite(Number(metrics.offEphemerisTransitCount))
+      && Number.isFinite(Number(metrics.offEphemerisFraction))
+      && Number(metrics.offEphemerisTransitCount) >= 3
+      && Number(metrics.offEphemerisFraction) >= 0.35
+    ) {
+      warnings.push({
+        severity: 'caution',
+        title: 'Many off-period dips',
+        detail: 'Several detected dips do not land near the recovered period and may be systematics.',
+      });
+    }
+  }
   if (maxRadius !== null && maxRadius > 0.2) {
     warnings.push({
       severity: 'caution',
@@ -738,6 +863,12 @@ function buildPlanetAssessment(metrics, warnings) {
   const oddEvenMismatch = Number.isFinite(Number(metrics.oddEvenDepthMismatch)) ? Number(metrics.oddEvenDepthMismatch) : null;
   const maxRadiusRatio = Number.isFinite(Number(metrics.maxRadiusRatio)) ? Number(metrics.maxRadiusRatio) : null;
   const medianTransitPoints = Number.isFinite(Number(metrics.medianTransitPoints)) ? Number(metrics.medianTransitPoints) : null;
+  const ephemerisMatchFraction = Number.isFinite(Number(metrics.ephemerisMatchFraction)) ? Number(metrics.ephemerisMatchFraction) : null;
+  const ephemerisMatchCount = Number.isFinite(Number(metrics.ephemerisMatchCount)) ? Number(metrics.ephemerisMatchCount) : null;
+  const offEphemerisCount = Number.isFinite(Number(metrics.offEphemerisTransitCount)) ? Number(metrics.offEphemerisTransitCount) : null;
+  const offEphemerisFraction = Number.isFinite(Number(metrics.offEphemerisFraction)) ? Number(metrics.offEphemerisFraction) : null;
+  const expectedTransitCoverage = Number.isFinite(Number(metrics.expectedTransitCoverage)) ? Number(metrics.expectedTransitCoverage) : null;
+  const timingResidualRatio = Number.isFinite(Number(metrics.timingResidualRatio)) ? Number(metrics.timingResidualRatio) : null;
   const supportingEvidence = [];
   const limitingEvidence = [];
   let score = 0;
@@ -803,6 +934,31 @@ function buildPlanetAssessment(metrics, warnings) {
     }
   }
 
+  if (periodMethod === 'BLS' && transitCount >= 3 && ephemerisMatchFraction !== null) {
+    if (ephemerisMatchFraction >= 0.8) {
+      support('Detected dips follow the ephemeris', `${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, 16);
+    } else if (ephemerisMatchFraction >= 0.65) {
+      support('Partial ephemeris agreement', `${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, 5);
+      limit('Some off-period dips', 'Several detected dips do not belong to the recovered period.', -6);
+    } else if (ephemerisMatchFraction < 0.55) {
+      limit('Irregular transit timing', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, -34);
+    } else {
+      limit('Weak timing agreement', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, -18);
+    }
+  }
+
+  if (offEphemerisCount !== null && offEphemerisFraction !== null && offEphemerisCount >= 3 && offEphemerisFraction >= 0.35) {
+    limit('Many off-period dips', 'The detector found too many transit-like dips away from the recovered ephemeris.', -24);
+  }
+
+  if (expectedTransitCoverage !== null && transitCount >= 3 && expectedTransitCoverage < 0.5) {
+    limit('Weak predicted-transit coverage', `Only ${fmt(expectedTransitCoverage * 100, 0)}% of expected BLS events were matched.`, -10);
+  }
+
+  if (timingResidualRatio !== null && timingResidualRatio > 1.0 && transitCount >= 3) {
+    limit('Large timing residuals', 'Detected dip centers are not tightly clustered around the recovered ephemeris.', -10);
+  }
+
   if (depthScatterRatio !== null && transitCount >= 4) {
     if (depthScatterRatio <= 0.35) {
       support('Consistent transit depths', `Depth scatter ratio is ${fmt(depthScatterRatio, 2)}.`, 7);
@@ -854,7 +1010,17 @@ function buildPlanetAssessment(metrics, warnings) {
     && detectionSnr !== null
     && detectionSnr >= 7
     && (periodSde === null || periodSde >= 5)
+    && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.75)
+    && (offEphemerisFraction === null || offEphemerisFraction <= 0.3)
     && dangerCount === 0
+  );
+  const severeTimingMismatch = (
+    transitCount >= 3
+    && periodMethod === 'BLS'
+    && ephemerisMatchFraction !== null
+    && ephemerisMatchFraction < 0.55
+    && offEphemerisCount !== null
+    && offEphemerisCount >= 2
   );
 
   let status;
@@ -883,6 +1049,12 @@ function buildPlanetAssessment(metrics, warnings) {
       summary = 'No statistically credible repeating transit signal was found. This dataset may not contain a detectable transiting exoplanet at the current settings.';
       recommendation = 'Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve.';
     }
+  } else if (severeTimingMismatch) {
+    status = 'no_planet_like_signal';
+    title = 'Transit-like dips are not periodic';
+    shortLabel = 'No credible signal';
+    summary = 'The detector found dip-shaped events, but most do not align with one repeating orbital schedule. That pattern is more consistent with irregular variability or systematics than a single transiting exoplanet.';
+    recommendation = 'Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate.';
   } else if (candidateScore >= 75 && strongRequirementsMet) {
     status = 'strong_candidate';
     title = 'Strong planet-like transit candidate';
@@ -927,6 +1099,12 @@ function buildPlanetAssessment(metrics, warnings) {
       odd_even_depth_mismatch: oddEvenMismatch,
       max_radius_ratio: maxRadiusRatio,
       median_transit_points: medianTransitPoints,
+      ephemeris_match_fraction: ephemerisMatchFraction,
+      ephemeris_match_count: ephemerisMatchCount,
+      off_ephemeris_transit_count: offEphemerisCount,
+      off_ephemeris_fraction: offEphemerisFraction,
+      expected_transit_coverage: expectedTransitCoverage,
+      timing_residual_ratio: timingResidualRatio,
       warning_count: warnings.length,
       danger_warning_count: dangerCount,
       caution_warning_count: cautionCount,
@@ -1034,6 +1212,14 @@ function renderMetrics() {
   const period = metrics.period === null || metrics.period === undefined
     ? 'Not enough transits'
     : `${fmt(metrics.period)} days${metrics.periodMethod ? ` (${metrics.periodMethod})` : ''}`;
+  const ephemerisFit = (
+    metrics.ephemerisMatchCount === null
+    || metrics.ephemerisMatchCount === undefined
+    || metrics.ephemerisMatchFraction === null
+    || metrics.ephemerisMatchFraction === undefined
+  )
+    ? '-'
+    : `${metrics.ephemerisMatchCount}/${currentResult.transits.length} (${fmt(metrics.ephemerisMatchFraction * 100, 0)}%)`;
 
   renderAssessment(metrics, warnings);
   metricsEl.innerHTML = `
@@ -1044,6 +1230,7 @@ function renderMetrics() {
     <div class="metric"><span>Radius ratio</span><span>${fmt(metrics.medianRadiusRatio)}</span></div>
     <div class="metric"><span>Depth SNR</span><span>${fmt(metrics.detectionSnr, 2)}</span></div>
     <div class="metric"><span>Period SDE</span><span>${fmt(metrics.periodSde, 2)}</span></div>
+    <div class="metric"><span>Ephemeris fit</span><span>${ephemerisFit}</span></div>
     <div class="metric"><span>Chi-sq p-value</span><span>${fmtPercent(metrics.pValue)}</span></div>
     <div class="metric"><span>Reduced chi-sq</span><span>${fmt(metrics.reducedChiSquared, 3)}</span></div>
     <div class="metric"><span>JD start</span><span>${fmt(currentResult.time_reference, 5)}</span></div>
@@ -1187,6 +1374,15 @@ function summaryForExport() {
       detection_snr: metrics.detectionSnr,
       odd_even_depth_mismatch: metrics.oddEvenDepthMismatch,
       depth_scatter_ratio: metrics.depthScatterRatio,
+      ephemeris_match_count: metrics.ephemerisMatchCount,
+      ephemeris_match_fraction: metrics.ephemerisMatchFraction,
+      off_ephemeris_transit_count: metrics.offEphemerisTransitCount,
+      off_ephemeris_fraction: metrics.offEphemerisFraction,
+      expected_transit_count: metrics.expectedTransitCount,
+      expected_transit_coverage: metrics.expectedTransitCoverage,
+      timing_residual_median: metrics.timingResidualMedian,
+      timing_residual_tolerance: metrics.timingResidualTolerance,
+      timing_residual_ratio: metrics.timingResidualRatio,
     },
     metrics: {
       transit_count: currentResult.transits.length,
@@ -1204,6 +1400,10 @@ function summaryForExport() {
       reduced_chi_squared: metrics.reducedChiSquared,
       detection_snr: metrics.detectionSnr,
       period_sde: metrics.periodSde,
+      ephemeris_match_count: metrics.ephemerisMatchCount,
+      ephemeris_match_fraction: metrics.ephemerisMatchFraction,
+      off_ephemeris_transit_count: metrics.offEphemerisTransitCount,
+      off_ephemeris_fraction: metrics.offEphemerisFraction,
       median_flux: currentResult.median_flux,
       robust_noise: currentResult.robust_noise,
     },
@@ -1229,6 +1429,7 @@ const analysisPdfColumns = [
   { key: 'score', label: 'Score', width: 42, align: 'right' },
   { key: 'points', label: 'Data points', width: 55, align: 'right' },
   { key: 'transits', label: 'Transits', width: 45, align: 'right' },
+  { key: 'ephemerisFit', label: 'Ephem fit', width: 52, align: 'right' },
   { key: 'period', label: 'Period d', width: 62, align: 'right' },
   { key: 'method', label: 'Method', width: 48, align: 'left' },
   { key: 'depthPercent', label: 'Depth %', width: 54, align: 'right' },
@@ -1258,6 +1459,14 @@ function analysisPdfRow(fileName, result) {
     score: assessment.candidateScore.toString(),
     points: result.total_points.toLocaleString(),
     transits: result.transits.length.toString(),
+    ephemerisFit: (
+      metrics.ephemerisMatchCount === null
+      || metrics.ephemerisMatchCount === undefined
+      || metrics.ephemerisMatchFraction === null
+      || metrics.ephemerisMatchFraction === undefined
+    )
+      ? '-'
+      : `${metrics.ephemerisMatchCount}/${result.transits.length}`,
     period: fmt(metrics.period, 6),
     method: metrics.periodMethod || '-',
     depthPercent: fmtDepthPercent(metrics.medianDepthFraction),

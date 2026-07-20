@@ -115,6 +115,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Verdict states include `strong_candidate`, `possible_candidate`, `inconclusive`, and `no_planet_like_signal`.
   - The no-signal verdict is phrased as no detectable planet-like transit at the current settings, not proof that no planet exists.
   - Manual box edits recompute the visible verdict client-side.
+  - Ephemeris agreement is now part of the verdict: detected dips must mostly align with the recovered period.
+  - Off-period transit-like dips are penalized heavily to avoid mistaking irregular systematics for a planet.
 - Export controls:
   - Transit CSV, including edited boxes and original JD columns.
   - Current graph PNG.
@@ -197,6 +199,13 @@ Recent verification used temporary fixtures in `/private/tmp`, including:
 /private/tmp/transit-batch-fixtures/batch_sample_2.csv
 ```
 
+Desktop adversarial/no-signal fixtures created during testing:
+
+```text
+/Users/jakenaor/Desktop/no_exoplanet_noise_lightcurve.csv
+/Users/jakenaor/Desktop/irregular_false_positive_transits.csv
+```
+
 Observed verification results from recent work:
 
 - Synthetic FITS fixture: `2592` points, `9` transits, BLS period about `1.9993686868639833` days.
@@ -207,6 +216,9 @@ Observed verification results from recent work:
 - 2026-07-20 direct flat/noisy test: `no_planet_like_signal`, score `18`, `0` transits.
 - 2026-07-20 HTTP upload positive CSV test: `strong_candidate`, score `100`, `8` transits.
 - 2026-07-20 HTTP upload flat/noisy CSV test: `no_planet_like_signal`, score `0`, `0` transits.
+- 2026-07-20 irregular false-positive test before ephemeris vetting: incorrectly returned `strong_candidate`, score `100`, `9` transits.
+- 2026-07-20 irregular false-positive test after ephemeris vetting: `no_planet_like_signal`, score `24`, `9` detected dips, ephemeris fit `3/9`, warnings `Irregular transit timing` and `Many off-period dips`.
+- 2026-07-20 clean synthetic transit after ephemeris vetting: `strong_candidate`, score `100`, ephemeris fit `8/8`.
 
 Commands used for basic checks:
 
