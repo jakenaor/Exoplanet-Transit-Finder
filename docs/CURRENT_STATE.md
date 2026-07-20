@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 ## Canonical Location
 
@@ -13,7 +13,18 @@ Use this repo as the source of truth:
 The app is currently nested at:
 
 ```text
+Exoplanet data parsing tool/
+```
+
+The active app files are:
+
+```text
 Exoplanet data parsing tool/main.py
+Exoplanet data parsing tool/analysis.py
+Exoplanet data parsing tool/parsers.py
+Exoplanet data parsing tool/static/index.html
+Exoplanet data parsing tool/static/styles.css
+Exoplanet data parsing tool/static/app.js
 ```
 
 A similarly named non-repo folder and an earlier typo-named app folder were used by mistake:
@@ -27,20 +38,37 @@ Future sessions should work in `Exoplanet-Transit-Finder` and the tracked `Exopl
 
 ## Product Goal
 
-Build a local Python web app for exoplanet transit analysis. The user uploads a CSV with two columns, `Time` and `Flux`. The app plots the light curve, detects transit-like dips, boxes transits, estimates orbital period, provides significance estimates, and supports exploration/editing/export.
+Build a local Python web app for exoplanet transit analysis. The user uploads one or more CSV/FITS light curves, the app plots the light curve, detects transit-like dips, boxes transits, estimates orbital period, provides significance estimates, supports manual exploration/editing, and exports the results.
 
-The `Time` column is treated as continuous Julian dates. UI plots show days since the first observation for time-series views, while retaining the original JD reference in the Analysis panel and export data.
+For CSV input, the app expects `Time` and `Flux` columns. For FITS input, it accepts common time and flux columns such as `TIME`, `BJD`, `BTJD`, `JD`, `MJD`, `PDCSAP_FLUX`, `SAP_FLUX`, and `FLUX`.
+
+The `Time` column is treated as continuous Julian days. UI plots show days since the first observation for time-series views, while retaining the original JD reference in the Analysis panel and export data. FITS relative time columns are shifted by available BJD/JD/MJD reference header values when present.
 
 ## Current Working Features
 
-- Localhost app served by `python3 main.py` using only Python stdlib for HTTP serving.
+- Localhost app served by `python3 main.py` using Python stdlib HTTP serving.
+- Split app structure:
+  - `main.py` handles HTTP routes, static assets, and `/analyze`.
+  - `parsers.py` handles CSV and FITS ingestion.
+  - `analysis.py` handles cleaning, detection, BLS search, diagnostics, and plot payloads.
+  - `static/index.html`, `static/styles.css`, and `static/app.js` hold the frontend.
 - CSV upload with case-insensitive `Time`/`Flux` parsing.
+- CSV upload size limit of `80 MB`.
+- FITS upload support for `.fits`, `.fit`, and `.fts` files.
+- FITS upload size limit of `200 MB`.
+- FITS parser support for table HDUs with common time/flux column names.
+- FITS `QUALITY == 0` filtering when a recognized quality column is present.
+- Batch upload support for up to `100` files.
+- Sequential batch processing through the existing `/analyze` endpoint.
+- Batch Results dropdown for switching between processed filenames.
+- Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
 - Robust clipping and moving-average smoothing for visualization.
+- Per-observing-segment median normalization for gapped/multi-zone light curves.
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
-- Binned-BLS fallback period estimate when `astropy` is unavailable or broken.
+- Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
 - Period displayed in Julian days.
 - Period search controls:
   - Minimum period.
@@ -68,6 +96,8 @@ The `Time` column is treated as continuous Julian dates. UI plots show days sinc
   - Minimum depth.
   - Minimum duration.
   - Maximum duration.
+  - Minimum period.
+  - Maximum period.
   - Reset detection.
 - Transit depth estimates:
   - Raw flux depth.
@@ -81,43 +111,53 @@ The `Time` column is treated as continuous Julian dates. UI plots show days sinc
 - Export controls:
   - Transit CSV, including edited boxes and original JD columns.
   - Current graph PNG.
-  - Summary JSON with metrics, detection options, and transits.
+  - Summary JSON with metrics, detection options, warnings, and transits.
+  - Analysis PDF for the currently selected file.
+  - Batch PDF table for all successfully processed uploaded files.
 
 ## Important Implementation Decisions
 
-- Keep the app as a single `main.py` for now. This keeps setup simple for the current local workflow.
+- The app has been split out of the old monolithic `main.py` into Python modules plus static frontend assets, while preserving the simple local `python3 main.py` workflow.
 - Use `numpy`, `scipy`, and `astropy` for numerical and astronomy-specific operations instead of hand-rolling everything.
+- FITS support depends on `astropy.io.fits`; if `astropy` is unavailable, FITS uploads fail with a user-visible error.
 - Use the repo-local `.venv` as the VS Code/Pylance interpreter. `.vscode/settings.json` points Pylance at `.venv/bin/python`.
 - Treat `Time` as Julian dates and convert to relative days for graph readability.
-- Use BLS for orbital period, because simple averaging of nearby detected boxes was badly wrong for this dataset.
+- Normalize gapped observing segments independently before transit detection. This fixed the HD 209458-style file where obvious dips existed in separate data zones but global noise/baseline handling hid them.
+- Use BLS for orbital period, because simple averaging of nearby detected boxes was badly wrong for real gapped datasets.
 - Treat broad automated period-search results as candidate rankings, not ground truth. The Kepler sample previously showed a strong alias around `294` days while a constrained `380-390` day search returned about `386.16` days.
 - Use phase-folding as the primary validation view for repeated transit structure.
-- Manual box edits are currently frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
-- Detection controls require clicking `Analyze CSV` again. They are not live-updated while dragging sliders.
+- Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
+- Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
+- Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
 - Chi-squared p-value is an approximate model-vs-flat significance metric, not a literal probability that a planet is real.
-- `docs/CURRENT_STATE.md` and `docs/REPO_MAP.md` are intentionally ignored by git. They remain local working references, not tracked project files.
+- Exports are client-side downloads.
+- `docs/CURRENT_STATE.md` is now tracked in git. `docs/REPO_MAP.md` is still ignored by `.gitignore` unless it is intentionally force-added.
 
 ## Things That Worked
 
 - BLS and the binned-BLS fallback replaced naive average-gap period estimation.
 - Period min/max controls made period aliases visible and controllable; constraining the Kepler sample to `380-390` days previously returned about `386.16` days.
 - A repo-local `.venv` fixed Pylance missing-import warnings for `numpy`, `scipy`, and `astropy`.
-- Phase-folded view made the repeated transit visually obvious when centered on phase 0.
+- Phase-folded view made repeated transit structure visually obvious when centered on phase 0.
 - Local curve-bounded boxes are much more readable than full-height boxes.
 - Manual editing is useful for correcting imperfect automatic boxes.
-- Detection strictness and smoothing controls actually affect candidate counts; for example, lowering strictness on the Kepler sample found more candidates than the default.
-- Export JSON/CSV/PNG provides a clean way to take analysis results out of the app.
+- Detection strictness and smoothing controls affect candidate counts.
+- Per-segment median normalization and a more permissive fallback detector fixed the HD 209458 CSV case with clear transits in two separated data zones.
+- FITS parsing works on synthetic table-HDU light curve fixtures.
+- Batch uploads work for mixed successful/failed files and preserve filename switching.
+- PDF analysis exports work for both the selected file and all successful batch results.
+- Splitting the monolithic file made the code easier to navigate without changing the local startup command.
 
 ## Things That Did Not Work Or Needed Correction
 
 - Initial Pylance reported missing `numpy`; this was fixed by creating `.venv`, installing `requirements.txt`, and adding `.vscode/settings.json`.
 - An earlier global Python environment had a broken `astropy` import due to a dependency mismatch. The repo-local `.venv` imports `numpy`, `scipy`, and `astropy` successfully.
 - Early plots were unreadable because the raw data had large outliers and too many points. Clipping, smoothing, and downsampling were added.
-- Early transit detection found only one transit. Detection was broadened and later improved with prominence logic.
+- Early transit detection found only one transit. Detection was broadened and later improved with prominence logic, threshold fallback, and segment-aware normalization.
 - Early box drawing covered too much vertical space. It now boxes the local transit curve region.
 - Simple average of detected transit centers was not reliable for orbital period because the detector can find many local dips that are not consecutive orbital events. BLS is now preferred.
 - The wrong local folder was used for several edits before copying the final app into the correct Git repo. The correct repo is now documented here.
-- Binding localhost from the sandbox may fail with `Operation not permitted`; running `.venv/bin/python main.py` may need escalated execution in this environment.
+- The docs became stale after FITS support, batch uploads, PDF exports, and the file split. This update corrects that.
 
 ## Current Verification Notes
 
@@ -127,37 +167,56 @@ Known sample file previously used during testing:
 /Users/jakenaor/Downloads/kepler_Kepler-452b_transit_data_20.csv
 ```
 
-As of 2026-06-02, that sample file is not present at the old path, so it was not revalidated in this update.
+As of 2026-06-02, that sample file was not present at the old path, so it was not revalidated in that update.
 
-Previous observed verification result at default detection settings:
+The HD 209458 CSV used for the transit-detection fix was:
 
-- Total points: `71,963`
-- Detected transits: `41`
-- BLS period: about `294.471929` days
-- Binned-BLS fallback period: about `294.363098` days
-- With period bounds `380-390` days, binned-BLS fallback returned about `386.162403` days
-- Phase-folded points: `12,000` plotted points
-- Phase-folded bins: about `280` median bins
-- Chi-squared p-value: extremely small, displayed as less than a tiny percentage in the UI
+```text
+/Users/jakenaor/Desktop/hd209458_time_flux.csv
+```
+
+That desktop file later disappeared, so do not assume it exists in future sessions.
+
+Recent verification used temporary fixtures in `/private/tmp`, including:
+
+```text
+/private/tmp/synthetic_transit_lightcurve.fits
+/private/tmp/transit-batch-fixtures/batch_sample_1.csv
+/private/tmp/transit-batch-fixtures/batch_sample_2.csv
+```
+
+Observed verification results from recent work:
+
+- Synthetic FITS fixture: `2592` points, `9` transits, BLS period about `1.9993686868639833` days.
+- Batch CSV fixture 1: `8` transits, period about `1.69795663` days.
+- Batch CSV fixture 2: `6` transits, period about `2.29867111` days.
+- Earlier HD 209458 CSV run: `15` transits, BLS period about `3.5242522516600965` days, segment count `4`, SNR about `50.67`.
 
 Commands used for basic checks:
 
 ```bash
-PYTHONPYCACHEPREFIX=/private/tmp/transit-pycache .venv/bin/python -m py_compile "Exoplanet data parsing tool/main.py"
+PYTHONPYCACHEPREFIX=/private/tmp/transit-pycache .venv/bin/python -m py_compile \
+  "Exoplanet data parsing tool/main.py" \
+  "Exoplanet data parsing tool/analysis.py" \
+  "Exoplanet data parsing tool/parsers.py"
+
 .venv/bin/python "Exoplanet data parsing tool/main.py"
 ```
 
-Browser JavaScript has also been syntax-checked with macOS `osascript -l JavaScript` when Node was unavailable.
+Browser JavaScript has also been syntax-checked with macOS `osascript -l JavaScript` when no in-app browser was available.
 
 ## Known Limitations
 
-- Single-file app is growing large; future work may benefit from splitting Python analysis, HTML template, CSS, and JavaScript.
 - Manual box edits are not persisted after re-analysis or page reload.
 - The p-value recomputed after manual edits uses frontend plotted/smoothed data, not the full backend dataset. This is useful for feedback but less rigorous than a backend recompute.
 - Exports are client-side downloads.
 - False-positive warnings are heuristic and advisory; they do not prove or disprove that a candidate is planetary.
 - Top period candidates are exposed, but harmonics/aliases are not yet analyzed deeply.
 - Broad automated period search can still prefer aliases. Use period min/max controls when a target period range is known.
+- Batch processing is sequential and client-driven. Very large batches can take a while and do not yet have cancellation or backend progress streaming.
+- FITS support handles table HDUs with recognizable time/flux columns; it does not analyze FITS image cubes or arbitrary instrument-specific products yet.
+- The data cleaning report/panel is still pending.
+- There is no real test suite yet for the analysis functions.
 
 ## TLS Parity Roadmap
 
@@ -173,7 +232,7 @@ This project is intended to become a more user-friendly version of Transit Least
   - Surface missing/invalid stellar-prior warnings clearly.
 - Search controls:
   - Period minimum/maximum controls are implemented.
-  - Add duration minimum/maximum controls tied to physically plausible ranges.
+  - Duration minimum/maximum controls are implemented as detection controls, but not yet tied to physical stellar priors.
   - Period search bounds are exported in JSON; full period/duration grid visualization is still pending.
   - Add quick-look binning/resampling controls for large or short-cadence datasets.
 - Detection statistics:
@@ -227,11 +286,10 @@ Additional useful future features after step 8:
 - Search progress reporting and quick-look binning/resampling.
 - Save/load edited sessions.
 - A real test suite for analysis functions.
-- Refactor into modules once behavior stabilizes.
 
 ## Current Git State Expectations
 
-The main branch should contain this documentation and the current app implementation. The canonical remote is:
+The main branch should contain the current app implementation and `docs/CURRENT_STATE.md`. The canonical remote is:
 
 ```text
 https://github.com/jakenaor/Exoplanet-Transit-Finder.git
