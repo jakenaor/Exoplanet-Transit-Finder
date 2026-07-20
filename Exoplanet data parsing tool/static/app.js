@@ -19,6 +19,7 @@ const strictnessInput = document.getElementById('strictnessInput');
 const strictnessValue = document.getElementById('strictnessValue');
 const smoothingInput = document.getElementById('smoothingInput');
 const smoothingValue = document.getElementById('smoothingValue');
+const searchModeInput = document.getElementById('searchModeInput');
 const minDepthInput = document.getElementById('minDepthInput');
 const minDurationInput = document.getElementById('minDurationInput');
 const maxDurationInput = document.getElementById('maxDurationInput');
@@ -269,6 +270,7 @@ function detectionOptions() {
   return {
     strictness: Number(strictnessInput.value),
     smoothing: Number(smoothingInput.value),
+    searchMode: searchModeInput.value,
     minDepth: optionalNumber(minDepthInput),
     minDuration: optionalNumber(minDurationInput),
     maxDuration: optionalNumber(maxDurationInput),
@@ -285,6 +287,7 @@ function updateDetectionReadouts() {
 function resetDetectionControls() {
   strictnessInput.value = '1';
   smoothingInput.value = '1';
+  searchModeInput.value = 'bls';
   minDepthInput.value = '';
   minDurationInput.value = '';
   maxDurationInput.value = '';
@@ -374,6 +377,7 @@ function clearResultView() {
 function appendDetectionOptions(formData, options) {
   formData.append('strictness', options.strictness);
   formData.append('smoothing', options.smoothing);
+  formData.append('searchMode', options.searchMode);
   if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
   if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
   if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
@@ -421,6 +425,7 @@ fileInput.addEventListener('change', () => setFiles(fileInput.files));
 [minDepthInput, minDurationInput, maxDurationInput, minPeriodInput, maxPeriodInput].forEach(input => {
   input.addEventListener('change', markDetectionControlsChanged);
 });
+searchModeInput.addEventListener('change', markDetectionControlsChanged);
 resetDetectionButton.addEventListener('click', () => {
   resetDetectionControls();
   markDetectionControlsChanged();
@@ -965,6 +970,12 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
         title: 'Period selected by regularity',
         detail: 'A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.',
       });
+    } else if (metrics.periodMethod === 'TLS-style') {
+      warnings.push({
+        severity: 'info',
+        title: 'TLS-style search mode',
+        detail: 'The orbital period was selected by the transit-shape search mode.',
+      });
     } else {
       warnings.push({
         severity: 'info',
@@ -1003,7 +1014,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
   }
   if (
     transits.length >= 3
-    && ['BLS', 'binned BLS fallback', 'transit regularity'].includes(metrics.periodMethod)
+    && ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS-style'].includes(metrics.periodMethod)
     && Number.isFinite(Number(metrics.ephemerisMatchFraction))
   ) {
     const matchFraction = Number(metrics.ephemerisMatchFraction);
@@ -1012,7 +1023,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
     const expectedCount = Number(metrics.expectedTransitCount);
     const expectedCoverage = Number(metrics.expectedTransitCoverage);
     const wellCoveredEvents = (
-      metrics.periodMethod === 'transit regularity'
+      ['transit regularity', 'TLS-style'].includes(metrics.periodMethod)
       && Number.isFinite(eventCount)
       && eventCount >= 3
       && (
@@ -1102,10 +1113,10 @@ function buildPlanetAssessment(metrics, warnings) {
   const expectedTransitCount = Number.isFinite(Number(metrics.expectedTransitCount)) ? Number(metrics.expectedTransitCount) : null;
   const expectedTransitCoverage = Number.isFinite(Number(metrics.expectedTransitCoverage)) ? Number(metrics.expectedTransitCoverage) : null;
   const timingResidualRatio = Number.isFinite(Number(metrics.timingResidualRatio)) ? Number(metrics.timingResidualRatio) : null;
-  const ephemerisPeriodMethods = ['BLS', 'binned BLS fallback', 'transit regularity'];
+  const ephemerisPeriodMethods = ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS-style'];
   const periodLabel = periodMethod === 'BLS' ? 'BLS period' : 'selected period';
   const wellCoveredEphemeris = (
-    periodMethod === 'transit regularity'
+    ['transit regularity', 'TLS-style'].includes(periodMethod)
     && ephemerisEventMatchCount !== null
     && ephemerisEventMatchCount >= 3
     && (
@@ -1142,6 +1153,8 @@ function buildPlanetAssessment(metrics, warnings) {
 
   if (period !== null && period > 0 && periodMethod === 'BLS') {
     support('Stable BLS period', `Best period is ${fmt(period, 6)} days from the BLS search.`, 22);
+  } else if (period !== null && period > 0 && periodMethod === 'TLS-style') {
+    support('TLS-style transit-shape period', `Best period is ${fmt(period, 6)} days from the transit-shape search.`, 22);
   } else if (period !== null && period > 0 && periodMethod === 'transit regularity') {
     support('Frequent transit regularity', `Best repeating interval is ${fmt(period, 6)} days from the boxed transit cadence.`, 20);
   } else if (period !== null && period > 0) {
@@ -1151,7 +1164,11 @@ function buildPlanetAssessment(metrics, warnings) {
     limit('No stable period', 'A repeating orbital period was not recovered.', -18);
   }
 
-  const sdeBand = scoreBand(periodSde, [
+  const sdeBand = scoreBand(periodSde, periodMethod === 'TLS-style' ? [
+    [8, 22, 'Very strong TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
+    [5, 17, 'Strong TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
+    [3.5, 8, 'Moderate TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
+  ] : [
     [10, 22, 'Very strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
     [7, 17, 'Strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
     [5, 8, 'Moderate period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
@@ -1263,10 +1280,10 @@ function buildPlanetAssessment(metrics, warnings) {
   const strongRequirementsMet = (
     transitCount >= 3
     && period !== null
-    && periodMethod === 'BLS'
+    && ['BLS', 'TLS-style'].includes(periodMethod)
     && detectionSnr !== null
     && detectionSnr >= 7
-    && (periodSde === null || periodSde >= 5)
+    && (periodSde === null || periodSde >= (periodMethod === 'TLS-style' ? 3.5 : 5))
     && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.75)
     && (offEphemerisFraction === null || offEphemerisFraction <= 0.3)
     && dangerCount === 0
@@ -1460,7 +1477,7 @@ function renderPeriodCandidates() {
   periodCandidatesEl.innerHTML = candidates.map((candidate, index) => `
     <div class="warning-item ${index === 0 ? 'info' : 'caution'}">
       <strong>${fmt(candidate.period, 4)} days</strong>
-      <span>Power ${fmt(candidate.power, 2)}${candidate.sde === null || candidate.sde === undefined ? '' : `, SDE ${fmt(candidate.sde, 2)}`}</span>
+      <span>${candidate.method ? `${escapeHtml(candidate.method)}; ` : ''}Power ${fmt(candidate.power, 2)}${candidate.sde === null || candidate.sde === undefined ? '' : `, SDE ${fmt(candidate.sde, 2)}`}</span>
     </div>
   `).join('');
 }

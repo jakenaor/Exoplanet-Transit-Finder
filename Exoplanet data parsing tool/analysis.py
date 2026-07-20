@@ -23,6 +23,7 @@ MAX_PLOT_POINTS = 12000
 DEFAULT_DETECTION_OPTIONS = {
     "strictness": 1.0,
     "smoothing": 1.0,
+    "search_mode": "bls",
     "min_depth": None,
     "min_duration": None,
     "max_duration": None,
@@ -61,6 +62,23 @@ def parse_optional_float(form, name, low=None, high=None):
     return value
 
 
+def parse_search_mode(form):
+    raw_value = field_value(form, "searchMode")
+    if raw_value is None or str(raw_value).strip() == "":
+        return DEFAULT_DETECTION_OPTIONS["search_mode"]
+    value = str(raw_value).strip().lower().replace("_", "-")
+    aliases = {
+        "bls": "bls",
+        "bls-regularity": "bls",
+        "bls+regularity": "bls",
+        "tls": "tls",
+        "tls-style": "tls",
+    }
+    if value not in aliases:
+        raise ValueError("searchMode must be bls or tls.")
+    return aliases[value]
+
+
 def parse_detection_options(form):
     options = dict(DEFAULT_DETECTION_OPTIONS)
     strictness = parse_optional_float(form, "strictness", 0.2, 5.0)
@@ -69,6 +87,7 @@ def parse_detection_options(form):
         options["strictness"] = clamp(strictness, 0.2, 5.0)
     if smoothing is not None:
         options["smoothing"] = clamp(smoothing, 0.25, 4.0)
+    options["search_mode"] = parse_search_mode(form)
 
     options["min_depth"] = parse_optional_float(form, "minDepth", 0.0, None)
     options["min_duration"] = parse_optional_float(form, "minDuration", 0.0, None)
@@ -790,6 +809,62 @@ def should_prefer_regularity_period(regularity_period, bls_period, transits, tim
     )
 
 
+def should_prefer_tls_style_period(tls_period, regularity_period, transits, time):
+    if tls_period is None:
+        return False
+    if regularity_period is None:
+        return True
+
+    tls_value = float(tls_period.get("period", 0.0) or 0.0)
+    regular_value = float(regularity_period.get("period", 0.0) or 0.0)
+    if tls_value <= 0 or regular_value <= 0:
+        return True
+    if abs(regular_value - tls_value) / tls_value <= 0.02:
+        return True
+
+    centers = np.asarray([item["center"] for item in transits], dtype=float)
+    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
+    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
+    tls_score = score_transit_regularity_period(
+        centers,
+        durations,
+        depths,
+        float(time[0]),
+        float(time[-1]),
+        tls_value,
+        fixed_epoch=tls_period.get("transit_time"),
+    )
+    if tls_score is None:
+        tls_sde = finite_number(tls_period.get("sde"))
+        return tls_sde is not None and tls_sde >= 7.0
+
+    tls_event_count = int(tls_score.get("event_match_count", 0))
+    tls_box_count = int(tls_score.get("box_match_count", 0))
+    regular_event_count = int(regularity_period.get("event_match_count", 0))
+    regular_box_count = int(regularity_period.get("box_match_count", 0))
+    regular_coverage = float(regularity_period.get("expected_coverage", 0.0))
+    tls_sde = finite_number(tls_period.get("sde"))
+
+    if (
+        regular_event_count >= tls_event_count + 3
+        and regular_box_count >= tls_box_count + 3
+        and (
+            regular_coverage >= 0.55
+            or is_dense_regularity_match(
+                regular_box_count,
+                regular_event_count,
+                regular_coverage,
+                len(transits),
+            )
+        )
+    ):
+        return False
+
+    if tls_sde is not None and tls_sde >= 5.0 and tls_event_count >= max(3, regular_event_count - 1):
+        return True
+    return tls_event_count >= regular_event_count
+
+
 def dealiased_bls_period(bls_period, transits, time, flux):
     if bls_period is None or len(transits) < 3:
         return bls_period
@@ -920,6 +995,363 @@ def dealiased_bls_period(bls_period, transits, time, flux):
         "harmonic_alias_period": top_period,
         "harmonic_alias_factor": best["harmonic"],
         "harmonic_alias_power_ratio": (finite_number(candidate.get("power")) or 0.0) / top_power,
+        **(chi_squared or {}),
+    }
+
+
+def sample_for_period_search(time, flux, max_points=25000):
+    if len(time) <= max_points:
+        return time, flux
+    indices = np.unique(np.linspace(0, len(time) - 1, max_points, dtype=int))
+    return time[indices], flux[indices]
+
+
+def wrapped_window_sum(prefix, start, width, bin_count):
+    start = int(start) % int(bin_count)
+    width = int(width)
+    return float(prefix[start + width] - prefix[start])
+
+
+def best_tls_style_window_for_period(time, flattened_flux, period, durations, reference_time, sigma):
+    bin_count = 420
+    phase = ((time - reference_time) % period) / period
+    bin_ids = np.minimum((phase * bin_count).astype(int), bin_count - 1)
+    sums = np.bincount(bin_ids, weights=flattened_flux, minlength=bin_count)
+    counts = np.bincount(bin_ids, minlength=bin_count)
+    doubled_sums = np.r_[sums, sums]
+    doubled_counts = np.r_[counts, counts]
+    sum_prefix = np.r_[0.0, np.cumsum(doubled_sums)]
+    count_prefix = np.r_[0.0, np.cumsum(doubled_counts)]
+    total_sum = float(np.sum(sums))
+    total_count = float(np.sum(counts))
+    if total_count < 20:
+        return None
+
+    best = None
+    for duration in durations:
+        duration = float(duration)
+        if duration <= 0 or duration >= period * 0.24:
+            continue
+        window = int(round((duration / period) * bin_count))
+        window = max(2, min(window, bin_count // 4))
+        if window < 2:
+            continue
+
+        in_sums = sum_prefix[window:window + bin_count] - sum_prefix[:bin_count]
+        in_counts = count_prefix[window:window + bin_count] - count_prefix[:bin_count]
+        out_counts = total_count - in_counts
+        valid = (in_counts >= 3) & (out_counts >= 3)
+        if not np.any(valid):
+            continue
+
+        in_means = np.where(valid, in_sums / np.maximum(in_counts, 1), np.nan)
+        out_means = np.where(valid, (total_sum - in_sums) / np.maximum(out_counts, 1), np.nan)
+        depths = out_means - in_means
+        valid &= np.isfinite(depths) & (depths > 0)
+        if not np.any(valid):
+            continue
+
+        duty_cycle = duration / period
+        duty_weight = clamp(0.05 / max(duty_cycle, 0.005), 0.65, 1.35)
+        powers = np.where(
+            valid,
+            (depths / sigma) * np.sqrt(np.maximum(in_counts, 1.0)) * duty_weight,
+            -np.inf,
+        )
+        start = int(np.nanargmax(powers))
+        power = float(powers[start])
+        if not math.isfinite(power) or power <= 0:
+            continue
+
+        depth = float(depths[start])
+        shoulder_width = max(1, min(window, bin_count // 12))
+        left_sum = wrapped_window_sum(sum_prefix, start - shoulder_width, shoulder_width, bin_count)
+        left_count = wrapped_window_sum(count_prefix, start - shoulder_width, shoulder_width, bin_count)
+        right_sum = wrapped_window_sum(sum_prefix, start + window, shoulder_width, bin_count)
+        right_count = wrapped_window_sum(count_prefix, start + window, shoulder_width, bin_count)
+        left_mean = left_sum / left_count if left_count > 0 else out_means[start]
+        right_mean = right_sum / right_count if right_count > 0 else out_means[start]
+        shoulder_lift = min(float(left_mean) - float(in_means[start]), float(right_mean) - float(in_means[start]))
+        shoulder_score = clamp(shoulder_lift / max(depth, 1e-12), 0.0, 1.25)
+
+        core_width = max(1, window // 2)
+        core_start = start + max(0, (window - core_width) // 2)
+        core_sum = wrapped_window_sum(sum_prefix, core_start, core_width, bin_count)
+        core_count = wrapped_window_sum(count_prefix, core_start, core_width, bin_count)
+        core_mean = core_sum / core_count if core_count > 0 else in_means[start]
+        core_drop = float(out_means[start]) - float(core_mean)
+        core_score = clamp(core_drop / max(depth, 1e-12), 0.35, 1.35)
+
+        shape_score = 0.55 + 0.25 * shoulder_score + 0.20 * core_score
+        tls_power = power * shape_score
+        center_phase = (start + window / 2.0) / bin_count
+        transit_time = float(reference_time + center_phase * period)
+        candidate = {
+            "period": float(period),
+            "duration": duration,
+            "transit_time": transit_time,
+            "depth": depth,
+            "power": float(tls_power),
+            "shape_score": float(shape_score),
+            "duty_cycle": float(duty_cycle),
+        }
+        if best is None or candidate["power"] > best["power"]:
+            best = candidate
+
+    return best
+
+
+def tls_style_event_coherence(time, flattened_flux, period, duration, transit_time, sigma):
+    if period <= 0 or duration <= 0:
+        return None
+
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    first_epoch = math.ceil((time[0] - transit_time) / period)
+    last_epoch = math.floor((time[-1] - transit_time) / period)
+    expected_count = max(1, int(last_epoch - first_epoch + 1))
+    event_depths = []
+    event_snrs = []
+    event_residuals = []
+    sampled_count = 0
+    min_in_points = max(2, min(6, int(round(duration / max(cadence, 1e-9) * 0.35))))
+    shoulder_inner = max(duration * 0.75, cadence * 2.0)
+    shoulder_outer = max(duration * 2.8, cadence * 8.0)
+
+    for cycle in range(first_epoch, last_epoch + 1):
+        center = transit_time + cycle * period
+        in_left = int(np.searchsorted(time, center - duration / 2.0, side="left"))
+        in_right = int(np.searchsorted(time, center + duration / 2.0, side="right"))
+        in_count = max(0, in_right - in_left)
+        if in_count < min_in_points:
+            continue
+
+        left_out_start = int(np.searchsorted(time, center - shoulder_outer, side="left"))
+        left_out_end = int(np.searchsorted(time, center - shoulder_inner, side="right"))
+        right_out_start = int(np.searchsorted(time, center + shoulder_inner, side="left"))
+        right_out_end = int(np.searchsorted(time, center + shoulder_outer, side="right"))
+        out_count = max(0, left_out_end - left_out_start) + max(0, right_out_end - right_out_start)
+        if out_count < max(3, min_in_points):
+            continue
+
+        sampled_count += 1
+        in_flux = flattened_flux[in_left:in_right]
+        out_flux = np.r_[
+            flattened_flux[left_out_start:left_out_end],
+            flattened_flux[right_out_start:right_out_end],
+        ]
+        local_depth = float(np.median(out_flux) - np.median(in_flux))
+        local_noise = max(
+            sigma,
+            1.4826 * float(np.median(np.abs(out_flux - np.median(out_flux)))),
+            1e-9,
+        )
+        local_snr = local_depth / local_noise * math.sqrt(max(in_count, 1))
+        if local_depth > 0 and local_snr > 0.35:
+            event_depths.append(local_depth)
+            event_snrs.append(float(local_snr))
+            event_residuals.append(0.0)
+
+    match_count = len(event_depths)
+    if sampled_count < 2 or match_count < 2:
+        return None
+
+    depth_cv = coefficient_of_variation(event_depths)
+    cv_penalty = 1.0 if depth_cv is None else clamp(1.15 - depth_cv * 0.35, 0.45, 1.10)
+    odd_depth = median_or_none(event_depths[0::2])
+    even_depth = median_or_none(event_depths[1::2])
+    odd_even_mismatch = None
+    if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
+        odd_even_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
+    odd_even_penalty = 1.0 if odd_even_mismatch is None else clamp(1.10 - odd_even_mismatch * 0.30, 0.55, 1.08)
+
+    match_fraction = match_count / sampled_count
+    if match_fraction < 0.45:
+        return None
+
+    median_snr = median_or_none(event_snrs) or 0.0
+    coherence = math.sqrt(match_count) * match_fraction * cv_penalty * odd_even_penalty
+    return {
+        "expected_count": expected_count,
+        "sampled_count": int(sampled_count),
+        "event_match_count": int(match_count),
+        "match_fraction": float(match_fraction),
+        "median_event_depth": median_or_none(event_depths),
+        "median_event_snr": float(median_snr),
+        "depth_scatter_ratio": depth_cv,
+        "odd_even_depth_mismatch": odd_even_mismatch,
+        "timing_scatter": float(np.std(event_residuals)) if len(event_residuals) > 1 else 0.0,
+        "coherence": float(coherence),
+    }
+
+
+def add_tls_seed_periods(seed_periods, bls_period, min_period, max_period):
+    if bls_period is None:
+        return
+    sources = [bls_period, *bls_period.get("candidates", [])]
+    for source in sources:
+        period = finite_number(source.get("period")) if isinstance(source, dict) else None
+        if period is None or period <= 0:
+            continue
+        for scale in (1.0, 0.5, 1.5, 2.0, 3.0):
+            scaled_period = period * scale
+            if scaled_period < min_period or scaled_period > max_period:
+                continue
+            for offset in (-0.015, -0.006, 0.0, 0.006, 0.015):
+                seed_periods.append(scaled_period * (1.0 + offset))
+
+
+def estimate_period_with_tls_style(time, flux, options=None, bls_period=None):
+    if len(time) < 50:
+        return None
+
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    if full_span <= 0:
+        return None
+
+    flattened_flux = flattened_flux_for_period_search(time, flux)
+    if flattened_flux is None:
+        return None
+
+    min_period, max_period = period_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
+    min_duration, max_duration = constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options)
+    if min_period >= max_period or min_duration >= max_duration:
+        return None
+
+    search_time, search_flux = sample_for_period_search(time, flattened_flux)
+    residual_median = float(np.median(search_flux))
+    residual_mad = float(np.median(np.abs(search_flux - residual_median)))
+    sigma = max(1.4826 * residual_mad, float(np.std(search_flux)), 1e-9)
+    reference_time = float(time[0])
+
+    base_periods = period_grid(min_period, max_period, 420)
+    seeded_periods = []
+    add_tls_seed_periods(seeded_periods, bls_period, min_period, max_period)
+    periods = np.unique(np.r_[base_periods, np.asarray(seeded_periods, dtype=float)])
+    periods = periods[(periods >= min_period) & (periods <= max_period)]
+    periods = np.sort(periods.astype(float))
+    if periods.size == 0:
+        return None
+
+    linear_durations = np.linspace(min_duration, max_duration, 10)
+    geometric_durations = np.geomspace(max(min_duration, 1e-6), max(max_duration, min_duration * 1.01), 8)
+    durations = np.unique(np.r_[linear_durations, geometric_durations])
+    period_scores = np.zeros(periods.size, dtype=float)
+    quick_candidates = []
+    scored_candidates = []
+
+    for period_index, period in enumerate(periods):
+        period_durations = durations[(durations >= min_duration) & (durations <= min(max_duration, period * 0.20))]
+        if period_durations.size == 0:
+            continue
+
+        window = best_tls_style_window_for_period(
+            search_time,
+            search_flux,
+            float(period),
+            period_durations,
+            reference_time,
+            sigma,
+        )
+        if window is None:
+            continue
+
+        window["period_index"] = int(period_index)
+        quick_candidates.append(window)
+
+    event_check_limit = min(len(quick_candidates), max(60, periods.size // 5))
+    for window in sorted(quick_candidates, key=lambda item: item["power"], reverse=True)[:event_check_limit]:
+        event_stats = tls_style_event_coherence(
+            search_time,
+            search_flux,
+            window["period"],
+            window["duration"],
+            window["transit_time"],
+            sigma,
+        )
+        if event_stats is None:
+            continue
+
+        event_floor = 3 if event_stats["sampled_count"] >= 3 else 2
+        if event_stats["event_match_count"] < event_floor:
+            continue
+
+        score = window["power"] * event_stats["coherence"] * (0.75 + min(event_stats["median_event_snr"], 12.0) / 48.0)
+        candidate = {
+            **window,
+            **event_stats,
+            "score": float(score),
+        }
+        scored_candidates.append(candidate)
+        period_scores[int(window["period_index"])] = float(score)
+
+    if not scored_candidates:
+        return None
+
+    scores = np.asarray(period_scores, dtype=float)
+    finite_scores = scores[np.isfinite(scores) & (scores > 0)]
+    if finite_scores.size >= 5:
+        score_median = float(np.median(finite_scores))
+        score_std = max(float(np.std(finite_scores)), 1e-9)
+    else:
+        score_median = 0.0
+        score_std = 1.0
+
+    best = max(scored_candidates, key=lambda item: item["score"])
+    sde = (best["score"] - score_median) / score_std
+    if not math.isfinite(sde):
+        sde = None
+
+    ranked = sorted(scored_candidates, key=lambda item: item["score"], reverse=True)
+    candidates = []
+    seen_periods = set()
+    for item in ranked:
+        key = round(item["period"], 10)
+        if key in seen_periods:
+            continue
+        seen_periods.add(key)
+        item_sde = None if sde is None else float((item["score"] - score_median) / score_std)
+        candidates.append({
+            "period": float(item["period"]),
+            "power": float(item["score"]),
+            "sde": item_sde,
+            "method": "TLS-style",
+            "event_match_count": int(item["event_match_count"]),
+            "observed_event_count": int(item["sampled_count"]),
+            "expected_transit_count": int(item["expected_count"]),
+            "expected_transit_coverage": item["event_match_count"] / max(item["expected_count"], 1),
+        })
+        if len(candidates) >= 8:
+            break
+
+    chi_squared = chi_squared_transit_probability(
+        time,
+        flattened_flux,
+        best["period"],
+        best["duration"],
+        best["transit_time"],
+    )
+
+    return {
+        "period": float(best["period"]),
+        "scatter": float(best["timing_scatter"]),
+        "count": int(best["expected_count"]),
+        "duration": float(best["duration"]),
+        "transit_time": float(best["transit_time"]),
+        "power": float(best["score"]),
+        "sde": None if sde is None else float(sde),
+        "candidates": candidates,
+        "search_min_period": float(min_period),
+        "search_max_period": float(max_period),
+        "search_min_duration": float(min_duration),
+        "search_max_duration": float(max_duration),
+        "method": "TLS-style",
+        "tls_event_match_count": int(best["event_match_count"]),
+        "tls_observed_event_count": int(best["sampled_count"]),
+        "tls_match_fraction": float(best["match_fraction"]),
+        "tls_depth_scatter_ratio": best["depth_scatter_ratio"],
+        "tls_odd_even_depth_mismatch": best["odd_even_depth_mismatch"],
         **(chi_squared or {}),
     }
 
@@ -1207,10 +1639,28 @@ def detect_transits(time, flux, options=None):
 
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    search_mode = str(options.get("search_mode", "bls")).lower()
     bls_period = estimate_period_with_bls(time, flux, options)
     bls_period = dealiased_bls_period(bls_period, transits, time, flux)
-    regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
-    use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
+    tls_period = estimate_period_with_tls_style(time, flux, options, bls_period) if search_mode == "tls" else None
+    regularity_seed_period = tls_period if tls_period is not None else bls_period
+    regularity_period = estimate_period_by_transit_regularity(transits, time, options, regularity_seed_period)
+    use_tls_period = (
+        search_mode == "tls"
+        and should_prefer_tls_style_period(tls_period, regularity_period, transits, time)
+    )
+    use_regularity_period = (
+        regularity_period is not None
+        and not use_tls_period
+        and (
+            search_mode == "tls"
+            or should_prefer_regularity_period(regularity_period, bls_period, transits, time)
+        )
+    )
+    period = None
+    period_scatter = None
+    period_match_count = 0
+    period_method = None
     p_value = None
     chi_squared_flat = None
     chi_squared_box = None
@@ -1225,43 +1675,87 @@ def detect_transits(time, flux, options=None):
     harmonic_alias_period = None
     harmonic_alias_factor = None
     harmonic_alias_power_ratio = None
-    if bls_period is not None and not use_regularity_period:
-        period = bls_period["period"]
-        period_scatter = bls_period["scatter"]
-        period_match_count = bls_period["count"]
-        period_method = bls_period["method"]
-        p_value = bls_period.get("p_value")
-        chi_squared_flat = bls_period.get("chi_squared_flat")
-        chi_squared_box = bls_period.get("chi_squared_box")
-        reduced_chi_squared_box = bls_period.get("reduced_chi_squared_box")
-        delta_chi_squared = bls_period.get("delta_chi_squared")
-        period_epoch = bls_period.get("transit_time")
-        period_duration = bls_period.get("duration")
-        period_sde = bls_period.get("sde")
+
+    def regularity_candidate_payload():
+        if regularity_period is None:
+            return None
+        return {
+            "period": regularity_period["period"],
+            "power": regularity_period["event_match_count"],
+            "sde": None,
+            "method": regularity_period["method"],
+            "event_match_count": regularity_period["event_match_count"],
+            "expected_transit_count": regularity_period["expected_count"],
+            "expected_transit_coverage": regularity_period["expected_coverage"],
+        }
+
+    def period_search_payload(source):
+        if source is None:
+            return None
+        return {
+            "min_period": source.get("search_min_period"),
+            "max_period": source.get("search_max_period"),
+            "min_duration": source.get("search_min_duration"),
+            "max_duration": source.get("search_max_duration"),
+            "search_mode": search_mode,
+            "method": source.get("method"),
+        }
+
+    def dedupe_candidates(candidates):
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            candidate_period = finite_number(candidate.get("period"))
+            if candidate_period is None:
+                continue
+            key = (round(candidate_period, 10), candidate.get("method"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
+
+    def apply_grid_period(source):
+        nonlocal period, period_scatter, period_match_count, period_method
+        nonlocal p_value, chi_squared_flat, chi_squared_box, reduced_chi_squared_box, delta_chi_squared
+        nonlocal period_epoch, period_duration, period_sde, period_search
+        period = source["period"]
+        period_scatter = source["scatter"]
+        period_match_count = source["count"]
+        period_method = source["method"]
+        p_value = source.get("p_value")
+        chi_squared_flat = source.get("chi_squared_flat")
+        chi_squared_box = source.get("chi_squared_box")
+        reduced_chi_squared_box = source.get("reduced_chi_squared_box")
+        delta_chi_squared = source.get("delta_chi_squared")
+        period_epoch = source.get("transit_time")
+        period_duration = source.get("duration")
+        period_sde = source.get("sde")
+        period_search = period_search_payload(source)
+
+    if use_tls_period:
+        apply_grid_period(tls_period)
+        period_candidates = dedupe_candidates([
+            *tls_period.get("candidates", []),
+            regularity_candidate_payload(),
+            *(bls_period.get("candidates", []) if bls_period is not None else []),
+        ])
+        if bls_period is not None:
+            harmonic_alias_corrected = bool(bls_period.get("harmonic_alias_corrected"))
+            harmonic_alias_period = bls_period.get("harmonic_alias_period")
+            harmonic_alias_factor = bls_period.get("harmonic_alias_factor")
+            harmonic_alias_power_ratio = bls_period.get("harmonic_alias_power_ratio")
+    elif bls_period is not None and not use_regularity_period:
+        apply_grid_period(bls_period)
         period_candidates = bls_period.get("candidates", [])
         harmonic_alias_corrected = bool(bls_period.get("harmonic_alias_corrected"))
         harmonic_alias_period = bls_period.get("harmonic_alias_period")
         harmonic_alias_factor = bls_period.get("harmonic_alias_factor")
         harmonic_alias_power_ratio = bls_period.get("harmonic_alias_power_ratio")
         if regularity_period is not None:
-            period_candidates = [
-                {
-                    "period": regularity_period["period"],
-                    "power": regularity_period["event_match_count"],
-                    "sde": None,
-                    "method": regularity_period["method"],
-                    "event_match_count": regularity_period["event_match_count"],
-                    "expected_transit_count": regularity_period["expected_count"],
-                    "expected_transit_coverage": regularity_period["expected_coverage"],
-                },
-                *period_candidates,
-            ]
-        period_search = {
-            "min_period": bls_period.get("search_min_period"),
-            "max_period": bls_period.get("search_max_period"),
-            "min_duration": bls_period.get("search_min_duration"),
-            "max_duration": bls_period.get("search_max_duration"),
-        }
+            period_candidates = dedupe_candidates([regularity_candidate_payload(), *period_candidates])
     elif regularity_period is not None:
         period = regularity_period["period"]
         period_scatter = regularity_period["scatter"]
@@ -1269,29 +1763,19 @@ def detect_transits(time, flux, options=None):
         period_method = regularity_period["method"]
         period_epoch = regularity_period["transit_time"]
         period_duration = regularity_period["duration"]
-        period_candidates = [
-            {
-                "period": regularity_period["period"],
-                "power": regularity_period["event_match_count"],
-                "sde": None,
-                "method": regularity_period["method"],
-                "event_match_count": regularity_period["event_match_count"],
-                "expected_transit_count": regularity_period["expected_count"],
-                "expected_transit_coverage": regularity_period["expected_coverage"],
-            },
+        period_candidates = dedupe_candidates([
+            regularity_candidate_payload(),
+            *(tls_period.get("candidates", []) if tls_period is not None else []),
             *(bls_period.get("candidates", []) if bls_period is not None else []),
-        ]
+        ])
         if bls_period is not None:
             harmonic_alias_corrected = bool(bls_period.get("harmonic_alias_corrected"))
             harmonic_alias_period = bls_period.get("harmonic_alias_period")
             harmonic_alias_factor = bls_period.get("harmonic_alias_factor")
             harmonic_alias_power_ratio = bls_period.get("harmonic_alias_power_ratio")
-            period_search = {
-                "min_period": bls_period.get("search_min_period"),
-                "max_period": bls_period.get("search_max_period"),
-                "min_duration": bls_period.get("search_min_duration"),
-                "max_duration": bls_period.get("search_max_duration"),
-            }
+            period_search = period_search_payload(tls_period if search_mode == "tls" and tls_period is not None else bls_period)
+        elif tls_period is not None:
+            period_search = period_search_payload(tls_period)
         flattened_flux = flattened_flux_for_period_search(time, flux)
         chi_squared = None if flattened_flux is None else chi_squared_transit_probability(
             time,
@@ -1312,6 +1796,7 @@ def detect_transits(time, flux, options=None):
         if period is not None and transits:
             period_epoch = float(transits[0]["center"])
             period_duration = float(np.median([item["duration"] for item in transits]))
+        period_search = period_search_payload(tls_period or bls_period)
     return {
         "transits": transits,
         "period": period,
@@ -1539,6 +2024,12 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
                 "title": "Period selected by regularity",
                 "detail": "A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.",
             })
+        elif detection.get("period_method") == "TLS-style":
+            warnings.append({
+                "severity": "info",
+                "title": "TLS-style search mode",
+                "detail": "The orbital period was selected by the transit-shape search mode.",
+            })
         else:
             warnings.append({
                 "severity": "info",
@@ -1572,7 +2063,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
         })
     if (
         len(transits) >= 3
-        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity")
+        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS-style")
         and diagnostics["ephemeris_match_fraction"] is not None
     ):
         match_fraction = diagnostics["ephemeris_match_fraction"]
@@ -1582,7 +2073,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
         expected_count = diagnostics["expected_transit_count"]
         expected_coverage = diagnostics["expected_transit_coverage"]
         well_covered_events = (
-            detection.get("period_method") == "transit regularity"
+            detection.get("period_method") in ("transit regularity", "TLS-style")
             and event_count is not None
             and event_count >= 3
             and (
@@ -1671,10 +2162,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     expected_transit_count = finite_number(diagnostics.get("expected_transit_count"))
     expected_transit_coverage = finite_number(diagnostics.get("expected_transit_coverage"))
     timing_residual_ratio = finite_number(diagnostics.get("timing_residual_ratio"))
-    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity")
+    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity", "TLS-style")
     period_label = "BLS period" if period_method == "BLS" else "selected period"
     well_covered_ephemeris = (
-        period_method == "transit regularity"
+        period_method in ("transit regularity", "TLS-style")
         and ephemeris_event_match_count is not None
         and ephemeris_event_match_count >= 3
         and (
@@ -1723,6 +2214,8 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
 
     if period is not None and period > 0 and period_method == "BLS":
         support("Stable BLS period", f"Best period is {period:.6g} days from the BLS search.", 22)
+    elif period is not None and period > 0 and period_method == "TLS-style":
+        support("TLS-style transit-shape period", f"Best period is {period:.6g} days from the transit-shape search.", 22)
     elif period is not None and period > 0 and period_method == "transit regularity":
         support("Frequent transit regularity", f"Best repeating interval is {period:.6g} days from the boxed transit cadence.", 20)
     elif period is not None and period > 0:
@@ -1731,11 +2224,16 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     else:
         limit("No stable period", "A repeating orbital period was not recovered.", -18)
 
-    sde_result = score_band(period_sde, (
+    sde_bands = (
+        (8.0, 22, "Very strong TLS-style period score", f"Period SDE is {format_metric(period_sde)}."),
+        (5.0, 17, "Strong TLS-style period score", f"Period SDE is {format_metric(period_sde)}."),
+        (3.5, 8, "Moderate TLS-style period score", f"Period SDE is {format_metric(period_sde)}."),
+    ) if period_method == "TLS-style" else (
         (10.0, 22, "Very strong period peak", f"Period SDE is {format_metric(period_sde)}."),
         (7.0, 17, "Strong period peak", f"Period SDE is {format_metric(period_sde)}."),
         (5.0, 8, "Moderate period peak", f"Period SDE is {format_metric(period_sde)}."),
-    ))
+    )
+    sde_result = score_band(period_sde, sde_bands)
     if sde_result is not None:
         points, title, detail = sde_result
         support(title, detail, points)
@@ -1838,10 +2336,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     strong_requirements_met = (
         transit_count >= 3
         and period is not None
-        and period_method == "BLS"
+        and period_method in ("BLS", "TLS-style")
         and detection_snr is not None
         and detection_snr >= 7
-        and (period_sde is None or period_sde >= 5)
+        and (period_sde is None or period_sde >= (3.5 if period_method == "TLS-style" else 5.0))
         and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.75)
         and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.3)
         and danger_count == 0

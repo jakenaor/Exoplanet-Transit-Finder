@@ -76,6 +76,9 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
+- Detection search mode control:
+  - `BLS + regularity` is the default and preserves the existing period-selection flow.
+  - `TLS-style` runs a transit-shape matched-filter period search, then checks event-by-event depth coherence before selecting the period.
 - BLS harmonic de-aliasing:
   - Checks strong longer-period candidates near `2x`, `3x`, or `4x` the top BLS peak.
   - Promotes the longer BLS candidate when it matches nearly the same boxed transits and avoids the short-period harmonic.
@@ -87,6 +90,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Rejects weak one-off regularities so the irregular false-positive fixture stays a no-signal case.
 - Period displayed in Julian days.
 - Period search controls:
+  - Search mode.
   - Minimum period.
   - Maximum period.
   - Period candidate list with power/SDE values.
@@ -109,6 +113,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Detection sensitivity controls:
   - Strictness.
   - Smoothing.
+  - Search mode: `BLS + regularity` or `TLS-style`.
   - Minimum depth.
   - Minimum duration.
   - Maximum duration.
@@ -278,7 +283,8 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 This project is intended to become a more user-friendly version of Transit Least Squares (TLS). Missing TLS-inspired capabilities to add after the current feature sequence:
 
 - Transit-shaped model fitting:
-  - Add an optional TLS-style search mode using limb-darkened transit templates instead of only BLS boxes/local dip boxes.
+  - TLS-style search mode is implemented as a transit-shape matched-filter search with event-by-event coherence checks.
+  - True limb-darkened transit templates are still pending.
   - Show model overlays in time view and phase-folded view.
   - Support trapezoid/grazing-transit templates for V-shaped or box-like events.
 - Stellar parameter priors:
@@ -329,7 +335,7 @@ Current feature sequence status:
 8. Ephemeris audit view: done.
 9. Data cleaning panel: next.
 10. Sensitivity/no-planet upper-limit message: pending.
-11. TLS-style search mode: pending.
+11. TLS-style search mode: done.
 12. Reset/home view button: pending.
 
 Additional useful future features after step 12:
