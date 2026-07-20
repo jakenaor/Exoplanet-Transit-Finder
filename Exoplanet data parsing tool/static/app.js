@@ -475,6 +475,24 @@ function updateChartHeading() {
     return;
   }
 
+  if (currentView === 'audit') {
+    chartTitleEl.textContent = 'Ephemeris Audit';
+    const metrics = currentAnalysisMetrics();
+    if (!Number.isFinite(Number(metrics.period)) || !Number.isFinite(Number(metrics.periodEpoch))) {
+      subtitleEl.textContent = 'Audit view needs a recovered period and epoch.';
+    } else if (
+      Number.isFinite(Number(metrics.ephemerisMatchCount))
+      && Number.isFinite(Number(metrics.ephemerisMatchFraction))
+    ) {
+      const matchCount = Number(metrics.ephemerisMatchCount);
+      const total = currentResult.transits.length;
+      subtitleEl.textContent = `${matchCount}/${total} detected dips align with the ${fmt(metrics.period, 5)} day ephemeris. Green boxes match; red boxes are off-period.`;
+    } else {
+      subtitleEl.textContent = `Predicted windows are shown for the ${fmt(metrics.period, 5)} day ephemeris.`;
+    }
+    return;
+  }
+
   chartTitleEl.textContent = 'Flux Over Time';
   subtitleEl.textContent = `${currentResult.plot.time.length.toLocaleString()} plotted points shown from ${currentResult.total_points.toLocaleString()} total samples. Time is shown as Julian days since JD ${fmt(currentResult.time_reference, 5)}.`;
 }
@@ -567,6 +585,8 @@ function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expe
   const empty = {
     ephemerisMatchCount: null,
     ephemerisMatchFraction: null,
+    ephemerisEventMatchCount: null,
+    ephemerisEventMatchFraction: null,
     offEphemerisTransitCount: null,
     offEphemerisFraction: null,
     expectedTransitCount: Number.isFinite(expectedValue) ? expectedValue : null,
@@ -597,17 +617,27 @@ function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expe
     const cycles = Math.round((center - epochValue) / periodValue);
     return Math.abs(center - (epochValue + cycles * periodValue));
   });
-  const matchedResiduals = residuals.filter(residual => residual <= tolerance);
+  const matchedCycles = new Set();
+  const matchedResiduals = [];
+  residuals.forEach((residual, index) => {
+    if (residual <= tolerance) {
+      matchedResiduals.push(residual);
+      matchedCycles.add(Math.round((centers[index] - epochValue) / periodValue));
+    }
+  });
   const matchCount = matchedResiduals.length;
+  const eventMatchCount = matchedCycles.size;
   const offCount = centers.length - matchCount;
   const residualMedian = median(residuals);
   const expectedCoverage = Number.isFinite(expectedValue) && expectedValue > 0
-    ? Math.min(1, matchCount / expectedValue)
+    ? Math.min(1, eventMatchCount / expectedValue)
     : null;
 
   return {
     ephemerisMatchCount: matchCount,
     ephemerisMatchFraction: matchCount / centers.length,
+    ephemerisEventMatchCount: eventMatchCount,
+    ephemerisEventMatchFraction: Number.isFinite(expectedValue) && expectedValue > 0 ? eventMatchCount / expectedValue : null,
     offEphemerisTransitCount: offCount,
     offEphemerisFraction: offCount / centers.length,
     expectedTransitCount: Number.isFinite(expectedValue) ? expectedValue : null,
@@ -617,6 +647,98 @@ function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expe
     timingResidualTolerance: tolerance,
     timingResidualRatio: residualMedian === null ? null : residualMedian / tolerance,
   };
+}
+
+function ephemerisTolerance(period, duration, transits) {
+  const periodValue = Number(period);
+  if (!Number.isFinite(periodValue) || periodValue <= 0) return null;
+  const durationValue = Number(duration);
+  const transitDurations = (transits || [])
+    .map(transit => Number(transit.duration))
+    .filter(value => Number.isFinite(value) && value > 0);
+  const medianDuration = median(transitDurations);
+  const durationScale = Math.max(
+    Number.isFinite(durationValue) ? durationValue : 0,
+    medianDuration || 0,
+    periodValue * 0.035
+  );
+  const tolerance = Math.min(
+    Math.max(durationScale * 1.5, periodValue * 0.025),
+    periodValue * 0.18
+  );
+  return Number.isFinite(tolerance) && tolerance > 0 ? tolerance : null;
+}
+
+function isDenseRegularityMatch(matchCount, eventCount, expectedCoverage, transitCount) {
+  if (
+    !Number.isFinite(Number(matchCount))
+    || !Number.isFinite(Number(eventCount))
+    || !Number.isFinite(Number(expectedCoverage))
+    || !Number.isFinite(Number(transitCount))
+    || Number(transitCount) < 12
+  ) {
+    return false;
+  }
+  const total = Number(transitCount);
+  const denseBoxFloor = Math.max(6, Math.ceil(total * 0.35));
+  return (
+    Number(matchCount) >= denseBoxFloor
+    && Number(eventCount) >= 3
+    && Number(matchCount) / total >= 0.35
+    && Number(expectedCoverage) >= 0.3
+  );
+}
+
+function ephemerisResidual(center, period, epoch) {
+  const centerValue = Number(center);
+  const periodValue = Number(period);
+  const epochValue = Number(epoch);
+  if (!Number.isFinite(centerValue) || !Number.isFinite(periodValue) || periodValue <= 0 || !Number.isFinite(epochValue)) {
+    return null;
+  }
+  const cycles = Math.round((centerValue - epochValue) / periodValue);
+  const predictedCenter = epochValue + cycles * periodValue;
+  return {
+    cycles,
+    predictedCenter,
+    residual: Math.abs(centerValue - predictedCenter),
+  };
+}
+
+function classifyTransitForEphemeris(transit, metrics = currentAnalysisMetrics()) {
+  const tolerance = ephemerisTolerance(metrics.period, metrics.periodDuration, currentResult ? currentResult.transits : []);
+  const residual = ephemerisResidual(transit.center, metrics.period, metrics.periodEpoch);
+  if (!residual || tolerance === null) {
+    return { status: 'unknown', residual: null, tolerance: null, predictedCenter: null };
+  }
+  return {
+    status: residual.residual <= tolerance ? 'matched' : 'off',
+    residual: residual.residual,
+    tolerance,
+    predictedCenter: residual.predictedCenter,
+  };
+}
+
+function predictedEphemerisEvents(metrics, domain = currentResult ? currentResult.domain : null) {
+  if (!domain) return [];
+  const period = Number(metrics.period);
+  const epoch = Number(metrics.periodEpoch);
+  if (!Number.isFinite(period) || period <= 0 || !Number.isFinite(epoch)) return [];
+  const tolerance = ephemerisTolerance(metrics.period, metrics.periodDuration, currentResult ? currentResult.transits : []);
+  const firstCycle = Math.ceil((domain.time_min - epoch) / period) - 1;
+  const lastCycle = Math.floor((domain.time_max - epoch) / period) + 1;
+  const events = [];
+  for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+    const center = epoch + cycle * period;
+    if (center < domain.time_min - period || center > domain.time_max + period) continue;
+    events.push({
+      cycle,
+      center,
+      start: tolerance === null ? center : center - tolerance,
+      end: tolerance === null ? center : center + tolerance,
+    });
+  }
+  return events;
 }
 
 function currentAnalysisMetrics() {
@@ -757,11 +879,19 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
     });
   }
   if (metrics.periodMethod && metrics.periodMethod !== 'BLS') {
-    warnings.push({
-      severity: 'info',
-      title: 'Period is provisional',
-      detail: `Period came from ${metrics.periodMethod}, not a BLS peak.`,
-    });
+    if (metrics.periodMethod === 'transit regularity') {
+      warnings.push({
+        severity: 'info',
+        title: 'Period selected by regularity',
+        detail: 'A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.',
+      });
+    } else {
+      warnings.push({
+        severity: 'info',
+        title: 'Period is provisional',
+        detail: `Period came from ${metrics.periodMethod}, not a BLS peak.`,
+      });
+    }
   }
   if (metrics.pValue !== null && metrics.pValue !== undefined && metrics.pValue > 0.01) {
     warnings.push({
@@ -793,22 +923,42 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
   }
   if (
     transits.length >= 3
-    && metrics.periodMethod === 'BLS'
+    && ['BLS', 'binned BLS fallback', 'transit regularity'].includes(metrics.periodMethod)
     && Number.isFinite(Number(metrics.ephemerisMatchFraction))
   ) {
     const matchFraction = Number(metrics.ephemerisMatchFraction);
     const matchCount = Number(metrics.ephemerisMatchCount);
-    if (matchFraction < 0.55) {
+    const eventCount = Number(metrics.ephemerisEventMatchCount);
+    const expectedCount = Number(metrics.expectedTransitCount);
+    const expectedCoverage = Number(metrics.expectedTransitCoverage);
+    const wellCoveredEvents = (
+      metrics.periodMethod === 'transit regularity'
+      && Number.isFinite(eventCount)
+      && eventCount >= 3
+      && (
+        (Number.isFinite(expectedCoverage) && expectedCoverage >= 0.65)
+        || isDenseRegularityMatch(matchCount, eventCount, expectedCoverage, transits.length)
+      )
+    );
+    const periodLabel = metrics.periodMethod === 'BLS' ? 'BLS period' : 'selected period';
+    if (matchFraction < 0.55 && !wellCoveredEvents) {
       warnings.push({
         severity: 'danger',
         title: 'Irregular transit timing',
-        detail: `Only ${matchCount} of ${transits.length} detected dips align with the BLS period.`,
+        detail: `Only ${matchCount} of ${transits.length} detected dips align with the ${periodLabel}.`,
       });
-    } else if (matchFraction < 0.75) {
+    } else if (matchFraction < 0.75 && !wellCoveredEvents) {
       warnings.push({
         severity: 'caution',
         title: 'Weak ephemeris agreement',
-        detail: `${matchCount} of ${transits.length} detected dips align with the BLS period.`,
+        detail: `${matchCount} of ${transits.length} detected dips align with the ${periodLabel}.`,
+      });
+    }
+    if (wellCoveredEvents && matchFraction < 0.65) {
+      warnings.push({
+        severity: 'caution',
+        title: 'Noisy extra dips',
+        detail: `${eventCount} of ${expectedCount} predicted events are covered, but extra off-period dips were also boxed.`,
       });
     }
 
@@ -817,6 +967,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
       && Number.isFinite(Number(metrics.offEphemerisFraction))
       && Number(metrics.offEphemerisTransitCount) >= 3
       && Number(metrics.offEphemerisFraction) >= 0.35
+      && !wellCoveredEvents
     ) {
       warnings.push({
         severity: 'caution',
@@ -865,10 +1016,28 @@ function buildPlanetAssessment(metrics, warnings) {
   const medianTransitPoints = Number.isFinite(Number(metrics.medianTransitPoints)) ? Number(metrics.medianTransitPoints) : null;
   const ephemerisMatchFraction = Number.isFinite(Number(metrics.ephemerisMatchFraction)) ? Number(metrics.ephemerisMatchFraction) : null;
   const ephemerisMatchCount = Number.isFinite(Number(metrics.ephemerisMatchCount)) ? Number(metrics.ephemerisMatchCount) : null;
+  const ephemerisEventMatchCount = Number.isFinite(Number(metrics.ephemerisEventMatchCount)) ? Number(metrics.ephemerisEventMatchCount) : null;
   const offEphemerisCount = Number.isFinite(Number(metrics.offEphemerisTransitCount)) ? Number(metrics.offEphemerisTransitCount) : null;
   const offEphemerisFraction = Number.isFinite(Number(metrics.offEphemerisFraction)) ? Number(metrics.offEphemerisFraction) : null;
+  const expectedTransitCount = Number.isFinite(Number(metrics.expectedTransitCount)) ? Number(metrics.expectedTransitCount) : null;
   const expectedTransitCoverage = Number.isFinite(Number(metrics.expectedTransitCoverage)) ? Number(metrics.expectedTransitCoverage) : null;
   const timingResidualRatio = Number.isFinite(Number(metrics.timingResidualRatio)) ? Number(metrics.timingResidualRatio) : null;
+  const ephemerisPeriodMethods = ['BLS', 'binned BLS fallback', 'transit regularity'];
+  const periodLabel = periodMethod === 'BLS' ? 'BLS period' : 'selected period';
+  const wellCoveredEphemeris = (
+    periodMethod === 'transit regularity'
+    && ephemerisEventMatchCount !== null
+    && ephemerisEventMatchCount >= 3
+    && (
+      (expectedTransitCoverage !== null && expectedTransitCoverage >= 0.65)
+      || isDenseRegularityMatch(
+        ephemerisMatchCount,
+        ephemerisEventMatchCount,
+        expectedTransitCoverage,
+        transitCount
+      )
+    )
+  );
   const supportingEvidence = [];
   const limitingEvidence = [];
   let score = 0;
@@ -893,6 +1062,8 @@ function buildPlanetAssessment(metrics, warnings) {
 
   if (period !== null && period > 0 && periodMethod === 'BLS') {
     support('Stable BLS period', `Best period is ${fmt(period, 6)} days from the BLS search.`, 22);
+  } else if (period !== null && period > 0 && periodMethod === 'transit regularity') {
+    support('Frequent transit regularity', `Best repeating interval is ${fmt(period, 6)} days from the boxed transit cadence.`, 20);
   } else if (period !== null && period > 0) {
     support('Provisional period', `Estimated period is ${fmt(period, 6)} days from ${periodMethod || 'candidate spacing'}.`, 10);
     limit('Period is not a BLS peak', 'The repeating period needs manual confirmation.', -4);
@@ -934,28 +1105,34 @@ function buildPlanetAssessment(metrics, warnings) {
     }
   }
 
-  if (periodMethod === 'BLS' && transitCount >= 3 && ephemerisMatchFraction !== null) {
+  if (ephemerisPeriodMethods.includes(periodMethod) && transitCount >= 3 && ephemerisMatchFraction !== null) {
     if (ephemerisMatchFraction >= 0.8) {
-      support('Detected dips follow the ephemeris', `${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, 16);
+      support('Detected dips follow the ephemeris', `${ephemerisMatchCount} of ${transitCount} dips align with the ${periodLabel}.`, 16);
+    } else if (wellCoveredEphemeris) {
+      support('Predicted events are covered', `${ephemerisEventMatchCount} of ${expectedTransitCount} predicted events have matching dips.`, 12);
     } else if (ephemerisMatchFraction >= 0.65) {
-      support('Partial ephemeris agreement', `${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, 5);
+      support('Partial ephemeris agreement', `${ephemerisMatchCount} of ${transitCount} dips align with the ${periodLabel}.`, 5);
       limit('Some off-period dips', 'Several detected dips do not belong to the recovered period.', -6);
     } else if (ephemerisMatchFraction < 0.55) {
-      limit('Irregular transit timing', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, -34);
+      limit('Irregular transit timing', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the ${periodLabel}.`, -34);
     } else {
-      limit('Weak timing agreement', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the BLS period.`, -18);
+      limit('Weak timing agreement', `Only ${ephemerisMatchCount} of ${transitCount} dips align with the ${periodLabel}.`, -18);
     }
   }
 
   if (offEphemerisCount !== null && offEphemerisFraction !== null && offEphemerisCount >= 3 && offEphemerisFraction >= 0.35) {
-    limit('Many off-period dips', 'The detector found too many transit-like dips away from the recovered ephemeris.', -24);
+    if (wellCoveredEphemeris) {
+      limit('Extra off-period dips', 'The selected ephemeris repeats, but extra boxed dips may be noise or systematics.', -6);
+    } else {
+      limit('Many off-period dips', 'The detector found too many transit-like dips away from the recovered ephemeris.', -24);
+    }
   }
 
   if (expectedTransitCoverage !== null && transitCount >= 3 && expectedTransitCoverage < 0.5) {
-    limit('Weak predicted-transit coverage', `Only ${fmt(expectedTransitCoverage * 100, 0)}% of expected BLS events were matched.`, -10);
+    limit('Weak predicted-transit coverage', `Only ${fmt(expectedTransitCoverage * 100, 0)}% of expected ${periodLabel} events were matched.`, -10);
   }
 
-  if (timingResidualRatio !== null && timingResidualRatio > 1.0 && transitCount >= 3) {
+  if (timingResidualRatio !== null && timingResidualRatio > 1.0 && transitCount >= 3 && !wellCoveredEphemeris) {
     limit('Large timing residuals', 'Detected dip centers are not tightly clustered around the recovered ephemeris.', -10);
   }
 
@@ -1016,9 +1193,10 @@ function buildPlanetAssessment(metrics, warnings) {
   );
   const severeTimingMismatch = (
     transitCount >= 3
-    && periodMethod === 'BLS'
+    && ephemerisPeriodMethods.includes(periodMethod)
     && ephemerisMatchFraction !== null
     && ephemerisMatchFraction < 0.55
+    && !wellCoveredEphemeris
     && offEphemerisCount !== null
     && offEphemerisCount >= 2
   );
@@ -1101,8 +1279,10 @@ function buildPlanetAssessment(metrics, warnings) {
       median_transit_points: medianTransitPoints,
       ephemeris_match_fraction: ephemerisMatchFraction,
       ephemeris_match_count: ephemerisMatchCount,
+      ephemeris_event_match_count: ephemerisEventMatchCount,
       off_ephemeris_transit_count: offEphemerisCount,
       off_ephemeris_fraction: offEphemerisFraction,
+      expected_transit_count: expectedTransitCount,
       expected_transit_coverage: expectedTransitCoverage,
       timing_residual_ratio: timingResidualRatio,
       warning_count: warnings.length,
@@ -1376,6 +1556,8 @@ function summaryForExport() {
       depth_scatter_ratio: metrics.depthScatterRatio,
       ephemeris_match_count: metrics.ephemerisMatchCount,
       ephemeris_match_fraction: metrics.ephemerisMatchFraction,
+      ephemeris_event_match_count: metrics.ephemerisEventMatchCount,
+      ephemeris_event_match_fraction: metrics.ephemerisEventMatchFraction,
       off_ephemeris_transit_count: metrics.offEphemerisTransitCount,
       off_ephemeris_fraction: metrics.offEphemerisFraction,
       expected_transit_count: metrics.expectedTransitCount,
@@ -1402,6 +1584,8 @@ function summaryForExport() {
       period_sde: metrics.periodSde,
       ephemeris_match_count: metrics.ephemerisMatchCount,
       ephemeris_match_fraction: metrics.ephemerisMatchFraction,
+      ephemeris_event_match_count: metrics.ephemerisEventMatchCount,
+      ephemeris_event_match_fraction: metrics.ephemerisEventMatchFraction,
       off_ephemeris_transit_count: metrics.offEphemerisTransitCount,
       off_ephemeris_fraction: metrics.offEphemerisFraction,
       median_flux: currentResult.median_flux,
@@ -2200,6 +2384,122 @@ function drawPhaseChart(geo) {
   updateCanvasCursor(lastPointer);
 }
 
+function drawAuditPredictions(geo, viewport, metrics, xScale) {
+  const events = predictedEphemerisEvents(metrics);
+  if (!events.length) return;
+  const { width, pad, innerH } = geo;
+  const xMin = viewport.xMin;
+  const xMax = viewport.xMax;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, geo.innerW, innerH);
+  ctx.clip();
+
+  events.forEach(event => {
+    if (event.end < xMin || event.start > xMax) return;
+    const x1 = Math.max(pad.left, xScale(event.start));
+    const x2 = Math.min(width - pad.right, xScale(event.end));
+    const centerX = xScale(event.center);
+    if (x2 > x1) {
+      ctx.fillStyle = 'rgba(37, 99, 235, 0.08)';
+      ctx.fillRect(x1, pad.top, Math.max(1, x2 - x1), innerH);
+    }
+    if (centerX >= pad.left && centerX <= width - pad.right) {
+      ctx.strokeStyle = 'rgba(37, 99, 235, 0.46)';
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(centerX, pad.top);
+      ctx.lineTo(centerX, pad.top + innerH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  });
+  ctx.restore();
+}
+
+function drawAuditResiduals(geo, viewport, metrics, xScale) {
+  if (!currentResult || !currentResult.transits.length) return;
+  const { width, pad, innerH } = geo;
+  const railY = pad.top + innerH - 15;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, geo.innerW, innerH);
+  ctx.clip();
+
+  currentResult.transits.forEach(transit => {
+    if (transit.center < viewport.xMin || transit.center > viewport.xMax) return;
+    const classification = classifyTransitForEphemeris(transit, metrics);
+    if (!Number.isFinite(classification.predictedCenter)) return;
+    const transitX = xScale(transit.center);
+    const predictedX = xScale(classification.predictedCenter);
+    if (
+      (transitX < pad.left && predictedX < pad.left)
+      || (transitX > width - pad.right && predictedX > width - pad.right)
+    ) {
+      return;
+    }
+    ctx.strokeStyle = classification.status === 'matched'
+      ? 'rgba(21, 128, 61, 0.7)'
+      : 'rgba(180, 35, 24, 0.72)';
+    ctx.lineWidth = classification.status === 'matched' ? 1.4 : 2.2;
+    ctx.setLineDash(classification.status === 'matched' ? [] : [4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(Math.max(pad.left, Math.min(width - pad.right, predictedX)), railY);
+    ctx.lineTo(Math.max(pad.left, Math.min(width - pad.right, transitX)), railY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = classification.status === 'matched' ? '#15803d' : '#b42318';
+    ctx.beginPath();
+    ctx.arc(Math.max(pad.left, Math.min(width - pad.right, transitX)), railY, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawAuditLegend(geo, metrics) {
+  const { width, pad } = geo;
+  const matchText = (
+    Number.isFinite(Number(metrics.ephemerisMatchCount))
+    && Number.isFinite(Number(metrics.ephemerisMatchFraction))
+  )
+    ? `Ephemeris fit ${metrics.ephemerisMatchCount}/${currentResult.transits.length}`
+    : 'Ephemeris fit -';
+  const items = [
+    { color: '#2563eb', text: 'Predicted' },
+    { color: '#15803d', text: 'Aligned' },
+    { color: '#b42318', text: 'Off-period' },
+    { color: '#202124', text: matchText },
+  ];
+  ctx.save();
+  ctx.font = '700 11px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  const itemWidths = items.map(item => 18 + ctx.measureText(item.text).width + 10);
+  const legendWidth = Math.min(
+    width - pad.left - pad.right,
+    itemWidths.reduce((sum, value) => sum + value, 0) + 12
+  );
+  const xStart = Math.max(pad.left + 8, width - pad.right - legendWidth - 6);
+  let x = xStart + 8;
+  const y = pad.top + 15;
+  ctx.fillStyle = 'rgba(251, 252, 253, 0.88)';
+  ctx.strokeStyle = 'rgba(215, 220, 227, 0.95)';
+  ctx.lineWidth = 1;
+  ctx.fillRect(xStart, pad.top + 4, legendWidth, 22);
+  ctx.strokeRect(xStart, pad.top + 4, legendWidth, 22);
+  items.forEach(item => {
+    const widthNeeded = 18 + ctx.measureText(item.text).width + 10;
+    if (x + widthNeeded > xStart + legendWidth) return;
+    ctx.fillStyle = item.color;
+    ctx.fillRect(x, y - 4, 9, 8);
+    ctx.fillStyle = '#3f4650';
+    ctx.fillText(item.text, x + 14, y);
+    x += widthNeeded;
+  });
+  ctx.restore();
+}
+
 function drawChart() {
   resizeCanvas();
   const geo = getChartGeometry();
@@ -2233,6 +2533,14 @@ function drawChart() {
   ctx.fillStyle = '#fbfcfd';
   ctx.fillRect(0, 0, width, height);
   transitBoxCache = [];
+  const auditMetrics = currentView === 'audit' ? currentAnalysisMetrics() : null;
+  if (currentView === 'audit' && (!Number.isFinite(Number(auditMetrics.period)) || !Number.isFinite(Number(auditMetrics.periodEpoch)))) {
+    drawNotice('Ephemeris audit needs a recovered period and epoch.', width, height);
+    return;
+  }
+  if (currentView === 'audit') {
+    drawAuditPredictions(geo, viewport, auditMetrics, xScale);
+  }
 
   currentResult.transits.forEach((t, index) => {
     if (t.end < xMin || t.start > xMax) return;
@@ -2252,10 +2560,17 @@ function drawChart() {
       y1: boxTop,
       y2: boxTop + boxHeight,
     });
-    ctx.fillStyle = 'rgba(180, 83, 9, 0.22)';
+    const auditClassification = auditMetrics ? classifyTransitForEphemeris(t, auditMetrics) : null;
+    const auditMatched = auditClassification && auditClassification.status === 'matched';
+    const auditOffPeriod = auditClassification && auditClassification.status === 'off';
+    ctx.fillStyle = auditMatched
+      ? 'rgba(21, 128, 61, 0.2)'
+      : (auditOffPeriod ? 'rgba(180, 35, 24, 0.18)' : 'rgba(180, 83, 9, 0.22)');
     ctx.fillRect(x1, boxTop, boxWidth, boxHeight);
     const selected = index === selectedTransitIndex;
-    ctx.strokeStyle = selected ? 'rgba(15, 118, 110, 1)' : 'rgba(180, 83, 9, 1)';
+    ctx.strokeStyle = selected
+      ? 'rgba(15, 118, 110, 1)'
+      : (auditMatched ? 'rgba(21, 128, 61, 1)' : (auditOffPeriod ? 'rgba(180, 35, 24, 1)' : 'rgba(180, 83, 9, 1)'));
     ctx.lineWidth = selected ? 3.2 : 2.5;
     ctx.strokeRect(x1, boxTop, boxWidth, boxHeight);
     if (selected && canEditBoxes()) {
@@ -2263,7 +2578,7 @@ function drawChart() {
       ctx.fillRect(x1 - 3, boxTop, 6, boxHeight);
       ctx.fillRect(x1 + boxWidth - 3, boxTop, 6, boxHeight);
     }
-    ctx.fillStyle = '#8a3f06';
+    ctx.fillStyle = auditMatched ? '#166534' : (auditOffPeriod ? '#991b1b' : '#8a3f06');
     ctx.font = '700 12px system-ui, sans-serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
@@ -2337,11 +2652,16 @@ function drawChart() {
   }
   ctx.stroke();
 
+  if (currentView === 'audit') {
+    drawAuditResiduals(geo, viewport, auditMetrics, xScale);
+    drawAuditLegend(geo, auditMetrics);
+  }
+
   ctx.fillStyle = '#202124';
   ctx.font = '700 12px system-ui, sans-serif';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
-  ctx.fillText(currentView === 'raw' ? 'Flux' : 'Smoothed flux', 14, 16);
+  ctx.fillText(currentView === 'raw' ? 'Flux' : (currentView === 'audit' ? 'Ephemeris audit' : 'Smoothed flux'), 14, 16);
   ctx.textAlign = 'right';
   ctx.fillText('Julian days', width - 22, height - 22);
   updateCanvasCursor(lastPointer);

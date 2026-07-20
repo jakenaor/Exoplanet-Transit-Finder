@@ -189,6 +189,23 @@ def estimate_period_from_candidates(transits, time_span):
     return estimate_period(centers)
 
 
+def flattened_flux_for_period_search(time, flux):
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    if full_span <= 0:
+        return None
+
+    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
+    clipped_flux = np.clip(flux, clipped_low, clipped_high)
+    trend_days = min(10.0, max(2.0, full_span / 6.0))
+    trend_width = max(5, int(trend_days / max(cadence, 1e-9)))
+    if trend_width % 2 == 0:
+        trend_width += 1
+    trend = moving_average(clipped_flux, trend_width)
+    flattened_flux = clipped_flux - trend
+    return flattened_flux - np.median(flattened_flux)
+
+
 def chi_squared_transit_probability(time, flattened_flux, period, duration, transit_time):
     if chi2 is None or period <= 0 or duration <= 0:
         return None
@@ -281,15 +298,9 @@ def estimate_period_with_binned_bls(time, flux, options=None):
     if full_span <= 0:
         return None
 
-    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
-    clipped_flux = np.clip(flux, clipped_low, clipped_high)
-    trend_days = min(10.0, max(2.0, full_span / 6.0))
-    trend_width = max(5, int(trend_days / max(cadence, 1e-9)))
-    if trend_width % 2 == 0:
-        trend_width += 1
-    trend = moving_average(clipped_flux, trend_width)
-    flattened_flux = clipped_flux - trend
-    flattened_flux = flattened_flux - np.median(flattened_flux)
+    flattened_flux = flattened_flux_for_period_search(time, flux)
+    if flattened_flux is None:
+        return None
     residual_median = float(np.median(flattened_flux))
     residual_mad = float(np.median(np.abs(flattened_flux - residual_median)))
     sigma = max(1.4826 * residual_mad, float(np.std(flattened_flux)), 1e-9)
@@ -409,16 +420,9 @@ def estimate_period_with_bls(time, flux, options=None):
     if full_span <= 0:
         return None
 
-    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
-    clipped_flux = np.clip(flux, clipped_low, clipped_high)
-
-    trend_days = min(10.0, max(2.0, full_span / 6.0))
-    trend_width = max(5, int(trend_days / max(cadence, 1e-9)))
-    if trend_width % 2 == 0:
-        trend_width += 1
-    trend = moving_average(clipped_flux, trend_width)
-    flattened_flux = clipped_flux - trend
-    flattened_flux = flattened_flux - np.median(flattened_flux)
+    flattened_flux = flattened_flux_for_period_search(time, flux)
+    if flattened_flux is None:
+        return None
 
     min_period, max_period = period_search_bounds(cadence, full_span, options)
     min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
@@ -479,6 +483,311 @@ def estimate_period_with_bls(time, flux, options=None):
         "method": "BLS",
         **(chi_squared or {}),
     }
+
+
+def transit_regularity_tolerance(period, durations):
+    clean_durations = np.asarray(
+        [value for value in durations if math.isfinite(float(value)) and float(value) > 0],
+        dtype=float,
+    )
+    duration_scale = float(np.percentile(clean_durations, 40)) if clean_durations.size else 0.0
+    tolerance = max(duration_scale * 1.25, period * 0.02)
+    return float(min(tolerance, period * 0.12))
+
+
+def is_dense_regularity_match(match_count, event_count, expected_coverage, transit_count):
+    if (
+        match_count is None
+        or event_count is None
+        or expected_coverage is None
+        or transit_count < 12
+    ):
+        return False
+    dense_box_floor = max(6, int(math.ceil(transit_count * 0.35)))
+    return (
+        int(match_count) >= dense_box_floor
+        and int(event_count) >= 3
+        and float(match_count) / transit_count >= 0.35
+        and float(expected_coverage) >= 0.30
+    )
+
+
+def score_transit_regularity_period(
+    centers,
+    durations,
+    depths,
+    time_start,
+    time_end,
+    period,
+    candidate_support=0,
+    pair_support=0,
+    fixed_epoch=None,
+):
+    if centers.size < 3 or not math.isfinite(float(period)) or period <= 0:
+        return None
+
+    period = float(period)
+    tolerance = transit_regularity_tolerance(period, durations)
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        return None
+
+    epoch_values = [float(fixed_epoch)] if fixed_epoch is not None and math.isfinite(float(fixed_epoch)) else centers
+    best = None
+    for epoch in epoch_values:
+        first_epoch = math.ceil((float(time_start) - epoch) / period)
+        last_epoch = math.floor((float(time_end) - epoch) / period)
+        expected_count = int(last_epoch - first_epoch + 1)
+        if expected_count < 3:
+            continue
+
+        residuals = np.abs(((centers - epoch + period / 2.0) % period) - period / 2.0)
+        matched_mask = residuals <= tolerance
+        matched_indices = np.flatnonzero(matched_mask)
+        if matched_indices.size == 0:
+            continue
+
+        matched_cycles = np.rint((centers[matched_indices] - epoch) / period).astype(int)
+        unique_cycles = np.unique(matched_cycles)
+        event_match_count = int(unique_cycles.size)
+        if event_match_count == 0:
+            continue
+
+        representative_depths = []
+        representative_durations = []
+        representative_residuals = []
+        for cycle in unique_cycles:
+            cycle_indices = matched_indices[matched_cycles == cycle]
+            best_index = int(cycle_indices[np.argmax(depths[cycle_indices])])
+            representative_depths.append(float(depths[best_index]))
+            representative_durations.append(float(durations[best_index]))
+            representative_residuals.append(float(residuals[best_index]))
+
+        box_match_count = int(matched_indices.size)
+        expected_coverage = event_match_count / expected_count
+        residual_rms = float(np.sqrt(np.mean(np.asarray(representative_residuals) ** 2)))
+        depth_sum = float(np.sum(representative_depths))
+        duration = median_or_none(representative_durations) or median_or_none(durations) or tolerance
+        score_key = (
+            box_match_count,
+            event_match_count,
+            expected_coverage,
+            int(pair_support),
+            int(candidate_support),
+            depth_sum,
+            -residual_rms,
+            -period,
+        )
+        candidate = {
+            "period": period,
+            "scatter": residual_rms,
+            "count": expected_count,
+            "duration": float(duration),
+            "transit_time": float(epoch),
+            "event_match_count": event_match_count,
+            "box_match_count": box_match_count,
+            "expected_count": expected_count,
+            "expected_coverage": expected_coverage,
+            "match_fraction": box_match_count / centers.size,
+            "pair_support": int(pair_support),
+            "candidate_support": int(candidate_support),
+            "tolerance": tolerance,
+            "depth_sum": depth_sum,
+            "residual_median": median_or_none(representative_residuals),
+            "residual_rms": residual_rms,
+            "method": "transit regularity",
+            "_score_key": score_key,
+        }
+        if best is None or score_key > best["_score_key"]:
+            best = candidate
+
+    return best
+
+
+def estimate_period_by_transit_regularity(transits, time, options=None, bls_period=None):
+    if len(transits) < 3 or len(time) < 3:
+        return None
+
+    centers = np.asarray([item["center"] for item in transits], dtype=float)
+    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
+    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
+    finite_mask = np.isfinite(centers) & np.isfinite(durations) & np.isfinite(depths)
+    centers = centers[finite_mask]
+    durations = durations[finite_mask]
+    depths = depths[finite_mask]
+    if centers.size < 3:
+        return None
+
+    order = np.argsort(centers)
+    centers = centers[order]
+    durations = durations[order]
+    depths = depths[order]
+
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    if full_span <= 0:
+        return None
+
+    min_period, max_period = period_search_bounds(cadence, full_span, options)
+    positive_durations = durations[durations > 0]
+    if positive_durations.size:
+        duration_floor = float(np.percentile(positive_durations, 40))
+        min_period = max(min_period, duration_floor * 4.0)
+    if min_period >= max_period:
+        return None
+
+    resolution = max(cadence * 5.0, full_span / 50000.0, 1e-4)
+    candidates = {}
+
+    def add_candidate(period, support=1, pair=False):
+        if period is None:
+            return
+        try:
+            period_value = float(period)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(period_value) or period_value < min_period or period_value > max_period:
+            return
+        key = int(round(period_value / resolution))
+        record = candidates.setdefault(
+            key,
+            {"period_sum": 0.0, "weight": 0.0, "support": 0, "pair_support": 0},
+        )
+        weight = max(float(support), 1.0)
+        record["period_sum"] += period_value * weight
+        record["weight"] += weight
+        record["support"] += int(max(round(weight), 1))
+        if pair:
+            record["pair_support"] += int(max(round(weight), 1))
+
+    pair_count = min(80, centers.size)
+    if centers.size > pair_count:
+        strongest = np.argsort(depths)[-pair_count:]
+        pair_centers = np.sort(centers[strongest])
+    else:
+        pair_centers = centers
+
+    for left_index in range(pair_centers.size):
+        for right_index in range(left_index + 1, pair_centers.size):
+            gap = float(pair_centers[right_index] - pair_centers[left_index])
+            if gap < min_period:
+                continue
+            max_cycles = min(30, int(gap / min_period))
+            for cycle_count in range(1, max_cycles + 1):
+                add_candidate(gap / cycle_count, pair=True)
+
+    bls_sources = []
+    if bls_period is not None:
+        bls_sources.append(bls_period)
+        bls_sources.extend(bls_period.get("candidates", []))
+    for source in bls_sources:
+        source_period = source.get("period") if isinstance(source, dict) else None
+        add_candidate(source_period, support=30)
+        if source_period is None:
+            continue
+        for divisor in range(2, 13):
+            add_candidate(float(source_period) / divisor, support=12)
+        for multiple in range(2, 5):
+            add_candidate(float(source_period) * multiple, support=6)
+
+    if not candidates:
+        return None
+
+    candidate_records = sorted(
+        candidates.values(),
+        key=lambda item: (item["pair_support"], item["support"]),
+        reverse=True,
+    )[:3000]
+
+    pair_support_floor = max(3, min(12, int(math.ceil(centers.size * 0.25))))
+    event_floor = max(3, min(6, int(math.ceil(centers.size * 0.25))))
+    best = None
+    for record in candidate_records:
+        period = record["period_sum"] / max(record["weight"], 1.0)
+        score = score_transit_regularity_period(
+            centers,
+            durations,
+            depths,
+            float(time[0]),
+            float(time[-1]),
+            period,
+            candidate_support=record["support"],
+            pair_support=record["pair_support"],
+        )
+        if score is None:
+            continue
+        if score["pair_support"] < pair_support_floor:
+            continue
+        if score["event_match_count"] < event_floor:
+            continue
+        if (
+            score["expected_coverage"] < 0.55
+            and not is_dense_regularity_match(
+                score["box_match_count"],
+                score["event_match_count"],
+                score["expected_coverage"],
+                centers.size,
+            )
+        ):
+            continue
+        if best is None or score["_score_key"] > best["_score_key"]:
+            best = score
+
+    if best is None:
+        return None
+
+    best.pop("_score_key", None)
+    return best
+
+
+def should_prefer_regularity_period(regularity_period, bls_period, transits, time):
+    if regularity_period is None:
+        return False
+    if bls_period is None:
+        return True
+
+    bls_value = float(bls_period.get("period", 0.0) or 0.0)
+    regular_value = float(regularity_period.get("period", 0.0) or 0.0)
+    if bls_value <= 0 or regular_value <= 0:
+        return True
+    if abs(regular_value - bls_value) / bls_value <= 0.02:
+        return False
+
+    centers = np.asarray([item["center"] for item in transits], dtype=float)
+    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
+    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
+    bls_score = score_transit_regularity_period(
+        centers,
+        durations,
+        depths,
+        float(time[0]),
+        float(time[-1]),
+        bls_value,
+        fixed_epoch=bls_period.get("transit_time"),
+    )
+    bls_event_count = int(bls_score.get("event_match_count", 0)) if bls_score else 0
+    bls_coverage = float(bls_score.get("expected_coverage", 0.0)) if bls_score else 0.0
+    regular_event_count = int(regularity_period.get("event_match_count", 0))
+    regular_box_count = int(regularity_period.get("box_match_count", 0))
+    regular_coverage = float(regularity_period.get("expected_coverage", 0.0))
+    transit_count = len(transits)
+
+    if regular_event_count >= bls_event_count + 2 and regular_coverage >= 0.55:
+        return True
+    if (
+        regular_event_count >= bls_event_count + 2
+        and is_dense_regularity_match(
+            regular_box_count,
+            regular_event_count,
+            regular_coverage,
+            transit_count,
+        )
+    ):
+        return True
+    return (
+        regular_value < bls_value
+        and regular_event_count >= bls_event_count
+        and regular_coverage >= max(0.65, bls_coverage)
+    )
 
 
 def time_at_fractional_index(time, index_position):
@@ -765,6 +1074,8 @@ def detect_transits(time, flux, options=None):
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
     bls_period = estimate_period_with_bls(time, flux, options)
+    regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
+    use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
     p_value = None
     chi_squared_flat = None
     chi_squared_box = None
@@ -775,7 +1086,7 @@ def detect_transits(time, flux, options=None):
     period_sde = None
     period_candidates = []
     period_search = None
-    if bls_period is not None:
+    if bls_period is not None and not use_regularity_period:
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
         period_match_count = bls_period["count"]
@@ -789,12 +1100,65 @@ def detect_transits(time, flux, options=None):
         period_duration = bls_period.get("duration")
         period_sde = bls_period.get("sde")
         period_candidates = bls_period.get("candidates", [])
+        if regularity_period is not None:
+            period_candidates = [
+                {
+                    "period": regularity_period["period"],
+                    "power": regularity_period["event_match_count"],
+                    "sde": None,
+                    "method": regularity_period["method"],
+                    "event_match_count": regularity_period["event_match_count"],
+                    "expected_transit_count": regularity_period["expected_count"],
+                    "expected_transit_coverage": regularity_period["expected_coverage"],
+                },
+                *period_candidates,
+            ]
         period_search = {
             "min_period": bls_period.get("search_min_period"),
             "max_period": bls_period.get("search_max_period"),
             "min_duration": bls_period.get("search_min_duration"),
             "max_duration": bls_period.get("search_max_duration"),
         }
+    elif regularity_period is not None:
+        period = regularity_period["period"]
+        period_scatter = regularity_period["scatter"]
+        period_match_count = regularity_period["count"]
+        period_method = regularity_period["method"]
+        period_epoch = regularity_period["transit_time"]
+        period_duration = regularity_period["duration"]
+        period_candidates = [
+            {
+                "period": regularity_period["period"],
+                "power": regularity_period["event_match_count"],
+                "sde": None,
+                "method": regularity_period["method"],
+                "event_match_count": regularity_period["event_match_count"],
+                "expected_transit_count": regularity_period["expected_count"],
+                "expected_transit_coverage": regularity_period["expected_coverage"],
+            },
+            *(bls_period.get("candidates", []) if bls_period is not None else []),
+        ]
+        if bls_period is not None:
+            period_search = {
+                "min_period": bls_period.get("search_min_period"),
+                "max_period": bls_period.get("search_max_period"),
+                "min_duration": bls_period.get("search_min_duration"),
+                "max_duration": bls_period.get("search_max_duration"),
+            }
+        flattened_flux = flattened_flux_for_period_search(time, flux)
+        chi_squared = None if flattened_flux is None else chi_squared_transit_probability(
+            time,
+            flattened_flux,
+            period,
+            period_duration,
+            period_epoch,
+        )
+        if chi_squared:
+            p_value = chi_squared.get("p_value")
+            chi_squared_flat = chi_squared.get("chi_squared_flat")
+            chi_squared_box = chi_squared.get("chi_squared_box")
+            reduced_chi_squared_box = chi_squared.get("reduced_chi_squared_box")
+            delta_chi_squared = chi_squared.get("delta_chi_squared")
     else:
         period, period_scatter, period_match_count = estimate_period_from_candidates(transits, full_span)
         period_method = "average gaps" if period is not None else None
@@ -905,6 +1269,8 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
     empty = {
         "ephemeris_match_count": None,
         "ephemeris_match_fraction": None,
+        "ephemeris_event_match_count": None,
+        "ephemeris_event_match_fraction": None,
         "off_ephemeris_transit_count": None,
         "off_ephemeris_fraction": None,
         "expected_transit_count": expected_count,
@@ -931,6 +1297,7 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
 
     residuals = []
     matched_residuals = []
+    matched_cycles = set()
     for center in centers:
         cycles = round((center - epoch_relative) / period)
         nearest_epoch = epoch_relative + cycles * period
@@ -938,18 +1305,22 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
         residuals.append(residual)
         if residual <= tolerance:
             matched_residuals.append(residual)
+            matched_cycles.add(int(cycles))
 
     match_count = len(matched_residuals)
+    event_match_count = len(matched_cycles)
     transit_count = len(centers)
     off_count = transit_count - match_count
     median_residual = median_or_none(residuals)
     expected_coverage = None
     if expected_count is not None and expected_count > 0:
-        expected_coverage = min(1.0, match_count / expected_count)
+        expected_coverage = min(1.0, event_match_count / expected_count)
 
     return {
         "ephemeris_match_count": int(match_count),
         "ephemeris_match_fraction": match_count / transit_count,
+        "ephemeris_event_match_count": int(event_match_count),
+        "ephemeris_event_match_fraction": None if expected_count is None or expected_count <= 0 else event_match_count / expected_count,
         "off_ephemeris_transit_count": int(off_count),
         "off_ephemeris_fraction": off_count / transit_count,
         "expected_transit_count": expected_count,
@@ -1011,11 +1382,18 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
             "detail": "The app could not estimate a repeating orbital period.",
         })
     if detection.get("period_method") and detection.get("period_method") != "BLS":
-        warnings.append({
-            "severity": "info",
-            "title": "Period is provisional",
-            "detail": f"Period came from {detection.get('period_method')}, not a BLS peak.",
-        })
+        if detection.get("period_method") == "transit regularity":
+            warnings.append({
+                "severity": "info",
+                "title": "Period selected by regularity",
+                "detail": "A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.",
+            })
+        else:
+            warnings.append({
+                "severity": "info",
+                "title": "Period is provisional",
+                "detail": f"Period came from {detection.get('period_method')}, not a BLS peak.",
+            })
     p_value = detection.get("p_value")
     if p_value is not None and math.isfinite(float(p_value)) and float(p_value) > 0.01:
         warnings.append({
@@ -1043,33 +1421,61 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
         })
     if (
         len(transits) >= 3
-        and detection.get("period_method") == "BLS"
+        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity")
         and diagnostics["ephemeris_match_fraction"] is not None
     ):
         match_fraction = diagnostics["ephemeris_match_fraction"]
         match_count = diagnostics["ephemeris_match_count"]
         transit_count = len(transits)
-        if match_fraction < 0.55:
+        event_count = diagnostics["ephemeris_event_match_count"]
+        expected_count = diagnostics["expected_transit_count"]
+        expected_coverage = diagnostics["expected_transit_coverage"]
+        well_covered_events = (
+            detection.get("period_method") == "transit regularity"
+            and event_count is not None
+            and event_count >= 3
+            and (
+                (
+                    expected_coverage is not None
+                    and expected_coverage >= 0.65
+                )
+                or is_dense_regularity_match(
+                    match_count,
+                    event_count,
+                    expected_coverage,
+                    transit_count,
+                )
+            )
+        )
+        period_label = "BLS period" if detection.get("period_method") == "BLS" else "selected period"
+        if match_fraction < 0.55 and not well_covered_events:
             warnings.append({
                 "severity": "danger",
                 "title": "Irregular transit timing",
-                "detail": f"Only {match_count} of {transit_count} detected dips align with the BLS period.",
+                "detail": f"Only {match_count} of {transit_count} detected dips align with the {period_label}.",
             })
-        elif match_fraction < 0.75:
+        elif match_fraction < 0.75 and not well_covered_events:
             warnings.append({
                 "severity": "caution",
                 "title": "Weak ephemeris agreement",
-                "detail": f"{match_count} of {transit_count} detected dips align with the BLS period.",
+                "detail": f"{match_count} of {transit_count} detected dips align with the {period_label}.",
+            })
+        if well_covered_events and match_fraction < 0.65:
+            warnings.append({
+                "severity": "caution",
+                "title": "Noisy extra dips",
+                "detail": f"{int(event_count)} of {int(expected_count)} predicted events are covered, but extra off-period dips were also boxed.",
             })
 
         off_count = diagnostics["off_ephemeris_transit_count"]
         off_fraction = diagnostics["off_ephemeris_fraction"]
         if off_count is not None and off_fraction is not None and off_count >= 3 and off_fraction >= 0.35:
-            warnings.append({
-                "severity": "caution",
-                "title": "Many off-period dips",
-                "detail": "Several detected dips do not land near the recovered period and may be systematics.",
-            })
+            if not well_covered_events:
+                warnings.append({
+                    "severity": "caution",
+                    "title": "Many off-period dips",
+                    "detail": "Several detected dips do not land near the recovered period and may be systematics.",
+                })
     if diagnostics["max_radius_ratio"] is not None and diagnostics["max_radius_ratio"] > 0.2:
         warnings.append({
             "severity": "caution",
@@ -1108,10 +1514,31 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     median_transit_points = finite_number(diagnostics.get("median_transit_points"))
     ephemeris_match_fraction = finite_number(diagnostics.get("ephemeris_match_fraction"))
     ephemeris_match_count = finite_number(diagnostics.get("ephemeris_match_count"))
+    ephemeris_event_match_count = finite_number(diagnostics.get("ephemeris_event_match_count"))
     off_ephemeris_count = finite_number(diagnostics.get("off_ephemeris_transit_count"))
     off_ephemeris_fraction = finite_number(diagnostics.get("off_ephemeris_fraction"))
+    expected_transit_count = finite_number(diagnostics.get("expected_transit_count"))
     expected_transit_coverage = finite_number(diagnostics.get("expected_transit_coverage"))
     timing_residual_ratio = finite_number(diagnostics.get("timing_residual_ratio"))
+    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity")
+    period_label = "BLS period" if period_method == "BLS" else "selected period"
+    well_covered_ephemeris = (
+        period_method == "transit regularity"
+        and ephemeris_event_match_count is not None
+        and ephemeris_event_match_count >= 3
+        and (
+            (
+                expected_transit_coverage is not None
+                and expected_transit_coverage >= 0.65
+            )
+            or is_dense_regularity_match(
+                ephemeris_match_count,
+                ephemeris_event_match_count,
+                expected_transit_coverage,
+                transit_count,
+            )
+        )
+    )
 
     score = 0.0
     supporting_evidence = []
@@ -1145,6 +1572,8 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
 
     if period is not None and period > 0 and period_method == "BLS":
         support("Stable BLS period", f"Best period is {period:.6g} days from the BLS search.", 22)
+    elif period is not None and period > 0 and period_method == "transit regularity":
+        support("Frequent transit regularity", f"Best repeating interval is {period:.6g} days from the boxed transit cadence.", 20)
     elif period is not None and period > 0:
         support("Provisional period", f"Estimated period is {period:.6g} days from {period_method or 'candidate spacing'}.", 10)
         limit("Period is not a BLS peak", "The repeating period needs manual confirmation.", -4)
@@ -1183,16 +1612,22 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         else:
             limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
 
-    if period_method == "BLS" and transit_count >= 3 and ephemeris_match_fraction is not None:
+    if period_method in ephemeris_period_methods and transit_count >= 3 and ephemeris_match_fraction is not None:
         if ephemeris_match_fraction >= 0.8:
-            support("Detected dips follow the ephemeris", f"{int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", 16)
+            support("Detected dips follow the ephemeris", f"{int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", 16)
+        elif well_covered_ephemeris:
+            support(
+                "Predicted events are covered",
+                f"{int(ephemeris_event_match_count)} of {int(expected_transit_count)} predicted events have matching dips.",
+                12,
+            )
         elif ephemeris_match_fraction >= 0.65:
-            support("Partial ephemeris agreement", f"{int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", 5)
+            support("Partial ephemeris agreement", f"{int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", 5)
             limit("Some off-period dips", "Several detected dips do not belong to the recovered period.", -6)
         elif ephemeris_match_fraction < 0.55:
-            limit("Irregular transit timing", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", -34)
+            limit("Irregular transit timing", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", -34)
         else:
-            limit("Weak timing agreement", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the BLS period.", -18)
+            limit("Weak timing agreement", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", -18)
 
     if (
         off_ephemeris_count is not None
@@ -1200,12 +1635,15 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         and off_ephemeris_count >= 3
         and off_ephemeris_fraction >= 0.35
     ):
-        limit("Many off-period dips", "The detector found too many transit-like dips away from the recovered ephemeris.", -24)
+        if well_covered_ephemeris:
+            limit("Extra off-period dips", "The selected ephemeris repeats, but extra boxed dips may be noise or systematics.", -6)
+        else:
+            limit("Many off-period dips", "The detector found too many transit-like dips away from the recovered ephemeris.", -24)
 
     if expected_transit_coverage is not None and transit_count >= 3 and expected_transit_coverage < 0.5:
-        limit("Weak predicted-transit coverage", f"Only {expected_transit_coverage:.0%} of expected BLS events were matched.", -10)
+        limit("Weak predicted-transit coverage", f"Only {expected_transit_coverage:.0%} of expected {period_label} events were matched.", -10)
 
-    if timing_residual_ratio is not None and timing_residual_ratio > 1.0 and transit_count >= 3:
+    if timing_residual_ratio is not None and timing_residual_ratio > 1.0 and transit_count >= 3 and not well_covered_ephemeris:
         limit("Large timing residuals", "Detected dip centers are not tightly clustered around the recovered ephemeris.", -10)
 
     if depth_scatter_ratio is not None and transit_count >= 4:
@@ -1259,9 +1697,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     )
     severe_timing_mismatch = (
         transit_count >= 3
-        and period_method == "BLS"
+        and period_method in ephemeris_period_methods
         and ephemeris_match_fraction is not None
         and ephemeris_match_fraction < 0.55
+        and not well_covered_ephemeris
         and off_ephemeris_count is not None
         and off_ephemeris_count >= 2
     )
@@ -1350,8 +1789,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "median_transit_points": median_transit_points,
             "ephemeris_match_fraction": ephemeris_match_fraction,
             "ephemeris_match_count": ephemeris_match_count,
+            "ephemeris_event_match_count": ephemeris_event_match_count,
             "off_ephemeris_transit_count": off_ephemeris_count,
             "off_ephemeris_fraction": off_ephemeris_fraction,
+            "expected_transit_count": expected_transit_count,
             "expected_transit_coverage": expected_transit_coverage,
             "timing_residual_ratio": timing_residual_ratio,
             "warning_count": len(warnings),

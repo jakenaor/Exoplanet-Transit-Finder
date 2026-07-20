@@ -65,11 +65,21 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
+- Ephemeris audit chart mode:
+  - Shows predicted period windows from the recovered ephemeris.
+  - Colors detected boxes green when they align with the predicted ephemeris.
+  - Colors detected boxes red when they are off-period.
+  - Draws residual connectors and a compact ephemeris-fit legend.
 - Robust clipping and moving-average smoothing for visualization.
 - Per-observing-segment median normalization for gapped/multi-zone light curves.
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
+- Transit-regularity period override:
+  - Scores candidate periods by how many unique predicted transit events are covered by detected boxes.
+  - Can replace a long BLS alias when a shorter cadence explains substantially more events.
+  - Dense short-period matches can win even when full-span expected coverage is lower because of data gaps, as long as enough boxed events support the cadence.
+  - Rejects weak one-off regularities so the irregular false-positive fixture stays a no-signal case.
 - Period displayed in Julian days.
 - Period search controls:
   - Minimum period.
@@ -134,6 +144,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Normalize gapped observing segments independently before transit detection. This fixed the HD 209458-style file where obvious dips existed in separate data zones but global noise/baseline handling hid them.
 - Use BLS for orbital period, because simple averaging of nearby detected boxes was badly wrong for real gapped datasets.
 - Treat broad automated period-search results as candidate rankings, not ground truth. The Kepler sample previously showed a strong alias around `294` days while a constrained `380-390` day search returned about `386.16` days.
+- When BLS selects a sparse alias, the backend now checks detected-box cadence and prefers the most frequent well-covered regularity. This is intentionally still labeled as `transit regularity`, not a confirmed BLS period.
 - Use phase-folding as the primary validation view for repeated transit structure.
 - Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
@@ -161,6 +172,9 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Synthetic positive/no-signal tests now demonstrate both sides of the new assessment layer:
   - A clean injected-transit dataset returns `strong_candidate`.
   - A flat/noisy dataset returns `no_planet_like_signal`.
+- Ephemeris audit view made the irregular false-positive failure mode visible instead of only numeric.
+- The Kepler desktop sample now selects the denser transit-box regularity instead of the sparse `~294` day BLS alias while keeping the verdict cautious.
+- The TRAPPIST-1 desktop sample now prefers a dense short-period regularity instead of the sparse `~6.08` day BLS alias.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -219,6 +233,8 @@ Observed verification results from recent work:
 - 2026-07-20 irregular false-positive test before ephemeris vetting: incorrectly returned `strong_candidate`, score `100`, `9` transits.
 - 2026-07-20 irregular false-positive test after ephemeris vetting: `no_planet_like_signal`, score `24`, `9` detected dips, ephemeris fit `3/9`, warnings `Irregular transit timing` and `Many off-period dips`.
 - 2026-07-20 clean synthetic transit after ephemeris vetting: `strong_candidate`, score `100`, ephemeris fit `8/8`.
+- 2026-07-20 Kepler desktop sample after transit-regularity override: `possible_candidate`, score `48`, selected period about `55.36` days, `19/26` predicted events covered; irregular false-positive fixture remains `no_planet_like_signal`.
+- 2026-07-20 TRAPPIST-1 desktop sample after dense-regularity tuning: `possible_candidate`, score `51`, selected period about `0.75` days, ephemeris fit `18/30`; irregular false-positive fixture remains `no_planet_like_signal`.
 
 Commands used for basic checks:
 
@@ -302,10 +318,13 @@ Current feature sequence status:
 5. Transit depth in percent/ppm and radius-ratio estimate: done.
 6. False-positive warnings: done.
 7. Planet/no-planet assessment: done.
-8. Data cleaning panel: next.
-9. Reset/home view button: pending.
+8. Ephemeris audit view: done.
+9. Data cleaning panel: next.
+10. Sensitivity/no-planet upper-limit message: pending.
+11. TLS-style search mode: pending.
+12. Reset/home view button: pending.
 
-Additional useful future features after step 9:
+Additional useful future features after step 12:
 
 - Transit prediction from period and epoch.
 - Better candidate-period ranking with explicit harmonic/alias grouping.
