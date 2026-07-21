@@ -22,20 +22,35 @@
       </label>
       <input id="fileInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits" multiple>
       <button id="analyzeButton" disabled>Analyze files</button>
-      <div id="status" class="status">No file selected.</div>
-      <div id="analysisProgress" class="analysis-progress" hidden></div>
+
+      <details id="runStatusSection" class="accordion-section run-status-section" open>
+        <summary><h2>Run Status</h2></summary>
+        <div class="accordion-body run-status-body">
+          <div id="status" class="status">No file selected.</div>
+          <div id="analysisProgress" class="analysis-progress" hidden></div>
+        </div>
+      </details>
 
       <details class="accordion-section" open>
         <summary><h2>Batch Results</h2></summary>
-        <div class="accordion-body controls">
+        <div class="accordion-body controls batch-results-body">
           <div class="control-row">
             <label class="control-label" for="resultSelect">
               <span>Processed file</span>
               <output id="batchCount">0/0</output>
             </label>
-            <select id="resultSelect" disabled>
+            <select id="resultSelect" class="native-batch-select" disabled>
               <option>No processed files</option>
             </select>
+            <div id="batchPicker" class="batch-picker" hidden>
+              <button id="batchPickerButton" class="batch-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false" disabled>
+                <span class="batch-picker-current">
+                  <span id="batchPickerTitle" class="batch-picker-title">No processed files</span>
+                  <span id="batchPickerMeta" class="batch-picker-meta">Run analysis to populate this list.</span>
+                </span>
+              </button>
+              <div id="batchPickerList" class="batch-picker-list" role="listbox" hidden></div>
+            </div>
           </div>
         </div>
       </details>

@@ -3,6 +3,7 @@ const dropzone = document.getElementById('dropzone');
 const analyzeButton = document.getElementById('analyzeButton');
 const statusEl = document.getElementById('status');
 const analysisProgressEl = document.getElementById('analysisProgress');
+const runStatusSection = document.getElementById('runStatusSection');
 const assessmentEl = document.getElementById('assessment');
 const metricsEl = document.getElementById('metrics');
 const warningsEl = document.getElementById('warnings');
@@ -33,7 +34,16 @@ const exportAnalysisPdfButton = document.getElementById('exportAnalysisPdfButton
 const exportBatchPdfButton = document.getElementById('exportBatchPdfButton');
 const resultSelect = document.getElementById('resultSelect');
 const batchCount = document.getElementById('batchCount');
+const batchPicker = document.getElementById('batchPicker');
+const batchPickerButton = document.getElementById('batchPickerButton');
+const batchPickerTitle = document.getElementById('batchPickerTitle');
+const batchPickerMeta = document.getElementById('batchPickerMeta');
+const batchPickerList = document.getElementById('batchPickerList');
+const appShell = document.querySelector('main');
 const MAX_BATCH_FILES = 100;
+const DEFAULT_SIDEBAR_WIDTH = 390;
+const MIN_SIDEBAR_WIDTH = 320;
+const MAX_SIDEBAR_WIDTH = 560;
 let selectedFiles = [];
 let selectedFile = null;
 let batchResults = [];
@@ -237,6 +247,45 @@ function setupAccordions() {
 
 setupAccordions();
 
+function openAccordionSection(section) {
+  if (!section || section.open || section.dataset.animating === 'true') return;
+  const body = section.querySelector('.accordion-body');
+  if (!body || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    section.open = true;
+    return;
+  }
+  animateAccordionOpen(section, body);
+}
+
+function showRunStatus() {
+  openAccordionSection(runStatusSection);
+}
+
+function sidebarWidthForFiles(files) {
+  const names = Array.from(files || [])
+    .map(file => String(file.name || ''))
+    .filter(Boolean);
+  if (!names.length) return DEFAULT_SIDEBAR_WIDTH;
+
+  const longestName = Math.max(...names.map(name => name.length));
+  const longestSegment = Math.max(...names.flatMap(name => (
+    name.split(/[\s._()-]+/).map(part => part.length)
+  )));
+  const widthForWrappedName = 255 + Math.min(longestName, 90) * 3.4;
+  const widthForLongSegment = 250 + Math.min(longestSegment, 56) * 5.4;
+  const preferredWidth = Math.max(DEFAULT_SIDEBAR_WIDTH, widthForWrappedName, widthForLongSegment);
+  return Math.round(Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, preferredWidth)));
+}
+
+function updateSidebarWidth(files = selectedFiles) {
+  if (!appShell) return;
+  if (!files || !files.length) {
+    appShell.style.removeProperty('--sidebar-width');
+    return;
+  }
+  appShell.style.setProperty('--sidebar-width', `${sidebarWidthForFiles(files)}px`);
+}
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
   statusEl.className = isError ? 'status error' : 'status';
@@ -267,11 +316,12 @@ function renderProgressRows(files) {
   stopProgressTimer();
   progressValues = files.map(() => 0);
   if (!analysisProgressEl) return;
+  updateSidebarWidth(files);
   analysisProgressEl.hidden = files.length === 0;
   analysisProgressEl.innerHTML = files.map((file, index) => `
     <div class="progress-item pending" data-progress-index="${index}">
       <div class="progress-header">
-        <span>${index + 1}. ${escapeHtml(file.name)}</span>
+        <span title="${escapeHtml(file.name)}">${index + 1}. ${escapeHtml(file.name)}</span>
         <span data-progress-percent>Pending</span>
       </div>
       <div class="progress-track" role="progressbar" aria-label="Analysis progress for ${escapeHtml(file.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -279,10 +329,12 @@ function renderProgressRows(files) {
       </div>
     </div>
   `).join('');
+  showRunStatus();
 }
 
 function setFileProgress(index, value, label, state = 'active') {
   if (!analysisProgressEl) return;
+  showRunStatus();
   const row = analysisProgressEl.querySelector(`[data-progress-index="${index}"]`);
   if (!row) return;
   const progressValue = clampProgress(value);
@@ -296,6 +348,7 @@ function setFileProgress(index, value, label, state = 'active') {
 function beginFileProgress(index) {
   stopProgressTimer();
   const ceiling = 92;
+  showRunStatus();
   setFileProgress(index, 0, '0%', 'active');
   progressTimer = window.setInterval(() => {
     const currentValue = progressValues[index] || 0;
@@ -312,12 +365,96 @@ function finishFileProgress(index, succeeded = true) {
   setFileProgress(index, 100, succeeded ? 'Complete' : 'Failed', succeeded ? 'complete' : 'failed');
 }
 
+function batchResultDetail(item) {
+  if (!item) {
+    return {
+      label: 'No file selected',
+      meta: 'Run analysis to populate this list.',
+      status: 'pending',
+      transits: null,
+    };
+  }
+  if (item.error) {
+    return {
+      label: 'Failed',
+      meta: item.error,
+      status: 'failed',
+      transits: null,
+    };
+  }
+  const assessment = assessmentForResult(item.result);
+  const transitCount = item.result.transits.length;
+  return {
+    label: assessment.shortLabel,
+    meta: `${transitCount} transit${transitCount === 1 ? '' : 's'}`,
+    status: assessment.status,
+    transits: transitCount,
+  };
+}
+
+function closeBatchPicker() {
+  if (!batchPickerList || !batchPickerButton) return;
+  batchPickerList.hidden = true;
+  batchPickerButton.setAttribute('aria-expanded', 'false');
+}
+
+function toggleBatchPicker() {
+  if (!batchPickerList || !batchPickerButton || batchPickerButton.disabled) return;
+  const willOpen = batchPickerList.hidden;
+  batchPickerList.hidden = !willOpen;
+  batchPickerButton.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+
+function renderBatchPicker() {
+  if (!batchPicker || !batchPickerButton || !batchPickerTitle || !batchPickerMeta || !batchPickerList) return;
+  const successCount = batchResults.filter(item => item.result).length;
+  const activeItem = currentBatchIndex >= 0 ? batchResults[currentBatchIndex] : null;
+  const activeDetail = batchResultDetail(activeItem);
+  const disabled = !batchResults.length || batchInProgress;
+
+  batchPicker.hidden = false;
+  batchPickerButton.disabled = disabled;
+  batchPickerButton.className = `batch-picker-button ${activeDetail.status}`;
+  batchPickerTitle.textContent = activeItem ? activeItem.file.name : (batchResults.length ? 'No successful file selected' : 'No processed files');
+  batchPickerMeta.textContent = activeItem
+    ? `${activeDetail.label} · ${activeDetail.meta}`
+    : (batchResults.length && successCount === 0 ? 'All processed files failed.' : 'Run analysis to populate this list.');
+  batchPickerList.hidden = batchPickerList.hidden || disabled;
+  batchPickerButton.setAttribute('aria-expanded', batchPickerList.hidden ? 'false' : 'true');
+  batchPickerList.innerHTML = batchResults.map((item, index) => {
+    const selected = index === currentBatchIndex;
+    const detail = batchResultDetail(item);
+    const disabledAttribute = item.error ? ' disabled aria-disabled="true"' : '';
+    return `
+      <button
+        class="batch-option ${detail.status}${selected ? ' selected' : ''}"
+        type="button"
+        role="option"
+        aria-selected="${selected ? 'true' : 'false'}"
+        data-batch-index="${index}"
+        title="${escapeHtml(item.file.name)}"
+        ${disabledAttribute}
+      >
+        <span class="batch-option-index">${index + 1}</span>
+        <span class="batch-option-body">
+          <span class="batch-option-name">${escapeHtml(item.file.name)}</span>
+          <span class="batch-option-meta">
+            <span class="batch-badge ${detail.status}">${escapeHtml(detail.label)}</span>
+            <span>${escapeHtml(detail.meta)}</span>
+          </span>
+        </span>
+      </button>
+    `;
+  }).join('');
+}
+
 function renderBatchSelect() {
   const successCount = batchResults.filter(item => item.result).length;
   batchCount.value = `${successCount}/${batchResults.length || selectedFiles.length || 0}`;
   if (!batchResults.length) {
     resultSelect.disabled = true;
     resultSelect.innerHTML = '<option>No processed files</option>';
+    renderBatchPicker();
     syncExportButtons();
     return;
   }
@@ -331,12 +468,14 @@ function renderBatchSelect() {
       : `${assessmentForResult(item.result).shortLabel}; ${item.result.transits.length} transits`;
     return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
   }).join('');
+  renderBatchPicker();
   syncExportButtons();
 }
 
 function setFiles(fileList) {
   const files = Array.from(fileList || []);
   selectedFiles = files.slice(0, MAX_BATCH_FILES);
+  updateSidebarWidth(selectedFiles);
   selectedFile = selectedFiles[0] || null;
   batchResults = [];
   currentBatchIndex = -1;
@@ -613,6 +752,28 @@ analyzeButton.addEventListener('click', async () => {
 
 resultSelect.addEventListener('change', () => {
   selectBatchResult(Number(resultSelect.value));
+});
+
+if (batchPickerButton) {
+  batchPickerButton.addEventListener('click', toggleBatchPicker);
+}
+
+if (batchPickerList) {
+  batchPickerList.addEventListener('click', event => {
+    const option = event.target.closest('[data-batch-index]');
+    if (!option || option.disabled) return;
+    closeBatchPicker();
+    selectBatchResult(Number(option.dataset.batchIndex));
+  });
+}
+
+document.addEventListener('click', event => {
+  if (!batchPicker || batchPicker.hidden || batchPicker.contains(event.target)) return;
+  closeBatchPicker();
+});
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeBatchPicker();
 });
 
 viewButtons.forEach(button => {
@@ -3159,4 +3320,7 @@ function drawChart() {
   updateCanvasCursor(lastPointer);
 }
 
-window.addEventListener('resize', drawChart);
+window.addEventListener('resize', () => {
+  updateSidebarWidth();
+  drawChart();
+});

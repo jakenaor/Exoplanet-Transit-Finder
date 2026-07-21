@@ -51,6 +51,9 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, and `astropy>=6,<7` so Astropy BLS imports correctly on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
+- Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
+- Sidebar width expands from selected/progress filenames, and progress filenames wrap to two lines before truncating.
+- Batch Results uses a custom styled picker with two-line filenames and compact verdict/transit badges instead of the native OS dropdown.
 - Split app structure:
   - `main.py` handles HTTP routes, static assets, and `/analyze`.
   - `parsers.py` handles CSV and FITS ingestion.
