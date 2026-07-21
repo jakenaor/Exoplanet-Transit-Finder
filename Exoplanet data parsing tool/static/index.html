@@ -25,9 +25,9 @@
       <div id="status" class="status">No file selected.</div>
       <div id="analysisProgress" class="analysis-progress" hidden></div>
 
-      <section>
-        <h2>Batch Results</h2>
-        <div class="controls">
+      <details class="accordion-section" open>
+        <summary><h2>Batch Results</h2></summary>
+        <div class="accordion-body controls">
           <div class="control-row">
             <label class="control-label" for="resultSelect">
               <span>Processed file</span>
@@ -38,11 +38,11 @@
             </select>
           </div>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Detection</h2>
-        <div class="controls">
+      <details class="accordion-section" open>
+        <summary><h2>Detection</h2></summary>
+        <div class="accordion-body controls">
           <div class="control-row">
             <label class="control-label" for="strictnessInput">
               <span>Strictness</span>
@@ -103,11 +103,11 @@
           </div>
           <button id="resetDetectionButton" class="view-button" type="button">Reset detection</button>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Planet Check</h2>
-        <div id="assessment" class="assessment">
+      <details class="accordion-section" open>
+        <summary><h2>Planet Check</h2></summary>
+        <div id="assessment" class="accordion-body assessment">
           <div class="assessment-card pending">
             <div class="assessment-head">
               <strong>No dataset analyzed</strong>
@@ -116,11 +116,11 @@
             <p>Candidate verdict appears after analysis.</p>
           </div>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Analysis</h2>
-        <div class="meta" id="metrics">
+      <details class="accordion-section" open>
+        <summary><h2>Analysis</h2></summary>
+        <div class="accordion-body meta" id="metrics">
           <div class="metric"><span>Data points</span><span>-</span></div>
           <div class="metric"><span>Transits</span><span>-</span></div>
           <div class="metric"><span>Orbital period</span><span>-</span></div>
@@ -135,38 +135,38 @@
           <div class="metric"><span>Median flux</span><span>-</span></div>
           <div class="metric"><span>Noise</span><span>-</span></div>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Period Candidates</h2>
-        <div class="warning-list" id="periodCandidates">
+      <details class="accordion-section" open>
+        <summary><h2>Period Candidates</h2></summary>
+        <div class="accordion-body warning-list" id="periodCandidates">
           <div class="warning-item info">
             <strong>No candidates yet</strong>
             <span>Period search results appear after analysis.</span>
           </div>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Warnings</h2>
-        <div class="warning-list" id="warnings">
+      <details class="accordion-section" open>
+        <summary><h2>Warnings</h2></summary>
+        <div class="accordion-body warning-list" id="warnings">
           <div class="warning-item info">
             <strong>No analysis yet</strong>
             <span>Candidate checks appear after upload.</span>
           </div>
         </div>
-      </section>
+      </details>
 
-      <section>
-        <h2>Export</h2>
-        <div class="controls">
+      <details class="accordion-section" open>
+        <summary><h2>Export</h2></summary>
+        <div class="accordion-body controls">
           <button id="exportCsvButton" class="view-button" type="button" disabled>Transit CSV</button>
           <button id="exportPngButton" class="view-button" type="button" disabled>Graph PNG</button>
           <button id="exportJsonButton" class="view-button" type="button" disabled>Summary JSON</button>
           <button id="exportAnalysisPdfButton" class="view-button" type="button" disabled>Analysis PDF</button>
           <button id="exportBatchPdfButton" class="view-button" type="button" disabled>Batch PDF</button>
         </div>
-      </section>
+      </details>
     </aside>
 
     <section class="workspace">

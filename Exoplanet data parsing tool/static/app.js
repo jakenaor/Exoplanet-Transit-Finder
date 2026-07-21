@@ -142,6 +142,101 @@ function chiSquareOneDegreePValue(deltaChiSquared) {
   return Math.max(0, Math.min(1, erfcApprox(Math.sqrt(deltaChiSquared / 2))));
 }
 
+function finishAccordionAnimation(section, body) {
+  section.classList.remove('is-opening', 'is-closing');
+  delete section.dataset.animating;
+  body.style.height = '';
+  body.style.opacity = '';
+  body.style.transform = '';
+  body.style.marginTop = '';
+}
+
+function animateAccordionOpen(section, body) {
+  section.open = true;
+  section.dataset.animating = 'true';
+  section.classList.add('is-opening');
+  section.classList.remove('is-closing');
+  body.style.height = '0px';
+  body.style.opacity = '0';
+  body.style.transform = 'translateY(-4px)';
+  body.style.marginTop = '0';
+  body.offsetHeight;
+
+  window.requestAnimationFrame(() => {
+    body.style.height = `${body.scrollHeight}px`;
+    body.style.opacity = '1';
+    body.style.transform = 'translateY(0)';
+    body.style.marginTop = '9px';
+  });
+
+  let complete = false;
+  const finish = () => {
+    if (complete) return;
+    complete = true;
+    body.removeEventListener('transitionend', onTransitionEnd);
+    finishAccordionAnimation(section, body);
+  };
+  const onTransitionEnd = event => {
+    if (event.target === body && event.propertyName === 'height') finish();
+  };
+  body.addEventListener('transitionend', onTransitionEnd);
+  window.setTimeout(finish, 360);
+}
+
+function animateAccordionClose(section, body) {
+  section.dataset.animating = 'true';
+  section.classList.add('is-closing');
+  section.classList.remove('is-opening');
+  body.style.height = `${body.scrollHeight}px`;
+  body.style.opacity = '1';
+  body.style.transform = 'translateY(0)';
+  body.style.marginTop = '9px';
+  body.offsetHeight;
+
+  window.requestAnimationFrame(() => {
+    body.style.height = '0px';
+    body.style.opacity = '0';
+    body.style.transform = 'translateY(-4px)';
+    body.style.marginTop = '0';
+  });
+
+  let complete = false;
+  const finish = () => {
+    if (complete) return;
+    complete = true;
+    body.removeEventListener('transitionend', onTransitionEnd);
+    section.open = false;
+    finishAccordionAnimation(section, body);
+  };
+  const onTransitionEnd = event => {
+    if (event.target === body && event.propertyName === 'height') finish();
+  };
+  body.addEventListener('transitionend', onTransitionEnd);
+  window.setTimeout(finish, 360);
+}
+
+function setupAccordions() {
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  document.querySelectorAll('.accordion-section').forEach(section => {
+    const summary = section.querySelector('summary');
+    const body = section.querySelector('.accordion-body');
+    if (!summary || !body) return;
+
+    summary.addEventListener('click', event => {
+      if (reducedMotion.matches) return;
+      event.preventDefault();
+      if (section.dataset.animating === 'true') return;
+      if (section.open) {
+        animateAccordionClose(section, body);
+      } else {
+        animateAccordionOpen(section, body);
+      }
+    });
+  });
+}
+
+setupAccordions();
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
   statusEl.className = isError ? 'status error' : 'status';

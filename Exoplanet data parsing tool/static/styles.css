@@ -91,9 +91,103 @@ p {
   padding-bottom: 4px;
 }
 
-.sidebar section {
-  padding-top: 14px;
+.sidebar .accordion-section {
+  padding-top: 10px;
   border-top: 1px solid #e8edf2;
+}
+
+.accordion-section summary {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 7px;
+  padding: 6px 8px;
+  margin: 0 -8px;
+  transition: background .15s ease, color .15s ease;
+}
+
+.accordion-section summary::-webkit-details-marker {
+  display: none;
+}
+
+.accordion-section summary:hover {
+  background: #f1f5f8;
+}
+
+.accordion-section summary:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, .28);
+  outline-offset: 2px;
+}
+
+.accordion-section summary h2 {
+  margin: 0;
+}
+
+.accordion-section summary::after {
+  content: "";
+  width: 0;
+  height: 0;
+  flex: 0 0 auto;
+  color: #6b7480;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid currentColor;
+  margin-right: 5px;
+  transform: rotate(0deg);
+  transform-origin: 35% 50%;
+  transition: color .18s ease, transform .24s cubic-bezier(.22, 1, .36, 1);
+}
+
+.accordion-section[open] summary::after {
+  transform: rotate(90deg);
+}
+
+.accordion-section summary:hover::after,
+.accordion-section[open] summary::after {
+  color: var(--accent);
+}
+
+.accordion-body {
+  margin-top: 9px;
+  overflow: hidden;
+  transition:
+    height .28s cubic-bezier(.22, 1, .36, 1),
+    opacity .22s ease,
+    transform .28s cubic-bezier(.22, 1, .36, 1),
+    margin-top .22s ease;
+  will-change: height, opacity, transform;
+}
+
+.accordion-section.is-closing .accordion-body,
+.accordion-section:not([open]) .accordion-body {
+  margin-top: 0;
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.accordion-section.is-opening summary::after,
+.accordion-section.is-closing summary::after {
+  color: var(--accent);
+}
+
+.accordion-section.is-opening summary::after {
+  transform: rotate(90deg);
+}
+
+.accordion-section.is-closing summary::after {
+  transform: rotate(0deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accordion-body,
+  .accordion-section summary::after {
+    transition: none;
+  }
 }
 
 .workspace {
@@ -640,7 +734,7 @@ th {
     gap: 10px;
   }
 
-  .sidebar section {
+  .sidebar .accordion-section {
     padding-top: 10px;
   }
 
