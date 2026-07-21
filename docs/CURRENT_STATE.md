@@ -48,6 +48,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 
 - Localhost app served by `python3 main.py` using Python stdlib HTTP serving.
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
+- `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, and `astropy>=6,<7` so Astropy BLS imports correctly on the current Python 3.9 setup.
 - Split app structure:
   - `main.py` handles HTTP routes, static assets, and `/analyze`.
   - `parsers.py` handles CSV and FITS ingestion.
