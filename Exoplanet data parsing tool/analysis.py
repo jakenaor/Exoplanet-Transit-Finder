@@ -1470,7 +1470,45 @@ def coefficient_of_variation(values):
     return float(np.std(np.asarray(clean, dtype=float)) / center)
 
 
-def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
+def normalize_observed_ranges(observed_ranges):
+    ranges = []
+    for item in observed_ranges or []:
+        if isinstance(item, dict):
+            start = finite_number(item.get("start_day", item.get("start")))
+            end = finite_number(item.get("end_day", item.get("end")))
+        else:
+            try:
+                start = finite_number(item[0])
+                end = finite_number(item[1])
+            except (TypeError, IndexError):
+                start = None
+                end = None
+        if start is None or end is None:
+            continue
+        if end < start:
+            start, end = end, start
+        ranges.append((float(start), float(end)))
+    return ranges
+
+
+def ephemeris_cycles_in_observed_ranges(period, epoch, tolerance, observed_ranges):
+    period = finite_number(period)
+    epoch = finite_number(epoch)
+    tolerance = finite_number(tolerance)
+    if period is None or epoch is None or tolerance is None or period <= 0:
+        return set()
+
+    cycles = set()
+    for start, end in normalize_observed_ranges(observed_ranges):
+        first_cycle = math.ceil((start - tolerance - epoch) / period)
+        last_cycle = math.floor((end + tolerance - epoch) / period)
+        if last_cycle < first_cycle:
+            continue
+        cycles.update(range(int(first_cycle), int(last_cycle) + 1))
+    return cycles
+
+
+def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observed_ranges=None):
     period = finite_number(detection.get("period"))
     epoch = finite_number(detection.get("period_epoch"))
     period_duration = finite_number(detection.get("period_duration"))
@@ -1524,6 +1562,9 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
     transit_count = len(centers)
     off_count = transit_count - match_count
     median_residual = median_or_none(residuals)
+    observed_cycles = ephemeris_cycles_in_observed_ranges(period, epoch_relative, tolerance, observed_ranges)
+    if observed_cycles:
+        expected_count = len(observed_cycles)
     expected_coverage = None
     if expected_count is not None and expected_count > 0:
         expected_coverage = min(1.0, event_match_count / expected_count)
@@ -1535,7 +1576,7 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
         "ephemeris_event_match_fraction": None if expected_count is None or expected_count <= 0 else event_match_count / expected_count,
         "off_ephemeris_transit_count": int(off_count),
         "off_ephemeris_fraction": off_count / transit_count,
-        "expected_transit_count": expected_count,
+        "expected_transit_count": int(expected_count) if expected_count is not None else None,
         "expected_transit_coverage": expected_coverage,
         "timing_residual_median": median_residual,
         "timing_residual_max": max(residuals) if residuals else None,
@@ -1544,7 +1585,7 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0):
     }
 
 
-def build_candidate_diagnostics(transits, detection, time_reference=0.0):
+def build_candidate_diagnostics(transits, detection, time_reference=0.0, observed_ranges=None):
     depths = finite_values([item.get("depth") for item in transits])
     radius_ratios = finite_values([item.get("radius_ratio") for item in transits])
     point_counts = finite_values([item.get("points") for item in transits])
@@ -1562,7 +1603,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
     if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
         odd_even_depth_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
 
-    ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference)
+    ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference, observed_ranges)
     diagnostics = {
         "detection_snr": detection_snr,
         "median_transit_points": median_or_none(point_counts),
@@ -1633,7 +1674,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
         })
     if (
         len(transits) >= 3
-        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity")
+        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS-style")
         and diagnostics["ephemeris_match_fraction"] is not None
     ):
         match_fraction = diagnostics["ephemeris_match_fraction"]
@@ -1643,7 +1684,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0):
         expected_count = diagnostics["expected_transit_count"]
         expected_coverage = diagnostics["expected_transit_coverage"]
         well_covered_events = (
-            detection.get("period_method") == "transit regularity"
+            detection.get("period_method") in ("transit regularity", "TLS-style")
             and event_count is not None
             and event_count >= 3
             and (
@@ -1895,14 +1936,25 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     if caution_count >= 3:
         score -= 6
 
-    candidate_score = int(round(clamp(score, 0, 100)))
+    raw_candidate_score = int(round(clamp(score, 0, 100)))
+    required_period_sde = 3.5 if period_method == "TLS-style" else 5
+    high_repeat_confidence = (
+        transit_count >= 5
+        and detection_snr is not None
+        and detection_snr >= 5
+        and period_sde is not None
+        and period_sde >= (5 if period_method == "TLS-style" else 8)
+        and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.85)
+        and (expected_transit_coverage is None or expected_transit_coverage >= 0.65)
+        and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.2)
+    )
     strong_requirements_met = (
         transit_count >= 3
         and period is not None
-        and period_method == "BLS"
+        and period_method in ("BLS", "TLS-style")
         and detection_snr is not None
-        and detection_snr >= 7
-        and (period_sde is None or period_sde >= 5)
+        and (detection_snr >= 7 or high_repeat_confidence)
+        and (period_sde is None or period_sde >= required_period_sde)
         and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.75)
         and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.3)
         and danger_count == 0
@@ -1919,7 +1971,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
 
     if transit_count == 0:
         has_unboxed_period_signal = (
-            candidate_score >= 35
+            raw_candidate_score >= 35
             and period_sde is not None
             and period_sde >= 7
             and (p_value is None or p_value <= 0.01)
@@ -1951,7 +2003,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "That pattern is more consistent with irregular variability or systematics than a single transiting exoplanet."
         )
         recommendation = "Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate."
-    elif candidate_score >= 75 and strong_requirements_met:
+    elif raw_candidate_score >= 75 and strong_requirements_met:
         status = "strong_candidate"
         title = "Strong planet-like transit candidate"
         short_label = "Strong candidate"
@@ -1960,7 +2012,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "This is a strong candidate, not a confirmed planet."
         )
         recommendation = "Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed."
-    elif candidate_score >= 45 and transit_count >= 2:
+    elif raw_candidate_score >= 45 and transit_count >= 2:
         status = "possible_candidate"
         title = "Possible transit candidate"
         short_label = "Possible candidate"
@@ -1978,6 +2030,14 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "This dataset may not contain a detectable transiting exoplanet."
         )
         recommendation = "Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious."
+
+    candidate_score = raw_candidate_score
+    if status == "possible_candidate":
+        candidate_score = min(candidate_score, 74)
+    elif status == "inconclusive":
+        candidate_score = min(candidate_score, 59)
+    elif status == "no_planet_like_signal":
+        candidate_score = min(candidate_score, 44)
 
     return {
         "status": status,
@@ -2165,7 +2225,11 @@ def analyze(time, flux, options=None):
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
         display_transits.append(display_transit)
-    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference)
+    observed_ranges = [
+        (float(time[start] - time_reference), float(time[end - 1] - time_reference))
+        for start, end in segments
+    ]
+    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference, observed_ranges)
     planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
 
     zoom_domain = None

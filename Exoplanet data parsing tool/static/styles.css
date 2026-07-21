@@ -702,6 +702,25 @@ input[type="range"] {
   font-weight: 820;
 }
 
+.batch-score {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  border: 1px solid #cbd5df;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #fff;
+  color: #303844;
+  font-size: 11px;
+  font-weight: 880;
+  font-variant-numeric: tabular-nums;
+}
+
+.batch-score.strong_candidate { border-color: #9bd3ae; color: #166534; }
+.batch-score.possible_candidate { border-color: #f0bf82; color: #8a3f06; }
+.batch-score.inconclusive { border-color: #b9cffc; color: #1d4ed8; }
+.batch-score.no_planet_like_signal { border-color: #f0b2ad; color: #991b1b; }
+
 .batch-badge.strong_candidate { background: #e8f6ee; color: #166534; }
 .batch-badge.possible_candidate { background: #fff2df; color: #8a3f06; }
 .batch-badge.inconclusive { background: #edf4ff; color: #1d4ed8; }

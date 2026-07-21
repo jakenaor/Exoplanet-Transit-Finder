@@ -152,6 +152,52 @@ function chiSquareOneDegreePValue(deltaChiSquared) {
   return Math.max(0, Math.min(1, erfcApprox(Math.sqrt(deltaChiSquared / 2))));
 }
 
+function observationRangesForResult(result, fallbackDomain = null) {
+  const segmentRanges = result?.normalization?.segment_time_ranges || [];
+  const ranges = segmentRanges.map(segment => {
+    const start = Number(segment.start_day ?? segment.start);
+    const end = Number(segment.end_day ?? segment.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+    return start <= end ? { start, end } : { start: end, end: start };
+  }).filter(Boolean);
+  if (ranges.length) return ranges;
+
+  const domain = fallbackDomain || result?.domain;
+  const start = Number(domain?.time_min);
+  const end = Number(domain?.time_max);
+  return Number.isFinite(start) && Number.isFinite(end)
+    ? [{ start: Math.min(start, end), end: Math.max(start, end) }]
+    : [];
+}
+
+function ephemerisCyclesInObservedRanges(period, epoch, tolerance, observedRanges) {
+  const periodValue = Number(period);
+  const epochValue = Number(epoch);
+  const toleranceValue = Number(tolerance);
+  if (
+    !Number.isFinite(periodValue)
+    || periodValue <= 0
+    || !Number.isFinite(epochValue)
+    || !Number.isFinite(toleranceValue)
+  ) {
+    return new Set();
+  }
+
+  const cycles = new Set();
+  (observedRanges || []).forEach(range => {
+    const start = Number(range.start);
+    const end = Number(range.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const firstCycle = Math.ceil((Math.min(start, end) - toleranceValue - epochValue) / periodValue);
+    const lastCycle = Math.floor((Math.max(start, end) + toleranceValue - epochValue) / periodValue);
+    if (lastCycle < firstCycle) return;
+    for (let cycle = firstCycle; cycle <= lastCycle; cycle += 1) {
+      cycles.add(cycle);
+    }
+  });
+  return cycles;
+}
+
 function finishAccordionAnimation(section, body) {
   section.classList.remove('is-opening', 'is-closing');
   delete section.dataset.animating;
@@ -371,6 +417,7 @@ function batchResultDetail(item) {
       label: 'No file selected',
       meta: 'Run analysis to populate this list.',
       status: 'pending',
+      score: null,
       transits: null,
     };
   }
@@ -379,6 +426,7 @@ function batchResultDetail(item) {
       label: 'Failed',
       meta: item.error,
       status: 'failed',
+      score: null,
       transits: null,
     };
   }
@@ -388,6 +436,7 @@ function batchResultDetail(item) {
     label: assessment.shortLabel,
     meta: `${transitCount} transit${transitCount === 1 ? '' : 's'}`,
     status: assessment.status,
+    score: assessment.candidateScore,
     transits: transitCount,
   };
 }
@@ -417,7 +466,7 @@ function renderBatchPicker() {
   batchPickerButton.className = `batch-picker-button ${activeDetail.status}`;
   batchPickerTitle.textContent = activeItem ? activeItem.file.name : (batchResults.length ? 'No successful file selected' : 'No processed files');
   batchPickerMeta.textContent = activeItem
-    ? `${activeDetail.label} · ${activeDetail.meta}`
+    ? `${activeDetail.score === null ? 'No score' : `${activeDetail.score}/100 confidence`} · ${activeDetail.label} · ${activeDetail.meta}`
     : (batchResults.length && successCount === 0 ? 'All processed files failed.' : 'Run analysis to populate this list.');
   batchPickerList.hidden = batchPickerList.hidden || disabled;
   batchPickerButton.setAttribute('aria-expanded', batchPickerList.hidden ? 'false' : 'true');
@@ -425,6 +474,9 @@ function renderBatchPicker() {
     const selected = index === currentBatchIndex;
     const detail = batchResultDetail(item);
     const disabledAttribute = item.error ? ' disabled aria-disabled="true"' : '';
+    const scoreHtml = detail.score === null
+      ? ''
+      : `<span class="batch-score ${detail.status}" aria-label="Planet confidence ${detail.score} out of 100">${detail.score}/100</span>`;
     return `
       <button
         class="batch-option ${detail.status}${selected ? ' selected' : ''}"
@@ -439,6 +491,7 @@ function renderBatchPicker() {
         <span class="batch-option-body">
           <span class="batch-option-name">${escapeHtml(item.file.name)}</span>
           <span class="batch-option-meta">
+            ${scoreHtml}
             <span class="batch-badge ${detail.status}">${escapeHtml(detail.label)}</span>
             <span>${escapeHtml(detail.meta)}</span>
           </span>
@@ -978,7 +1031,7 @@ function estimatePValueFromTransitBoxes() {
   };
 }
 
-function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expectedCount) {
+function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expectedCount, observedRanges = null) {
   const centers = transits
     .map(transit => Number(transit.center))
     .filter(value => Number.isFinite(value));
@@ -1036,18 +1089,20 @@ function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expe
   const eventMatchCount = matchedCycles.size;
   const offCount = centers.length - matchCount;
   const residualMedian = median(residuals);
-  const expectedCoverage = Number.isFinite(expectedValue) && expectedValue > 0
-    ? Math.min(1, eventMatchCount / expectedValue)
+  const observedCycles = ephemerisCyclesInObservedRanges(periodValue, epochValue, tolerance, observedRanges);
+  const expectedObservedCount = observedCycles.size || (Number.isFinite(expectedValue) && expectedValue > 0 ? expectedValue : null);
+  const expectedCoverage = expectedObservedCount
+    ? Math.min(1, eventMatchCount / expectedObservedCount)
     : null;
 
   return {
     ephemerisMatchCount: matchCount,
     ephemerisMatchFraction: matchCount / centers.length,
     ephemerisEventMatchCount: eventMatchCount,
-    ephemerisEventMatchFraction: Number.isFinite(expectedValue) && expectedValue > 0 ? eventMatchCount / expectedValue : null,
+    ephemerisEventMatchFraction: expectedObservedCount ? eventMatchCount / expectedObservedCount : null,
     offEphemerisTransitCount: offCount,
     offEphemerisFraction: offCount / centers.length,
-    expectedTransitCount: Number.isFinite(expectedValue) ? expectedValue : null,
+    expectedTransitCount: expectedObservedCount || (Number.isFinite(expectedValue) ? expectedValue : null),
     expectedTransitCoverage: expectedCoverage,
     timingResidualMedian: residualMedian,
     timingResidualMax: residuals.length ? Math.max(...residuals) : null,
@@ -1132,17 +1187,24 @@ function predictedEphemerisEvents(metrics, domain = currentResult ? currentResul
   const epoch = Number(metrics.periodEpoch);
   if (!Number.isFinite(period) || period <= 0 || !Number.isFinite(epoch)) return [];
   const tolerance = ephemerisTolerance(metrics.period, metrics.periodDuration, currentResult ? currentResult.transits : []);
+  const observedRanges = observationRangesForResult(currentResult, domain);
   const firstCycle = Math.ceil((domain.time_min - epoch) / period) - 1;
   const lastCycle = Math.floor((domain.time_max - epoch) / period) + 1;
   const events = [];
   for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
     const center = epoch + cycle * period;
     if (center < domain.time_min - period || center > domain.time_max + period) continue;
+    const eventStart = tolerance === null ? center : center - tolerance;
+    const eventEnd = tolerance === null ? center : center + tolerance;
+    const overlapsObservedData = !observedRanges.length || observedRanges.some(range => (
+      eventEnd >= range.start && eventStart <= range.end
+    ));
+    if (!overlapsObservedData) continue;
     events.push({
       cycle,
       center,
-      start: tolerance === null ? center : center - tolerance,
-      end: tolerance === null ? center : center + tolerance,
+      start: eventStart,
+      end: eventEnd,
     });
   }
   return events;
@@ -1223,7 +1285,8 @@ function currentAnalysisMetrics() {
       metrics.period,
       metrics.periodEpoch,
       metrics.periodDuration,
-      metrics.periodMatchCount
+      metrics.periodMatchCount,
+      observationRangesForResult(currentResult)
     )
   );
 
@@ -1598,13 +1661,23 @@ function buildPlanetAssessment(metrics, warnings) {
   if (dangerCount) score -= dangerCount * 10;
   if (cautionCount >= 3) score -= 6;
 
-  const candidateScore = Math.round(Math.max(0, Math.min(100, score)));
+  const rawCandidateScore = Math.round(Math.max(0, Math.min(100, score)));
+  const highRepeatConfidence = (
+    transitCount >= 5
+    && detectionSnr !== null
+    && detectionSnr >= 5
+    && periodSde !== null
+    && periodSde >= (periodMethod === 'TLS-style' ? 5 : 8)
+    && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.85)
+    && (expectedTransitCoverage === null || expectedTransitCoverage >= 0.65)
+    && (offEphemerisFraction === null || offEphemerisFraction <= 0.2)
+  );
   const strongRequirementsMet = (
     transitCount >= 3
     && period !== null
     && ['BLS', 'TLS-style'].includes(periodMethod)
     && detectionSnr !== null
-    && detectionSnr >= 7
+    && (detectionSnr >= 7 || highRepeatConfidence)
     && (periodSde === null || periodSde >= (periodMethod === 'TLS-style' ? 3.5 : 5))
     && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.75)
     && (offEphemerisFraction === null || offEphemerisFraction <= 0.3)
@@ -1628,7 +1701,7 @@ function buildPlanetAssessment(metrics, warnings) {
 
   if (transitCount === 0) {
     const hasUnboxedPeriodSignal = (
-      candidateScore >= 35
+      rawCandidateScore >= 35
       && periodSde !== null
       && periodSde >= 7
       && (pValue === null || pValue <= 0.01)
@@ -1652,13 +1725,13 @@ function buildPlanetAssessment(metrics, warnings) {
     shortLabel = 'No credible signal';
     summary = 'The detector found dip-shaped events, but most do not align with one repeating orbital schedule. That pattern is more consistent with irregular variability or systematics than a single transiting exoplanet.';
     recommendation = 'Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate.';
-  } else if (candidateScore >= 75 && strongRequirementsMet) {
+  } else if (rawCandidateScore >= 75 && strongRequirementsMet) {
     status = 'strong_candidate';
     title = 'Strong planet-like transit candidate';
     shortLabel = 'Strong candidate';
     summary = 'Repeated dips align with a stable period and pass the current signal-strength checks. This is a strong candidate, not a confirmed planet.';
     recommendation = 'Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed.';
-  } else if (candidateScore >= 45 && transitCount >= 2) {
+  } else if (rawCandidateScore >= 45 && transitCount >= 2) {
     status = 'possible_candidate';
     title = 'Possible transit candidate';
     shortLabel = 'Possible candidate';
@@ -1670,6 +1743,15 @@ function buildPlanetAssessment(metrics, warnings) {
     shortLabel = 'No credible signal';
     summary = 'Detected dips do not currently pass enough planet-likeness checks. This dataset may not contain a detectable transiting exoplanet.';
     recommendation = 'Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious.';
+  }
+
+  let candidateScore = rawCandidateScore;
+  if (status === 'possible_candidate') {
+    candidateScore = Math.min(candidateScore, 74);
+  } else if (status === 'inconclusive') {
+    candidateScore = Math.min(candidateScore, 59);
+  } else if (status === 'no_planet_like_signal') {
+    candidateScore = Math.min(candidateScore, 44);
   }
 
   return {
