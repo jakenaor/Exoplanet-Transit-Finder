@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-07-20
+Last updated: 2026-07-22
 
 ## Canonical Location
 
@@ -54,6 +54,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Sidebar width expands from selected/progress filenames, and progress filenames wrap to two lines before truncating.
 - Batch Results uses a custom styled picker with two-line filenames and compact verdict/transit badges instead of the native OS dropdown.
+- Batch Results mini-previews include the per-file Planet Check confidence score as an `n/100` badge.
 - Split app structure:
   - `main.py` handles HTTP routes, static assets, and `/analyze`.
   - `parsers.py` handles CSV and FITS ingestion.
@@ -87,6 +88,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Period search controls:
   - Minimum period.
   - Maximum period.
+  - BLS + regularity and lightweight TLS-style search modes.
   - Period candidate list with power/SDE values.
   - Period search bounds included in JSON export.
 - Chi-squared p-value estimate for the fitted transit model, displayed as a percentage.
@@ -130,6 +132,9 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Manual box edits recompute the visible verdict client-side.
   - Ephemeris agreement is now part of the verdict: detected dips must mostly align with the recovered period.
   - Off-period transit-like dips are penalized heavily to avoid mistaking irregular systematics for a planet.
+  - Expected transit coverage now counts only predicted events that fall inside observed data segments, so long gaps do not unfairly penalize real gapped datasets.
+  - Candidate scores are capped by verdict tier so a `possible_candidate` no longer displays as `100/100`.
+  - High-repeat, high-period-confidence datasets with moderate per-transit SNR can still become `strong_candidate`.
 - Export controls:
   - Transit CSV, including edited boxes and original JD columns.
   - Current graph PNG.
@@ -146,8 +151,10 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Treat `Time` as Julian dates and convert to relative days for graph readability.
 - Normalize gapped observing segments independently before transit detection. This fixed the HD 209458-style file where obvious dips existed in separate data zones but global noise/baseline handling hid them.
 - Use BLS for orbital period, because simple averaging of nearby detected boxes was badly wrong for real gapped datasets.
+- Use observed-window ephemeris coverage for Planet Check and audit logic. Predicted transits that fall entirely inside data gaps are not counted against a candidate.
 - Treat broad automated period-search results as candidate rankings, not ground truth. The Kepler sample previously showed a strong alias around `294` days while a constrained `380-390` day search returned about `386.16` days.
 - Use phase-folding as the primary validation view for repeated transit structure.
+- The TLS-style search mode is a lightweight transit-shape search option, not a full physical TLS implementation with limb darkening or stellar-prior constraints.
 - Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
 - Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
@@ -175,6 +182,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - A clean injected-transit dataset returns `strong_candidate`.
   - A flat/noisy dataset returns `no_planet_like_signal`.
 - Ephemeris audit view made the irregular false-positive failure mode visible instead of only numeric.
+- Observed-window ephemeris coverage fixed a WASP-19-style case where the correct period was penalized as only `6%` covered because expected transits inside long observing gaps were being counted.
+- Batch Results score badges make it easier to compare many uploaded files without opening each Planet Check panel.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -186,6 +195,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Simple average of detected transit centers was not reliable for orbital period because the detector can find many local dips that are not consecutive orbital events. BLS is now preferred.
 - The wrong local folder was used for several edits before copying the final app into the correct Git repo. The correct repo is now documented here.
 - The docs became stale after FITS support, batch uploads, PDF exports, and the file split. This update corrects that.
+- A p-value display experiment added raw/scientific p-value formatting and a `p_value_log10` field, but it was reverted. The current app is back to the earlier Chi-sq p-value percentage display.
 
 ## Current Verification Notes
 
@@ -233,6 +243,17 @@ Observed verification results from recent work:
 - 2026-07-20 irregular false-positive test before ephemeris vetting: incorrectly returned `strong_candidate`, score `100`, `9` transits.
 - 2026-07-20 irregular false-positive test after ephemeris vetting: `no_planet_like_signal`, score `24`, `9` detected dips, ephemeris fit `3/9`, warnings `Irregular transit timing` and `Many off-period dips`.
 - 2026-07-20 clean synthetic transit after ephemeris vetting: `strong_candidate`, score `100`, ephemeris fit `8/8`.
+- 2026-07-22 WASP-19 dataset verification:
+  - File: `/Users/jakenaor/Desktop/Extrasolar Research Stuff/Datasets/wasp19_time_flux.csv`
+  - Result: `strong_candidate`, score `100`, `55` transits, BLS period about `0.787919` days.
+  - Observed expected coverage: `55/57` events, coverage about `0.9649`.
+  - This replaced the earlier incorrect weak-coverage behavior that reported about `6%`.
+- 2026-07-22 pure-noise guardrail verification:
+  - File: `/Users/jakenaor/Desktop/Extrasolar Research Stuff/datasets/no_exoplanet_just_pure_noiselightcurve.csv`
+  - Result: `no_planet_like_signal`, score `0`, `0` transits.
+- 2026-07-22 p-value display rollback verification:
+  - `/analyze` no longer emits `p_value_log10`.
+  - Frontend Analysis and PDF table use the older Chi-sq p-value percentage display.
 
 Commands used for basic checks:
 
@@ -268,7 +289,8 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 This project is intended to become a more user-friendly version of Transit Least Squares (TLS). Missing TLS-inspired capabilities to add after the current feature sequence:
 
 - Transit-shaped model fitting:
-  - Add an optional TLS-style search mode using limb-darkened transit templates instead of only BLS boxes/local dip boxes.
+  - Lightweight TLS-style search mode is implemented as a transit-shape search option.
+  - A full TLS-style search using limb-darkened transit templates is still pending.
   - Show model overlays in time view and phase-folded view.
   - Support trapezoid/grazing-transit templates for V-shaped or box-like events.
 - Stellar parameter priors:
@@ -301,7 +323,8 @@ This project is intended to become a more user-friendly version of Transit Least
   - Expose top candidate periods, harmonics, aliases, and the median-smoothed vs raw power spectrum.
   - Flag edge-effect or phase-wrapping artifacts where relevant.
 - Performance/user feedback:
-  - Add progress reporting for long searches.
+  - Per-file progress bars are implemented for client-side batch processing.
+  - Backend/search-stage progress streaming is still pending.
   - Add a fast preview mode before full-resolution search.
   - Consider installing `transitleastsquares` as an optional backend dependency once the UI has a stable search workflow.
 
@@ -319,7 +342,7 @@ Current feature sequence status:
 8. Ephemeris audit view: done.
 9. Data cleaning panel: next.
 10. Sensitivity/no-planet upper-limit message: pending.
-11. TLS-style search mode: pending.
+11. Lightweight TLS-style search mode: done.
 12. Reset/home view button: pending.
 
 Additional useful future features after step 12:
