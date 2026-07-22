@@ -1,4 +1,3 @@
-**/CURRENT_STATE.md
-**/REPO_MAP.md
-**/.gitignore
+/docs
+/.gitignore
 .venv/
