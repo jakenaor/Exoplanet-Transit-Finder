@@ -75,7 +75,7 @@ let lastPointer = null;
 let selectedTransitIndex = null;
 let editBoxesEnabled = false;
 let transitBoxCache = [];
-const chartPad = { left: 62, right: 22, top: 24, bottom: 48 };
+const chartPad = { left: 72, right: 48, top: 42, bottom: 66 };
 
 const fmt = (value, digits = 6) => {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return '-';
@@ -2920,6 +2920,66 @@ function drawNotice(message, width, height) {
   ctx.fillText(message, width / 2, height / 2);
 }
 
+function drawChartAxes(geo, viewport, options = {}) {
+  const { width, height, pad, innerW, innerH } = geo;
+  const {
+    xDigits = 4,
+    yDigits = 4,
+    xLabel = '',
+    yLabel = '',
+  } = options;
+  const xDivisions = Math.max(2, Math.min(6, Math.floor(innerW / 88)));
+  const yDivisions = Math.max(2, Math.min(5, Math.floor(innerH / 52)));
+  const plotBottom = pad.top + innerH;
+
+  ctx.strokeStyle = '#d6dde5';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#5f6874';
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i <= yDivisions; i++) {
+    const y = pad.top + (innerH * i / yDivisions);
+    const value = viewport.yMax - ((viewport.yMax - viewport.yMin) * i / yDivisions);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(fmt(value, yDigits), pad.left - 9, y);
+  }
+
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= xDivisions; i++) {
+    const x = pad.left + (innerW * i / xDivisions);
+    const value = viewport.xMin + ((viewport.xMax - viewport.xMin) * i / xDivisions);
+    ctx.beginPath();
+    ctx.moveTo(x, plotBottom);
+    ctx.lineTo(x, plotBottom + 5);
+    ctx.stroke();
+    ctx.textAlign = i === 0 ? 'left' : (i === xDivisions ? 'right' : 'center');
+    ctx.fillText(fmt(value, xDigits), x, plotBottom + 10);
+  }
+
+  ctx.fillStyle = '#202124';
+  ctx.font = '700 12px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  if (yLabel) {
+    ctx.fillText(yLabel, pad.left, Math.max(8, pad.top - 27));
+  }
+  ctx.textAlign = 'right';
+  if (xLabel) {
+    ctx.fillText(xLabel, width - pad.right, height - 23);
+  }
+}
+
+function clipToChartPlot(geo) {
+  ctx.beginPath();
+  ctx.rect(geo.pad.left, geo.pad.top, geo.innerW, geo.innerH);
+  ctx.clip();
+}
+
 function nearestPeriodogramPoint(points, period) {
   const target = Number(period);
   if (!Number.isFinite(target) || target <= 0) return null;
@@ -2989,10 +3049,25 @@ function drawPeriodogramMarker(geo, viewport, xScale, period, color, label, offs
   if (label) {
     ctx.fillStyle = color;
     ctx.font = '700 11px system-ui, sans-serif';
-    ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    const labelX = Math.min(geo.width - pad.right - 72, Math.max(pad.left + 4, x + 5));
-    ctx.fillText(label, labelX, pad.top + 34 + offset);
+    const labelWidth = ctx.measureText(label).width;
+    const plotLeft = pad.left + 4;
+    const plotRight = geo.width - pad.right - 4;
+    const fitsRight = x + 6 + labelWidth <= plotRight;
+    ctx.textAlign = fitsRight ? 'left' : 'right';
+    const labelX = fitsRight
+      ? Math.max(plotLeft, x + 6)
+      : Math.min(plotRight, x - 6);
+    const labelY = pad.top + 34 + offset;
+    ctx.fillStyle = 'rgba(251, 252, 253, 0.9)';
+    ctx.fillRect(
+      fitsRight ? labelX - 2 : labelX - labelWidth - 2,
+      labelY - 1,
+      labelWidth + 4,
+      14
+    );
+    ctx.fillStyle = color;
+    ctx.fillText(label, labelX, labelY);
   }
   ctx.restore();
 }
@@ -3026,33 +3101,12 @@ function drawPeriodogramChart(geo) {
   ctx.fillStyle = '#fbfcfd';
   ctx.fillRect(0, 0, width, height);
 
-  ctx.strokeStyle = '#d6dde5';
-  ctx.lineWidth = 1;
-  ctx.fillStyle = '#5f6874';
-  ctx.font = '12px system-ui, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.textBaseline = 'middle';
-  for (let i = 0; i <= 5; i++) {
-    const y = pad.top + (innerH * i / 5);
-    const value = yMax - ((yMax - yMin) * i / 5);
-    ctx.beginPath();
-    ctx.moveTo(pad.left, y);
-    ctx.lineTo(width - pad.right, y);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 3), pad.left - 8, y);
-  }
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  for (let i = 0; i <= 6; i++) {
-    const x = pad.left + (innerW * i / 6);
-    const value = xMin + ((xMax - xMin) * i / 6);
-    ctx.beginPath();
-    ctx.moveTo(x, pad.top + innerH);
-    ctx.lineTo(x, pad.top + innerH + 5);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
-  }
+  drawChartAxes(geo, viewport, {
+    xDigits: 4,
+    yDigits: 3,
+    xLabel: 'Period days',
+    yLabel: series.yLabel,
+  });
 
   if (yMin < 0 && yMax > 0) {
     const zeroY = yScale(0);
@@ -3093,9 +3147,14 @@ function drawPeriodogramChart(geo) {
     ctx.fillRect(xScale(point.period) - pointSize / 2, yScale(point.value) - pointSize / 2, pointSize, pointSize);
   });
 
+  const selectedPeriod = Number(currentResult.period);
   const candidates = (currentResult.period_candidates || [])
     .map(candidate => Number(candidate.period))
     .filter(period => Number.isFinite(period) && period > 0)
+    .filter(period => (
+      !Number.isFinite(selectedPeriod)
+      || Math.abs(period - selectedPeriod) / Math.max(period, selectedPeriod, 1e-9) >= 0.001
+    ))
     .filter((period, index, periods) => periods.findIndex(other => Math.abs(other - period) / Math.max(period, 1e-9) < 0.001) === index)
     .slice(0, 6);
   candidates.forEach((period, index) => {
@@ -3121,20 +3180,22 @@ function drawPeriodogramChart(geo) {
       period,
       index === 0 ? '#0f766e' : '#b45309',
       index < 3 ? `${fmt(period, 4)} d` : '',
-      index * 13,
+      (index + 1) * 15,
       true
     );
   });
-  drawPeriodogramMarker(geo, viewport, xScale, currentResult.period, '#202124', 'Selected', 0, false);
+  drawPeriodogramMarker(
+    geo,
+    viewport,
+    xScale,
+    selectedPeriod,
+    '#202124',
+    Number.isFinite(selectedPeriod) ? `Selected ${fmt(selectedPeriod, 4)} d` : 'Selected',
+    0,
+    false
+  );
   drawPeriodogramLegend(geo, series);
 
-  ctx.fillStyle = '#202124';
-  ctx.font = '700 12px system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText(series.yLabel, 14, 16);
-  ctx.textAlign = 'right';
-  ctx.fillText('Period days', width - 22, height - 22);
   updateCanvasCursor(lastPointer);
 }
 
@@ -3311,34 +3372,12 @@ function drawPhaseChart(geo) {
     }
   }
 
-  ctx.strokeStyle = '#d6dde5';
-  ctx.lineWidth = 1;
-  ctx.fillStyle = '#5f6874';
-  ctx.font = '12px system-ui, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.textBaseline = 'middle';
-
-  for (let i = 0; i <= 5; i++) {
-    const y = pad.top + (innerH * i / 5);
-    const value = yMax - ((yMax - yMin) * i / 5);
-    ctx.beginPath();
-    ctx.moveTo(pad.left, y);
-    ctx.lineTo(width - pad.right, y);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 4), pad.left - 8, y);
-  }
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  for (let i = 0; i <= 6; i++) {
-    const x = pad.left + (innerW * i / 6);
-    const value = xMin + ((xMax - xMin) * i / 6);
-    ctx.beginPath();
-    ctx.moveTo(x, pad.top + innerH);
-    ctx.lineTo(x, pad.top + innerH + 5);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
-  }
+  drawChartAxes(geo, viewport, {
+    xDigits: 4,
+    yDigits: 4,
+    xLabel: 'Phase days from transit center',
+    yLabel: 'Folded flux',
+  });
 
   const zeroX = xScale(0);
   if (zeroX >= pad.left && zeroX <= width - pad.right) {
@@ -3413,13 +3452,6 @@ function drawPhaseChart(geo) {
   ctx.stroke();
   ctx.restore();
 
-  ctx.fillStyle = '#202124';
-  ctx.font = '700 12px system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText('Folded flux', 14, 16);
-  ctx.textAlign = 'right';
-  ctx.fillText('Phase days from transit center', width - 22, height - 22);
   updateCanvasCursor(lastPointer);
 }
 
@@ -3586,6 +3618,8 @@ function drawChart() {
     drawAuditPredictions(geo, viewport, auditMetrics, xScale);
   }
 
+  ctx.save();
+  clipToChartPlot(geo);
   currentResult.transits.forEach((t, index) => {
     if (t.end < xMin || t.start > xMax) return;
     const range = transitFluxRange(t, flux);
@@ -3630,36 +3664,17 @@ function drawChart() {
       ctx.fillText(`T${index + 1}`, Math.max(pad.left + 4, x1 + 5), Math.max(pad.top + 4, boxTop + 5));
     }
   });
+  ctx.restore();
 
-  ctx.strokeStyle = '#d6dde5';
-  ctx.lineWidth = 1;
-  ctx.fillStyle = '#5f6874';
-  ctx.font = '12px system-ui, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.textBaseline = 'middle';
+  drawChartAxes(geo, viewport, {
+    xDigits: 4,
+    yDigits: 4,
+    xLabel: 'Julian days',
+    yLabel: currentView === 'raw' ? 'Flux' : (currentView === 'audit' ? 'Ephemeris audit' : 'Smoothed flux'),
+  });
 
-  for (let i = 0; i <= 5; i++) {
-    const y = pad.top + (innerH * i / 5);
-    const value = yMax - ((yMax - yMin) * i / 5);
-    ctx.beginPath();
-    ctx.moveTo(pad.left, y);
-    ctx.lineTo(width - pad.right, y);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 4), pad.left - 8, y);
-  }
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  for (let i = 0; i <= 6; i++) {
-    const x = pad.left + (innerW * i / 6);
-    const value = xMin + ((xMax - xMin) * i / 6);
-    ctx.beginPath();
-    ctx.moveTo(x, pad.top + innerH);
-    ctx.lineTo(x, pad.top + innerH + 5);
-    ctx.stroke();
-    ctx.fillText(fmt(value, 4), x, pad.top + innerH + 10);
-  }
-
+  ctx.save();
+  clipToChartPlot(geo);
   if (currentView !== 'raw') {
     ctx.strokeStyle = 'rgba(15, 118, 110, 0.16)';
     ctx.lineWidth = 1;
@@ -3719,19 +3734,13 @@ function drawChart() {
     }
     if (hasModelPoint) ctx.stroke();
   }
+  ctx.restore();
 
   if (currentView === 'audit') {
     drawAuditResiduals(geo, viewport, auditMetrics, xScale);
     drawAuditLegend(geo, auditMetrics);
   }
 
-  ctx.fillStyle = '#202124';
-  ctx.font = '700 12px system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText(currentView === 'raw' ? 'Flux' : (currentView === 'audit' ? 'Ephemeris audit' : 'Smoothed flux'), 14, 16);
-  ctx.textAlign = 'right';
-  ctx.fillText('Julian days', width - 22, height - 22);
   updateCanvasCursor(lastPointer);
 }
 
