@@ -282,9 +282,28 @@ button:disabled {
   opacity: .52;
 }
 
-#analyzeButton {
+.analysis-actions {
+  display: grid;
+  gap: 8px;
+}
+
+#analyzeButton,
+#cancelAnalysisButton {
   width: 100%;
   box-shadow: var(--shadow-soft);
+}
+
+.cancel-analysis-button {
+  border-color: #d4a2a2;
+  background: #fff;
+  color: var(--danger);
+}
+
+.cancel-analysis-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: #fff5f5;
+  color: var(--danger);
+  box-shadow: 0 5px 14px rgba(180, 35, 24, .12);
 }
 
 .view-controls {
@@ -478,6 +497,30 @@ button:disabled {
   gap: 10px;
 }
 
+.tls-options {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #cfe0df;
+  border-radius: var(--radius);
+  background: #f4faf8;
+}
+
+.tls-options[hidden] {
+  display: none;
+}
+
+.tls-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.control-help {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .control-row {
   display: grid;
   gap: 5px;
@@ -571,6 +614,11 @@ input[type="range"] {
 .batch-picker-button.failed,
 .batch-option.failed {
   border-left-color: var(--danger);
+}
+
+.batch-picker-button.cancelled,
+.batch-option.cancelled {
+  border-left-color: #9aa6b2;
 }
 
 .batch-picker-button.inconclusive,
@@ -929,8 +977,17 @@ th {
   animation: none;
 }
 
+.progress-item.cancelled .progress-fill {
+  background: #9aa6b2;
+  animation: none;
+}
+
 .progress-item.failed .progress-header span:last-child {
   color: var(--danger);
+}
+
+.progress-item.cancelled .progress-header span:last-child {
+  color: var(--muted);
 }
 
 @keyframes progress-sweep {
@@ -1079,5 +1136,9 @@ th {
 
   .workspace {
     min-height: 650px;
+  }
+
+  .tls-grid {
+    grid-template-columns: 1fr;
   }
 }

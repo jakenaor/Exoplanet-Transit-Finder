@@ -20,8 +20,10 @@ The active app files are:
 
 ```text
 Exoplanet data parsing tool/main.py
+Exoplanet data parsing tool/analysis_jobs.py
 Exoplanet data parsing tool/analysis.py
 Exoplanet data parsing tool/parsers.py
+Exoplanet data parsing tool/tls_search.py
 Exoplanet data parsing tool/static/index.html
 Exoplanet data parsing tool/static/styles.css
 Exoplanet data parsing tool/static/app.js
@@ -48,17 +50,22 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 
 - Localhost app served by `python3 main.py` using Python stdlib HTTP serving.
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
-- `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, and `astropy>=6,<7` so Astropy BLS imports correctly on the current Python 3.9 setup.
+- `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
+- Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.
+- Run Status reports queued/running state and honest elapsed time instead of a synthetic completion percentage.
+- The visible Cancel analysis control terminates the active analysis process and its TLS worker-process group without stopping the web server.
 - Sidebar width expands from selected/progress filenames, and progress filenames wrap to two lines before truncating.
 - Batch Results uses a custom styled picker with two-line filenames and compact verdict/transit badges instead of the native OS dropdown.
 - Batch Results mini-previews include the per-file Planet Check confidence score as an `n/100` badge.
 - Split app structure:
-  - `main.py` handles HTTP routes, static assets, and `/analyze`.
+  - `main.py` handles HTTP routes, static assets, the compatibility `/analyze` route, and `/analysis-jobs` lifecycle routes.
+  - `analysis_jobs.py` queues analyses in isolated processes, retains completed results, and provides process-group cancellation.
   - `parsers.py` handles CSV and FITS ingestion.
-  - `analysis.py` handles cleaning, detection, BLS search, diagnostics, and plot payloads.
+  - `analysis.py` handles cleaning, local detection, search selection, diagnostics, and plot payloads.
+  - `tls_search.py` wraps the maintained Transit Least Squares engine and converts its models/statistics into compact JSON-safe payloads.
   - `static/index.html`, `static/styles.css`, and `static/app.js` hold the frontend.
 - CSV upload with case-insensitive `Time`/`Flux` parsing.
 - CSV upload size limit of `80 MB`.
@@ -67,7 +74,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - FITS parser support for table HDUs with common time/flux column names.
 - FITS `QUALITY == 0` filtering when a recognized quality column is present.
 - Batch upload support for up to `100` files.
-- Sequential batch processing through the existing `/analyze` endpoint.
+- Sequential batch processing through cancellable `/analysis-jobs` background jobs.
 - Batch Results dropdown for switching between processed filenames.
 - Batch dropdown labels include the current planet-candidate verdict for each successful file.
 - Failed batch items are kept visible in the dropdown but disabled.
@@ -83,12 +90,21 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Per-observing-segment median normalization for gapped/multi-zone light curves.
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
-- Binned-BLS fallback period estimate when the full BLS path is unavailable or fails.
+- Binned-BLS fallback period estimate when the full BLS path is unavailable or fails at runtime.
+- Physical Transit Least Squares using `transitleastsquares` 1.32:
+  - Limb-darkened, grazing, and box comparison templates.
+  - Ingress/egress-aware fitting over the unbinned phase-folded light curve.
+  - Physically constrained period/duration grids.
+  - Optional stellar mass/radius and quadratic limb-darkening priors.
+  - Configurable period oversampling, duration-grid step, minimum transit count, minimum depth, and CPU workers.
+  - TLS SDE, raw SDE, white-noise FAP, combined SNR, period uncertainty, odd/even mismatch, per-transit statistics, and model payloads.
+  - TLS-derived transit boxes instead of relying on the local prominence detector for shallow signals.
+  - Physical model overlays in time-series and phase-folded views.
 - Period displayed in Julian days.
 - Period search controls:
   - Minimum period.
   - Maximum period.
-  - BLS + regularity and lightweight TLS-style search modes.
+  - BLS + regularity and physical TLS search modes.
   - Period candidate list with power/SDE values.
   - Period search bounds included in JSON export.
 - Chi-squared p-value estimate for the fitted transit model, displayed as a percentage.
@@ -120,7 +136,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Depth fraction, percent, and ppm.
   - Radius-ratio estimate using `Rp/Rs = sqrt(depth fraction)`.
   - Flux near a positive baseline is treated as fractional flux; residual ppm-style flux is treated as ppm directly.
-- False-positive and TLS-style diagnostics:
+- False-positive and TLS diagnostics:
   - Warnings panel for low-SNR, few-transit, no-period, provisional-period, weak-significance, odd/even mismatch, inconsistent-depth, large-radius-ratio, and sparse-sampling cases.
   - Depth SNR, period SDE, and reduced chi-squared metrics in the Analysis panel.
   - Warning and diagnostic fields included in summary JSON exports.
@@ -154,8 +170,11 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Use observed-window ephemeris coverage for Planet Check and audit logic. Predicted transits that fall entirely inside data gaps are not counted against a candidate.
 - Treat broad automated period-search results as candidate rankings, not ground truth. The Kepler sample previously showed a strong alias around `294` days while a constrained `380-390` day search returned about `386.16` days.
 - Use phase-folding as the primary validation view for repeated transit structure.
-- The TLS-style search mode is a lightweight transit-shape search option, not a full physical TLS implementation with limb darkening or stellar-prior constraints.
-- Batch upload is implemented client-side by sending one file at a time to the existing `/analyze` endpoint.
+- TLS mode uses the maintained reference implementation from Hippke & Heller rather than the earlier lightweight approximation. The app adds segment-aware normalization, observed-window ephemeris checks, compact model payloads, and conservative candidate gating around the reference result.
+- TLS white-noise FAP values can be optimistic for correlated/red noise and are never treated as planet confirmation.
+- Batch upload is implemented client-side by submitting and polling one background analysis job at a time.
+- The synchronous `/analyze` endpoint remains available for compatibility, while the app UI uses `/analysis-jobs` so TLS computation never holds an upload socket open.
+- Client socket disconnects during static or JSON response writes are logged once and do not trigger a second write to the already-closed socket.
 - Manual box edits are frontend-local. They update the displayed table and metrics but do not round-trip to the backend.
 - Detection controls require clicking `Analyze files` again. They are not live-updated while dragging sliders.
 - Chi-squared p-value is an approximate model-vs-flat significance metric, not a literal probability that a planet is real.
@@ -184,6 +203,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Ephemeris audit view made the irregular false-positive failure mode visible instead of only numeric.
 - Observed-window ephemeris coverage fixed a WASP-19-style case where the correct period was penalized as only `6%` covered because expected transits inside long observing gaps were being counted.
 - Batch Results score badges make it easier to compare many uploaded files without opening each Planet Check panel.
+- Isolated background jobs fixed the long-TLS `BrokenPipeError` failure mode: analysis continues independently of short HTTP requests, results are polled, and cancellation leaves the server responsive.
 
 ## Things That Did Not Work Or Needed Correction
 
@@ -254,6 +274,18 @@ Observed verification results from recent work:
 - 2026-07-22 p-value display rollback verification:
   - `/analyze` no longer emits `p_value_log10`.
   - Frontend Analysis and PDF table use the older Chi-sq p-value percentage display.
+- 2026-07-22 physical TLS integration verification:
+  - Reference engine: Transit Least Squares 1.32 (5 Apr 2024).
+  - A 1200-point injected 2.4-day limb-darkened transit recovered about `2.4009` days, TLS SDE about `7.36`, FAP about `0.0050`, combined SNR about `37.6`, and a `strong_candidate` verdict.
+  - A seeded pure-noise run produced TLS SDE about `3.33` and was capped at `no_planet_like_signal` rather than becoming a candidate.
+  - The live `/analyze` multipart route returned a TLS period about `2.4009` days, SDE about `9.40`, FAP about `8.0e-5`, five TLS-derived boxes, and a physical model payload.
+  - The reproducible 18-case shallow-transit benchmark in `tests/benchmark_searches.py` recovered the injected period in `17/18` TLS runs and `18/18` BLS runs at the chosen 1% period tolerance. TLS produced credible candidate verdicts in `17/18`; the existing BLS/local-box path produced `0/18` at these shallow depths. This small benchmark does not establish universal superiority.
+- 2026-07-22 background-job/BrokenPipe fix verification:
+  - The `6878`-row HD 209458 file at `/Users/jakenaor/Desktop/Extrasolar Research Stuff/datasets/hd209458_time_flux.csv` spans about `733.98` days; blank period bounds create `89,518` TLS period trials at oversampling `3`.
+  - `POST /analysis-jobs` accepted the upload with HTTP `202` in under a second, and status remained readable through short `GET /analysis-jobs/{id}` polls.
+  - A bounded `3-4` day, oversampling `1` job completed in about `20.76` seconds and recovered `3.525006` days, TLS SDE about `26.84`, FAP `8.0032e-5`, and combined SNR about `60.67`.
+  - A separate broad TLS job was cancelled in about `1.09` seconds; its worker stopped and the app still returned HTTP `200` for the index page.
+  - The regression suite now covers spawned-job completion, running-job cancellation, disconnect-safe JSON writes, job-route parsing, TLS recovery/noise gating, and BLS fallback.
 
 Commands used for basic checks:
 
@@ -279,22 +311,22 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 - The Planet Check verdict is heuristic and should be treated as a candidate/no-detection triage layer, not confirmation or publication-grade validation.
 - Top period candidates are exposed, but harmonics/aliases are not yet analyzed deeply.
 - Broad automated period search can still prefer aliases. Use period min/max controls when a target period range is known.
-- Batch processing is sequential and client-driven. Very large batches can take a while and do not yet have cancellation or backend progress streaming.
+- Batch processing is sequential and client-driven. It is cancellable and shows backend state/elapsed time, but does not yet expose exact period-grid completion percentages.
 - FITS support handles table HDUs with recognizable time/flux columns; it does not analyze FITS image cubes or arbitrary instrument-specific products yet.
 - The data cleaning report/panel is still pending.
-- There is no real test suite yet for the analysis functions.
+- The automated regression suite covers job completion/cancellation, disconnect handling, TLS option parsing, limb-darkening validation, physical TLS recovery, pure-noise rejection, JSON serialization, and BLS runtime fallback. Broader real-dataset coverage is still needed.
 
 ## TLS Parity Roadmap
 
-This project is intended to become a more user-friendly version of Transit Least Squares (TLS). Missing TLS-inspired capabilities to add after the current feature sequence:
+The project now includes the reference physical Transit Least Squares engine. Primary references are the [TLS paper](https://doi.org/10.1051/0004-6361/201834672), [official Python interface](https://transitleastsquares.readthedocs.io/en/latest/Python%20interface.html), and [reference source](https://github.com/hippke/tls). Remaining extensions are:
 
 - Transit-shaped model fitting:
-  - Lightweight TLS-style search mode is implemented as a transit-shape search option.
-  - A full TLS-style search using limb-darkened transit templates is still pending.
-  - Show model overlays in time view and phase-folded view.
-  - Support trapezoid/grazing-transit templates for V-shaped or box-like events.
+  - Full limb-darkened TLS, grazing, and box templates are implemented.
+  - Model overlays in time and phase-folded views are implemented.
+  - A separately parameterized trapezoid template beyond the reference grazing template remains optional future work.
 - Stellar parameter priors:
-  - Let users enter or import stellar radius, stellar mass/density, and limb-darkening coefficients.
+  - Users can enter stellar radius, stellar mass, and quadratic limb-darkening coefficients.
+  - Catalog import and direct stellar-density priors remain pending.
   - Use stellar priors to constrain physically plausible period and duration grids.
   - Surface missing/invalid stellar-prior warnings clearly.
 - Search controls:
@@ -303,13 +335,9 @@ This project is intended to become a more user-friendly version of Transit Least
   - Period search bounds are exported in JSON; full period/duration grid visualization is still pending.
   - Add quick-look binning/resampling controls for large or short-cadence datasets.
 - Detection statistics:
-  - Show SDE and raw SDE.
-  - Show false alarm probability estimates and explain white-noise vs red-noise caveats.
-  - Show chi-squared and reduced chi-squared for the best model.
-  - Show period uncertainty, epoch/T0, duration, depth, mean depth uncertainty, SNR, and per-transit SNR.
-  - Show odd/even transit depth mismatch as an eclipsing-binary warning.
-  - Show transit count, distinct transit count, empty transit count, per-transit point counts, and before/in/after-transit phase-bin counts.
-  - Show individual transit depths and depth uncertainties.
+  - TLS SDE, raw SDE, FAP, period uncertainty, combined SNR, odd/even mismatch, transit counts, and per-transit values are now emitted and exported.
+  - Surface more of the per-transit TLS detail directly in the UI rather than only in JSON.
+  - Add red-noise-aware significance estimates beyond the reference white-noise FAP.
 - Transit masks and iterative searches:
   - Generate an in-transit mask for the best candidate.
   - Let users hide, highlight, or export in-transit/out-of-transit points.
@@ -319,14 +347,14 @@ This project is intended to become a more user-friendly version of Transit Least
   - Clean NaN, None, infinite, masked, and invalid flux/error values with a user-visible report.
   - Preserve a reversible cleaning log for exports.
 - Power-spectrum inspection:
-  - Add a periodogram/SDE-ogram view.
-  - Expose top candidate periods, harmonics, aliases, and the median-smoothed vs raw power spectrum.
+  - Periodogram/SDE-ogram view and top candidate periods are implemented for BLS and TLS.
+  - Expose harmonic/alias groups and a UI toggle between TLS median-smoothed and raw SDE spectra.
   - Flag edge-effect or phase-wrapping artifacts where relevant.
 - Performance/user feedback:
-  - Per-file progress bars are implemented for client-side batch processing.
-  - Backend/search-stage progress streaming is still pending.
+  - Per-file queued/running state, elapsed time, and explicit cancellation are implemented with isolated worker processes.
+  - Exact backend search-stage/period-grid progress streaming is still pending.
   - Add a fast preview mode before full-resolution search.
-  - Consider installing `transitleastsquares` as an optional backend dependency once the UI has a stable search workflow.
+  - Cancellable worker-process execution for long TLS searches is implemented.
 
 ## Planned Feature Order
 
@@ -342,7 +370,7 @@ Current feature sequence status:
 8. Ephemeris audit view: done.
 9. Data cleaning panel: next.
 10. Sensitivity/no-planet upper-limit message: pending.
-11. Lightweight TLS-style search mode: done.
+11. Physical TLS search mode: done.
 12. Reset/home view button: pending.
 
 Additional useful future features after step 12:
@@ -350,14 +378,14 @@ Additional useful future features after step 12:
 - Transit prediction from period and epoch.
 - Better candidate-period ranking with explicit harmonic/alias grouping.
 - Periodogram alias grouping and raw vs smoothed power comparison.
-- TLS-style transit model overlay on phase-folded and time-series views.
+- Catalog-backed stellar priors and additional physical-template controls.
 - User-entered stellar priors and limb-darkening coefficients.
 - SDE, FAP, SNR, period uncertainty, reduced chi-squared, and odd/even mismatch statistics.
 - Transit masks, signal cleansing, and iterative multi-planet search.
 - Optional uncertainty-column support.
 - Search progress reporting and quick-look binning/resampling.
 - Save/load edited sessions.
-- A real test suite for analysis functions.
+- Expand the regression suite to real mission light curves and additional failure modes.
 
 ## Current Git State Expectations
 

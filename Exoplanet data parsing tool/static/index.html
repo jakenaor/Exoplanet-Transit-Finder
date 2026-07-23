@@ -21,7 +21,10 @@
         </span>
       </label>
       <input id="fileInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits" multiple>
-      <button id="analyzeButton" disabled>Analyze files</button>
+      <div class="analysis-actions">
+        <button id="analyzeButton" disabled>Analyze files</button>
+        <button id="cancelAnalysisButton" class="cancel-analysis-button" type="button" hidden>Cancel analysis</button>
+      </div>
 
       <details id="runStatusSection" class="accordion-section run-status-section" open>
         <summary><h2>Run Status</h2></summary>
@@ -78,8 +81,57 @@
             </label>
             <select id="searchModeInput">
               <option value="bls">BLS + regularity</option>
-              <option value="tls">TLS-style</option>
+              <option value="tls">Physical TLS</option>
             </select>
+          </div>
+          <div id="tlsOptions" class="tls-options" hidden>
+            <p class="control-help">TLS fits limb-darkened transit shapes. Stellar priors narrow its physical duration grid; leave them blank to use the reference defaults. Strictness and local depth/duration controls are disabled because TLS replaces that detector.</p>
+            <div class="control-row">
+              <label class="control-label" for="tlsTemplateInput"><span>Transit template</span></label>
+              <select id="tlsTemplateInput">
+                <option value="default">Limb-darkened</option>
+                <option value="grazing">Grazing / V-shaped</option>
+                <option value="box">Box comparison</option>
+              </select>
+            </div>
+            <div class="tls-grid">
+              <div class="control-row">
+                <label class="control-label" for="stellarRadiusInput"><span>Star radius R☉</span></label>
+                <input id="stellarRadiusInput" type="number" min="0.1" max="100" step="0.01" placeholder="default 1.0">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="stellarMassInput"><span>Star mass M☉</span></label>
+                <input id="stellarMassInput" type="number" min="0.01" max="100" step="0.01" placeholder="default 1.0">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="limbDarkeningU1Input"><span>Limb darkening u1</span></label>
+                <input id="limbDarkeningU1Input" type="number" min="-1" max="2" step="0.001" placeholder="default 0.4804">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="limbDarkeningU2Input"><span>Limb darkening u2</span></label>
+                <input id="limbDarkeningU2Input" type="number" min="-1" max="2" step="0.001" placeholder="default 0.1867">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="tlsOversamplingInput"><span>Period oversampling</span></label>
+                <input id="tlsOversamplingInput" type="number" min="1" max="9" step="1" value="3">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="tlsMinTransitsInput"><span>Minimum transits</span></label>
+                <input id="tlsMinTransitsInput" type="number" min="2" max="10" step="1" value="3">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="tlsMinDepthPpmInput"><span>Minimum depth ppm</span></label>
+                <input id="tlsMinDepthPpmInput" type="number" min="0.1" max="500000" step="0.1" value="10">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="tlsThreadsInput"><span>CPU workers</span></label>
+                <input id="tlsThreadsInput" type="number" min="1" max="8" step="1" value="1">
+              </div>
+              <div class="control-row">
+                <label class="control-label" for="tlsDurationGridStepInput"><span>Duration grid step</span></label>
+                <input id="tlsDurationGridStepInput" type="number" min="1.01" max="2" step="0.01" value="1.1">
+              </div>
+            </div>
           </div>
           <div class="control-row">
             <label class="control-label" for="minDepthInput">
@@ -139,10 +191,12 @@
           <div class="metric"><span>Data points</span><span>-</span></div>
           <div class="metric"><span>Transits</span><span>-</span></div>
           <div class="metric"><span>Orbital period</span><span>-</span></div>
+          <div class="metric"><span>Period uncertainty</span><span>-</span></div>
           <div class="metric"><span>Median depth</span><span>-</span></div>
           <div class="metric"><span>Radius ratio</span><span>-</span></div>
           <div class="metric"><span>Depth SNR</span><span>-</span></div>
           <div class="metric"><span>Period SDE</span><span>-</span></div>
+          <div class="metric"><span>TLS false-alarm probability</span><span>-</span></div>
           <div class="metric"><span>Ephemeris fit</span><span>-</span></div>
           <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
           <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>

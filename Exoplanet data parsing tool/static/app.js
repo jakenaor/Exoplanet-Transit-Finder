@@ -1,6 +1,7 @@
 const fileInput = document.getElementById('fileInput');
 const dropzone = document.getElementById('dropzone');
 const analyzeButton = document.getElementById('analyzeButton');
+const cancelAnalysisButton = document.getElementById('cancelAnalysisButton');
 const statusEl = document.getElementById('status');
 const analysisProgressEl = document.getElementById('analysisProgress');
 const runStatusSection = document.getElementById('runStatusSection');
@@ -21,6 +22,17 @@ const strictnessValue = document.getElementById('strictnessValue');
 const smoothingInput = document.getElementById('smoothingInput');
 const smoothingValue = document.getElementById('smoothingValue');
 const searchModeInput = document.getElementById('searchModeInput');
+const tlsOptionsEl = document.getElementById('tlsOptions');
+const tlsTemplateInput = document.getElementById('tlsTemplateInput');
+const stellarRadiusInput = document.getElementById('stellarRadiusInput');
+const stellarMassInput = document.getElementById('stellarMassInput');
+const limbDarkeningU1Input = document.getElementById('limbDarkeningU1Input');
+const limbDarkeningU2Input = document.getElementById('limbDarkeningU2Input');
+const tlsOversamplingInput = document.getElementById('tlsOversamplingInput');
+const tlsMinTransitsInput = document.getElementById('tlsMinTransitsInput');
+const tlsMinDepthPpmInput = document.getElementById('tlsMinDepthPpmInput');
+const tlsThreadsInput = document.getElementById('tlsThreadsInput');
+const tlsDurationGridStepInput = document.getElementById('tlsDurationGridStepInput');
 const minDepthInput = document.getElementById('minDepthInput');
 const minDurationInput = document.getElementById('minDurationInput');
 const maxDurationInput = document.getElementById('maxDurationInput');
@@ -41,6 +53,7 @@ const batchPickerMeta = document.getElementById('batchPickerMeta');
 const batchPickerList = document.getElementById('batchPickerList');
 const appShell = document.querySelector('main');
 const MAX_BATCH_FILES = 100;
+const JOB_POLL_INTERVAL_MS = 750;
 const DEFAULT_SIDEBAR_WIDTH = 390;
 const MIN_SIDEBAR_WIDTH = 320;
 const MAX_SIDEBAR_WIDTH = 560;
@@ -49,6 +62,8 @@ let selectedFile = null;
 let batchResults = [];
 let currentBatchIndex = -1;
 let batchInProgress = false;
+let activeAnalysisJobId = null;
+let analysisCancelRequested = false;
 let progressTimer = null;
 let progressValues = [];
 let currentResult = null;
@@ -393,22 +408,25 @@ function setFileProgress(index, value, label, state = 'active') {
 
 function beginFileProgress(index) {
   stopProgressTimer();
-  const ceiling = 92;
   showRunStatus();
-  setFileProgress(index, 0, '0%', 'active');
-  progressTimer = window.setInterval(() => {
-    const currentValue = progressValues[index] || 0;
-    const remaining = ceiling - currentValue;
-    if (remaining <= 0.1) return;
-    const step = Math.max(0.15, remaining * 0.08);
-    const nextValue = Math.min(ceiling, currentValue + step);
-    setFileProgress(index, nextValue, `${Math.round(nextValue)}%`, 'active');
-  }, 240);
+  setFileProgress(index, 8, 'Uploading', 'active');
 }
 
-function finishFileProgress(index, succeeded = true) {
+function setIndeterminateFileProgress(index, label) {
+  if (!analysisProgressEl) return;
+  showRunStatus();
+  const row = analysisProgressEl.querySelector(`[data-progress-index="${index}"]`);
+  if (!row) return;
+  row.className = 'progress-item active';
+  row.querySelector('[data-progress-percent]').textContent = label;
+  row.querySelector('[role="progressbar"]').removeAttribute('aria-valuenow');
+  row.querySelector('.progress-fill').style.width = '100%';
+}
+
+function finishFileProgress(index, outcome = 'complete') {
   stopProgressTimer();
-  setFileProgress(index, 100, succeeded ? 'Complete' : 'Failed', succeeded ? 'complete' : 'failed');
+  const labels = { complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' };
+  setFileProgress(index, outcome === 'cancelled' ? 0 : 100, labels[outcome] || 'Failed', outcome);
 }
 
 function batchResultDetail(item) {
@@ -422,10 +440,11 @@ function batchResultDetail(item) {
     };
   }
   if (item.error) {
+    const cancelled = item.error === 'Cancelled';
     return {
-      label: 'Failed',
+      label: cancelled ? 'Cancelled' : 'Failed',
       meta: item.error,
-      status: 'failed',
+      status: cancelled ? 'cancelled' : 'failed',
       score: null,
       transits: null,
     };
@@ -517,7 +536,7 @@ function renderBatchSelect() {
     const selected = index === currentBatchIndex ? ' selected' : '';
     const disabled = item.error ? ' disabled' : '';
     const detail = item.error
-      ? 'failed'
+      ? (item.error === 'Cancelled' ? 'cancelled' : 'failed')
       : `${assessmentForResult(item.result).shortLabel}; ${item.result.transits.length} transits`;
     return `<option value="${index}"${selected}${disabled}>${index + 1}. ${escapeHtml(item.file.name)} (${detail})</option>`;
   }).join('');
@@ -558,6 +577,16 @@ function detectionOptions() {
     strictness: Number(strictnessInput.value),
     smoothing: Number(smoothingInput.value),
     searchMode: searchModeInput.value,
+    tlsTemplate: tlsTemplateInput.value,
+    stellarRadius: optionalNumber(stellarRadiusInput),
+    stellarMass: optionalNumber(stellarMassInput),
+    limbDarkeningU1: optionalNumber(limbDarkeningU1Input),
+    limbDarkeningU2: optionalNumber(limbDarkeningU2Input),
+    tlsOversampling: optionalNumber(tlsOversamplingInput),
+    tlsMinTransits: optionalNumber(tlsMinTransitsInput),
+    tlsMinDepthPpm: optionalNumber(tlsMinDepthPpmInput),
+    tlsThreads: optionalNumber(tlsThreadsInput),
+    tlsDurationGridStep: optionalNumber(tlsDurationGridStepInput),
     minDepth: optionalNumber(minDepthInput),
     minDuration: optionalNumber(minDurationInput),
     maxDuration: optionalNumber(maxDurationInput),
@@ -569,12 +598,27 @@ function detectionOptions() {
 function updateDetectionReadouts() {
   strictnessValue.value = `${Number(strictnessInput.value).toFixed(2)}x`;
   smoothingValue.value = `${Number(smoothingInput.value).toFixed(2)}x`;
+  const tlsMode = searchModeInput.value === 'tls';
+  tlsOptionsEl.hidden = !tlsMode;
+  [strictnessInput, minDepthInput, minDurationInput, maxDurationInput].forEach(input => {
+    input.disabled = tlsMode;
+  });
 }
 
 function resetDetectionControls() {
   strictnessInput.value = '1';
   smoothingInput.value = '1';
   searchModeInput.value = 'bls';
+  tlsTemplateInput.value = 'default';
+  stellarRadiusInput.value = '';
+  stellarMassInput.value = '';
+  limbDarkeningU1Input.value = '';
+  limbDarkeningU2Input.value = '';
+  tlsOversamplingInput.value = '3';
+  tlsMinTransitsInput.value = '3';
+  tlsMinDepthPpmInput.value = '10';
+  tlsThreadsInput.value = '1';
+  tlsDurationGridStepInput.value = '1.1';
   minDepthInput.value = '';
   minDurationInput.value = '';
   maxDurationInput.value = '';
@@ -631,10 +675,12 @@ function clearResultView() {
     <div class="metric"><span>Data points</span><span>-</span></div>
     <div class="metric"><span>Transits</span><span>-</span></div>
     <div class="metric"><span>Orbital period</span><span>-</span></div>
+    <div class="metric"><span>Period uncertainty</span><span>-</span></div>
     <div class="metric"><span>Median depth</span><span>-</span></div>
     <div class="metric"><span>Radius ratio</span><span>-</span></div>
     <div class="metric"><span>Depth SNR</span><span>-</span></div>
     <div class="metric"><span>Period SDE</span><span>-</span></div>
+    <div class="metric"><span>TLS false-alarm probability</span><span>-</span></div>
     <div class="metric"><span>Ephemeris fit</span><span>-</span></div>
     <div class="metric"><span>Chi-sq p-value</span><span>-</span></div>
     <div class="metric"><span>Reduced chi-sq</span><span>-</span></div>
@@ -665,6 +711,16 @@ function appendDetectionOptions(formData, options) {
   formData.append('strictness', options.strictness);
   formData.append('smoothing', options.smoothing);
   formData.append('searchMode', options.searchMode);
+  formData.append('tlsTemplate', options.tlsTemplate);
+  if (options.stellarRadius !== null) formData.append('stellarRadius', options.stellarRadius);
+  if (options.stellarMass !== null) formData.append('stellarMass', options.stellarMass);
+  if (options.limbDarkeningU1 !== null) formData.append('limbDarkeningU1', options.limbDarkeningU1);
+  if (options.limbDarkeningU2 !== null) formData.append('limbDarkeningU2', options.limbDarkeningU2);
+  if (options.tlsOversampling !== null) formData.append('tlsOversampling', options.tlsOversampling);
+  if (options.tlsMinTransits !== null) formData.append('tlsMinTransits', options.tlsMinTransits);
+  if (options.tlsMinDepthPpm !== null) formData.append('tlsMinDepthPpm', options.tlsMinDepthPpm);
+  if (options.tlsThreads !== null) formData.append('tlsThreads', options.tlsThreads);
+  if (options.tlsDurationGridStep !== null) formData.append('tlsDurationGridStep', options.tlsDurationGridStep);
   if (options.minDepth !== null) formData.append('minDepth', options.minDepth);
   if (options.minDuration !== null) formData.append('minDuration', options.minDuration);
   if (options.maxDuration !== null) formData.append('maxDuration', options.maxDuration);
@@ -672,18 +728,111 @@ function appendDetectionOptions(formData, options) {
   if (options.maxPeriod !== null) formData.append('maxPeriod', options.maxPeriod);
 }
 
-async function analyzeFile(file, options) {
+class AnalysisCancelledError extends Error {
+  constructor(message = 'Analysis cancelled.') {
+    super(message);
+    this.name = 'AnalysisCancelledError';
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise(resolve => window.setTimeout(resolve, milliseconds));
+}
+
+function formatJobElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const remainder = total % 60;
+  return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`;
+}
+
+function updateProgressFromJob(index, job, searchMode) {
+  if (job.status === 'queued') {
+    const position = Number(job.queue_position);
+    const label = Number.isFinite(position) ? `Queued #${position}` : 'Queued';
+    setFileProgress(index, 12, label, 'active');
+    return;
+  }
+  const engine = searchMode === 'tls' ? 'TLS' : 'Analysis';
+  if (job.status === 'cancelling') {
+    setIndeterminateFileProgress(index, 'Cancelling…');
+  } else if (job.status === 'running') {
+    setIndeterminateFileProgress(index, `${engine} running • ${formatJobElapsed(job.elapsed_seconds)}`);
+  }
+}
+
+async function readJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new Error(`Server returned an unreadable response (${response.status}).`);
+  }
+}
+
+async function requestJobCancellation(jobId) {
+  if (!jobId) return;
+  const response = await fetch(`/analysis-jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+  const payload = await readJsonResponse(response);
+  if (!response.ok) throw new Error(payload.error || 'Could not cancel the analysis.');
+}
+
+async function analyzeFile(file, options, onJobUpdate = () => {}) {
   const formData = new FormData();
   formData.append('datafile', file);
   appendDetectionOptions(formData, options);
-  const response = await fetch('/analyze', { method: 'POST', body: formData });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || 'Analysis failed.');
-  payload.source_file = file.name;
-  payload.original_period = payload.period;
-  payload.original_period_method = payload.period_method;
-  payload.boxesEdited = false;
-  return payload;
+  const response = await fetch('/analysis-jobs', { method: 'POST', body: formData });
+  const submittedJob = await readJsonResponse(response);
+  if (!response.ok) throw new Error(submittedJob.error || 'Analysis could not be started.');
+  if (!submittedJob.job_id) throw new Error('Server did not return an analysis job ID.');
+
+  const jobId = submittedJob.job_id;
+  activeAnalysisJobId = jobId;
+  cancelAnalysisButton.disabled = false;
+  onJobUpdate(submittedJob);
+
+  try {
+    if (analysisCancelRequested) {
+      await requestJobCancellation(jobId);
+      throw new AnalysisCancelledError();
+    }
+
+    let failedPolls = 0;
+    while (true) {
+      let jobResponse;
+      let job;
+      try {
+        jobResponse = await fetch(`/analysis-jobs/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
+        job = await readJsonResponse(jobResponse);
+        if (!jobResponse.ok) throw new Error(job.error || 'Could not read analysis status.');
+        failedPolls = 0;
+      } catch (error) {
+        failedPolls += 1;
+        if (failedPolls >= 5) throw error;
+        await wait(JOB_POLL_INTERVAL_MS);
+        continue;
+      }
+
+      onJobUpdate(job);
+      if (job.status === 'completed') {
+        const payload = job.result;
+        if (!payload) throw new Error('Completed analysis did not include a result.');
+        payload.source_file = file.name;
+        payload.original_period = payload.period;
+        payload.original_period_method = payload.period_method;
+        payload.boxesEdited = false;
+        return payload;
+      }
+      if (job.status === 'failed') throw new Error(job.error || 'Analysis failed.');
+      if (job.status === 'cancelled') throw new AnalysisCancelledError();
+      if (analysisCancelRequested && job.status !== 'cancelling') {
+        await requestJobCancellation(jobId);
+        throw new AnalysisCancelledError();
+      }
+      await wait(JOB_POLL_INTERVAL_MS);
+    }
+  } finally {
+    if (activeAnalysisJobId === jobId) activeAnalysisJobId = null;
+  }
 }
 
 function selectBatchResult(index) {
@@ -712,7 +861,22 @@ fileInput.addEventListener('change', () => setFiles(fileInput.files));
 [minDepthInput, minDurationInput, maxDurationInput, minPeriodInput, maxPeriodInput].forEach(input => {
   input.addEventListener('change', markDetectionControlsChanged);
 });
-searchModeInput.addEventListener('change', markDetectionControlsChanged);
+[
+  tlsTemplateInput,
+  stellarRadiusInput,
+  stellarMassInput,
+  limbDarkeningU1Input,
+  limbDarkeningU2Input,
+  tlsOversamplingInput,
+  tlsMinTransitsInput,
+  tlsMinDepthPpmInput,
+  tlsThreadsInput,
+  tlsDurationGridStepInput,
+].forEach(input => input.addEventListener('change', markDetectionControlsChanged));
+searchModeInput.addEventListener('change', () => {
+  updateDetectionReadouts();
+  markDetectionControlsChanged();
+});
 resetDetectionButton.addEventListener('click', () => {
   resetDetectionControls();
   markDetectionControlsChanged();
@@ -740,6 +904,19 @@ dropzone.addEventListener('drop', event => {
   }
 });
 
+cancelAnalysisButton.addEventListener('click', async () => {
+  if (!batchInProgress || analysisCancelRequested) return;
+  analysisCancelRequested = true;
+  cancelAnalysisButton.disabled = true;
+  setStatus('Cancelling the active analysis…');
+  if (!activeAnalysisJobId) return;
+  try {
+    await requestJobCancellation(activeAnalysisJobId);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+});
+
 analyzeButton.addEventListener('click', async () => {
   if (!selectedFiles.length) return;
   const filesToAnalyze = selectedFiles.slice(0, MAX_BATCH_FILES);
@@ -748,18 +925,27 @@ analyzeButton.addEventListener('click', async () => {
   renderProgressRows(filesToAnalyze);
   analyzeButton.disabled = true;
   batchInProgress = true;
+  analysisCancelRequested = false;
+  activeAnalysisJobId = null;
+  cancelAnalysisButton.hidden = false;
+  cancelAnalysisButton.disabled = false;
   batchResults = [];
   currentBatchIndex = -1;
   renderBatchSelect();
   clearResultView();
   try {
+    let batchWasCancelled = false;
     for (let index = 0; index < filesToAnalyze.length; index++) {
       const file = filesToAnalyze[index];
       let fileSucceeded = false;
       setStatus(`Analyzing ${index + 1}/${filesToAnalyze.length}: ${file.name}`);
       beginFileProgress(index);
       try {
-        const result = await analyzeFile(file, options);
+        const result = await analyzeFile(
+          file,
+          options,
+          job => updateProgressFromJob(index, job, options.searchMode),
+        );
         batchResults.push({ file, result, error: null });
         fileSucceeded = true;
         if (currentBatchIndex === -1) {
@@ -768,10 +954,25 @@ analyzeButton.addEventListener('click', async () => {
           renderBatchSelect();
         }
       } catch (error) {
+        if (error instanceof AnalysisCancelledError) {
+          batchResults.push({ file, result: null, error: 'Cancelled' });
+          finishFileProgress(index, 'cancelled');
+          for (let pendingIndex = index + 1; pendingIndex < filesToAnalyze.length; pendingIndex++) {
+            setFileProgress(pendingIndex, 0, 'Not started', 'cancelled');
+          }
+          batchWasCancelled = true;
+          break;
+        }
         batchResults.push({ file, result: null, error: error.message });
         renderBatchSelect();
       }
-      finishFileProgress(index, fileSucceeded);
+      finishFileProgress(index, fileSucceeded ? 'complete' : 'failed');
+    }
+
+    if (batchWasCancelled) {
+      renderBatchSelect();
+      setStatus('Analysis cancelled. The server is ready for another run.');
+      return;
     }
 
     const successCount = batchResults.filter(item => item.result).length;
@@ -798,6 +999,10 @@ analyzeButton.addEventListener('click', async () => {
   } finally {
     stopProgressTimer();
     batchInProgress = false;
+    activeAnalysisJobId = null;
+    analysisCancelRequested = false;
+    cancelAnalysisButton.hidden = true;
+    cancelAnalysisButton.disabled = false;
     analyzeButton.disabled = !selectedFiles.length;
     renderBatchSelect();
   }
@@ -850,6 +1055,15 @@ editBoxesButton.addEventListener('click', () => {
 
 function hasPhaseFold() {
   return Boolean(currentResult && currentResult.phase_folded && currentResult.phase_folded.phase.length);
+}
+
+function hasTransitModel() {
+  return Boolean(
+    currentResult
+    && currentResult.transit_model
+    && Array.isArray(currentResult.transit_model.time)
+    && currentResult.transit_model.time.length
+  );
 }
 
 function periodogramSeries() {
@@ -1235,6 +1449,7 @@ function currentAnalysisMetrics() {
     period: currentResult.period,
     periodMethod: currentResult.period_method,
     periodScatter: currentResult.period_scatter,
+    periodUncertainty: currentResult.period_uncertainty,
     periodMatchCount: currentResult.period_match_count,
     pValue: currentResult.p_value,
     deltaChiSquared: currentResult.delta_chi_squared,
@@ -1244,6 +1459,10 @@ function currentAnalysisMetrics() {
       : null,
     periodDuration: currentResult.period_duration,
     periodSde: currentResult.period_sde,
+    tlsSdeRaw: currentResult.tls_sde_raw,
+    tlsFap: currentResult.tls_fap,
+    tlsSnr: currentResult.tls_snr,
+    tlsOddEvenMismatchSigma: currentResult.tls?.odd_even_mismatch_sigma ?? null,
     medianDepthFraction: median(depthFractions),
     medianRadiusRatio: median(radiusRatios),
     detectionSnr: currentResult.detection_snr,
@@ -1254,6 +1473,13 @@ function currentAnalysisMetrics() {
   };
 
   if (currentResult.boxesEdited) {
+    const editedDepthCenter = median(rawDepths);
+    metrics.detectionSnr = (
+      editedDepthCenter !== null
+      && Number.isFinite(Number(currentResult.robust_noise))
+      && Number(currentResult.robust_noise) > 0
+    ) ? editedDepthCenter / Number(currentResult.robust_noise) : null;
+    metrics.periodSde = null;
     const periodStats = estimatePeriodFromTransitBoxes();
     if (periodStats.period !== null) {
       const centers = currentResult.transits
@@ -1269,6 +1495,10 @@ function currentAnalysisMetrics() {
       metrics.periodMatchCount = periodStats.count;
       metrics.periodEpoch = centers.length ? centers[0] : metrics.periodEpoch;
       metrics.periodDuration = median(durations);
+      metrics.periodUncertainty = null;
+      metrics.tlsFap = null;
+      metrics.tlsSnr = null;
+      metrics.tlsSdeRaw = null;
     }
 
     const pValueStats = estimatePValueFromTransitBoxes();
@@ -1355,11 +1585,11 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
         title: 'Period selected by regularity',
         detail: 'A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.',
       });
-    } else if (metrics.periodMethod === 'TLS-style') {
+    } else if (metrics.periodMethod === 'TLS') {
       warnings.push({
         severity: 'info',
-        title: 'TLS-style search mode',
-        detail: 'The orbital period was selected by the transit-shape search mode.',
+        title: 'Physical TLS search',
+        detail: 'The period was fitted with a limb-darkened transit template including ingress and egress.',
       });
     } else {
       warnings.push({
@@ -1376,11 +1606,34 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
       detail: 'The box model is not much better than a flat light curve by the current chi-squared estimate.',
     });
   }
+  if (metrics.periodMethod === 'TLS' && Number.isFinite(Number(metrics.periodSde)) && Number(metrics.periodSde) < 5) {
+    warnings.push({
+      severity: 'caution',
+      title: 'TLS peak below candidate threshold',
+      detail: `TLS SDE is ${fmt(metrics.periodSde, 2)}; candidate review normally starts around SDE 5 and strong evidence around SDE 7.`,
+    });
+  }
+  if (metrics.periodMethod === 'TLS' && Number.isFinite(Number(metrics.tlsFap)) && Number(metrics.tlsFap) > 0.01) {
+    warnings.push({
+      severity: 'caution',
+      title: 'Weak TLS false-alarm estimate',
+      detail: `TLS reports a white-noise false-alarm probability of about ${fmt(Number(metrics.tlsFap) * 100, 2)}%; red noise can make this optimistic.`,
+    });
+  }
   if (snr !== null && snr < 7) {
     warnings.push({
       severity: 'caution',
-      title: 'Low depth SNR',
-      detail: `Median transit depth is about ${fmt(snr, 2)}x the robust noise.`,
+      title: metrics.periodMethod === 'TLS' ? 'Low search SNR' : 'Low depth SNR',
+      detail: metrics.periodMethod === 'TLS'
+        ? `TLS reports a combined transit SNR of ${fmt(snr, 2)}.`
+        : `Median transit depth is about ${fmt(snr, 2)}x the robust noise.`,
+    });
+  }
+  if (Number.isFinite(Number(metrics.tlsOddEvenMismatchSigma)) && Number(metrics.tlsOddEvenMismatchSigma) >= 5) {
+    warnings.push({
+      severity: 'danger',
+      title: 'TLS odd/even mismatch',
+      detail: `TLS measures an odd/even depth difference of ${fmt(metrics.tlsOddEvenMismatchSigma, 2)} sigma.`,
     });
   }
   if (oddEvenMismatch !== null && oddEvenMismatch > 0.5 && oddDepths.length >= 2 && evenDepths.length >= 2) {
@@ -1399,7 +1652,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
   }
   if (
     transits.length >= 3
-    && ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS-style'].includes(metrics.periodMethod)
+    && ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS'].includes(metrics.periodMethod)
     && Number.isFinite(Number(metrics.ephemerisMatchFraction))
   ) {
     const matchFraction = Number(metrics.ephemerisMatchFraction);
@@ -1408,7 +1661,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
     const expectedCount = Number(metrics.expectedTransitCount);
     const expectedCoverage = Number(metrics.expectedTransitCoverage);
     const wellCoveredEvents = (
-      ['transit regularity', 'TLS-style'].includes(metrics.periodMethod)
+      ['transit regularity', 'TLS'].includes(metrics.periodMethod)
       && Number.isFinite(eventCount)
       && eventCount >= 3
       && (
@@ -1485,6 +1738,7 @@ function buildPlanetAssessment(metrics, warnings) {
   const periodMethod = metrics.periodMethod || null;
   const periodSde = Number.isFinite(Number(metrics.periodSde)) ? Number(metrics.periodSde) : null;
   const detectionSnr = Number.isFinite(Number(metrics.detectionSnr)) ? Number(metrics.detectionSnr) : null;
+  const tlsFap = Number.isFinite(Number(metrics.tlsFap)) ? Number(metrics.tlsFap) : null;
   const pValue = Number.isFinite(Number(metrics.pValue)) ? Number(metrics.pValue) : null;
   const depthScatterRatio = Number.isFinite(Number(metrics.depthScatterRatio)) ? Number(metrics.depthScatterRatio) : null;
   const oddEvenMismatch = Number.isFinite(Number(metrics.oddEvenDepthMismatch)) ? Number(metrics.oddEvenDepthMismatch) : null;
@@ -1498,10 +1752,10 @@ function buildPlanetAssessment(metrics, warnings) {
   const expectedTransitCount = Number.isFinite(Number(metrics.expectedTransitCount)) ? Number(metrics.expectedTransitCount) : null;
   const expectedTransitCoverage = Number.isFinite(Number(metrics.expectedTransitCoverage)) ? Number(metrics.expectedTransitCoverage) : null;
   const timingResidualRatio = Number.isFinite(Number(metrics.timingResidualRatio)) ? Number(metrics.timingResidualRatio) : null;
-  const ephemerisPeriodMethods = ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS-style'];
+  const ephemerisPeriodMethods = ['BLS', 'binned BLS fallback', 'transit regularity', 'TLS'];
   const periodLabel = periodMethod === 'BLS' ? 'BLS period' : 'selected period';
   const wellCoveredEphemeris = (
-    ['transit regularity', 'TLS-style'].includes(periodMethod)
+    ['transit regularity', 'TLS'].includes(periodMethod)
     && ephemerisEventMatchCount !== null
     && ephemerisEventMatchCount >= 3
     && (
@@ -1538,8 +1792,8 @@ function buildPlanetAssessment(metrics, warnings) {
 
   if (period !== null && period > 0 && periodMethod === 'BLS') {
     support('Stable BLS period', `Best period is ${fmt(period, 6)} days from the BLS search.`, 22);
-  } else if (period !== null && period > 0 && periodMethod === 'TLS-style') {
-    support('TLS-style transit-shape period', `Best period is ${fmt(period, 6)} days from the transit-shape search.`, 22);
+  } else if (period !== null && period > 0 && periodMethod === 'TLS') {
+    support('Physical TLS period', `Best period is ${fmt(period, 6)} days from the limb-darkened TLS search.`, 22);
   } else if (period !== null && period > 0 && periodMethod === 'transit regularity') {
     support('Frequent transit regularity', `Best repeating interval is ${fmt(period, 6)} days from the boxed transit cadence.`, 20);
   } else if (period !== null && period > 0) {
@@ -1549,11 +1803,7 @@ function buildPlanetAssessment(metrics, warnings) {
     limit('No stable period', 'A repeating orbital period was not recovered.', -18);
   }
 
-  const sdeBand = scoreBand(periodSde, periodMethod === 'TLS-style' ? [
-    [8, 22, 'Very strong TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
-    [5, 17, 'Strong TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
-    [3.5, 8, 'Moderate TLS-style period score', `Period SDE is ${fmt(periodSde, 2)}.`],
-  ] : [
+  const sdeBand = scoreBand(periodSde, [
     [10, 22, 'Very strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
     [7, 17, 'Strong period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
     [5, 8, 'Moderate period peak', `Period SDE is ${fmt(periodSde, 2)}.`],
@@ -1564,15 +1814,26 @@ function buildPlanetAssessment(metrics, warnings) {
     limit('Weak period peak', `Period SDE is only ${fmt(periodSde, 2)}.`, -10);
   }
 
+  const snrTitle = periodMethod === 'TLS' ? 'TLS signal SNR' : 'transit depth SNR';
   const snrBand = scoreBand(detectionSnr, [
-    [10, 22, 'High transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
-    [7, 16, 'Good transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
-    [5, 8, 'Marginal transit depth SNR', `Median depth is ${fmt(detectionSnr, 2)}x the robust noise.`],
+    [10, 22, `High ${snrTitle}`, `Search SNR is ${fmt(detectionSnr, 2)}.`],
+    [7, 16, `Good ${snrTitle}`, `Search SNR is ${fmt(detectionSnr, 2)}.`],
+    [5, 8, `Marginal ${snrTitle}`, `Search SNR is ${fmt(detectionSnr, 2)}.`],
   ]);
   if (snrBand) {
     support(snrBand.title, snrBand.detail, snrBand.points);
   } else if (detectionSnr !== null) {
-    limit('Low transit depth SNR', `Median depth is only ${fmt(detectionSnr, 2)}x the robust noise.`, -14);
+    limit(`Low ${snrTitle}`, `Search SNR is only ${fmt(detectionSnr, 2)}.`, -14);
+  }
+
+  if (periodMethod === 'TLS' && tlsFap !== null) {
+    if (tlsFap <= 0.001) {
+      support('Low TLS false-alarm probability', `White-noise FAP is ${fmt(tlsFap * 100, 3)}%.`, 10);
+    } else if (tlsFap <= 0.01) {
+      support('Useful TLS false-alarm estimate', `White-noise FAP is ${fmt(tlsFap * 100, 2)}%.`, 6);
+    } else {
+      limit('Weak TLS false-alarm estimate', `White-noise FAP is ${fmt(tlsFap * 100, 2)}%.`, -10);
+    }
   }
 
   if (pValue !== null) {
@@ -1667,7 +1928,7 @@ function buildPlanetAssessment(metrics, warnings) {
     && detectionSnr !== null
     && detectionSnr >= 5
     && periodSde !== null
-    && periodSde >= (periodMethod === 'TLS-style' ? 5 : 8)
+    && periodSde >= (periodMethod === 'TLS' ? 7 : 8)
     && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.85)
     && (expectedTransitCoverage === null || expectedTransitCoverage >= 0.65)
     && (offEphemerisFraction === null || offEphemerisFraction <= 0.2)
@@ -1675,10 +1936,11 @@ function buildPlanetAssessment(metrics, warnings) {
   const strongRequirementsMet = (
     transitCount >= 3
     && period !== null
-    && ['BLS', 'TLS-style'].includes(periodMethod)
+    && ['BLS', 'TLS'].includes(periodMethod)
     && detectionSnr !== null
     && (detectionSnr >= 7 || highRepeatConfidence)
-    && (periodSde === null || periodSde >= (periodMethod === 'TLS-style' ? 3.5 : 5))
+    && (periodSde === null || periodSde >= (periodMethod === 'TLS' ? 7 : 5))
+    && (periodMethod !== 'TLS' || tlsFap === null || tlsFap <= 0.01)
     && (ephemerisMatchFraction === null || ephemerisMatchFraction >= 0.75)
     && (offEphemerisFraction === null || offEphemerisFraction <= 0.3)
     && dangerCount === 0
@@ -1691,6 +1953,15 @@ function buildPlanetAssessment(metrics, warnings) {
     && !wellCoveredEphemeris
     && offEphemerisCount !== null
     && offEphemerisCount >= 2
+  );
+  const credibleTlsSignal = (
+    periodMethod !== 'TLS'
+    || (
+      periodSde !== null
+      && periodSde >= 5
+      && detectionSnr !== null
+      && detectionSnr >= 5
+    )
   );
 
   let status;
@@ -1731,7 +2002,7 @@ function buildPlanetAssessment(metrics, warnings) {
     shortLabel = 'Strong candidate';
     summary = 'Repeated dips align with a stable period and pass the current signal-strength checks. This is a strong candidate, not a confirmed planet.';
     recommendation = 'Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed.';
-  } else if (rawCandidateScore >= 45 && transitCount >= 2) {
+  } else if (rawCandidateScore >= 45 && transitCount >= 2 && credibleTlsSignal) {
     status = 'possible_candidate';
     title = 'Possible transit candidate';
     shortLabel = 'Possible candidate';
@@ -1773,6 +2044,7 @@ function buildPlanetAssessment(metrics, warnings) {
       period_method: periodMethod,
       period_sde: periodSde,
       detection_snr: detectionSnr,
+      tls_fap: tlsFap,
       p_value: pValue,
       depth_scatter_ratio: depthScatterRatio,
       odd_even_depth_mismatch: oddEvenMismatch,
@@ -1907,10 +2179,12 @@ function renderMetrics() {
     <div class="metric"><span>Data points</span><span>${currentResult.total_points.toLocaleString()}</span></div>
     <div class="metric"><span>Transits</span><span>${currentResult.transits.length}</span></div>
     <div class="metric"><span>Orbital period</span><span>${period}</span></div>
+    <div class="metric"><span>Period uncertainty</span><span>${metrics.periodUncertainty === null || metrics.periodUncertainty === undefined ? '-' : `± ${fmt(metrics.periodUncertainty, 6)} days`}</span></div>
     <div class="metric"><span>Median depth</span><span>${fmtDepthPercent(metrics.medianDepthFraction)} / ${fmtPpm(metrics.medianDepthFraction === null ? null : metrics.medianDepthFraction * 1000000)} ppm</span></div>
     <div class="metric"><span>Radius ratio</span><span>${fmt(metrics.medianRadiusRatio)}</span></div>
-    <div class="metric"><span>Depth SNR</span><span>${fmt(metrics.detectionSnr, 2)}</span></div>
+    <div class="metric"><span>${metrics.periodMethod === 'TLS' ? 'TLS SNR' : 'Depth SNR'}</span><span>${fmt(metrics.detectionSnr, 2)}</span></div>
     <div class="metric"><span>Period SDE</span><span>${fmt(metrics.periodSde, 2)}</span></div>
+    <div class="metric"><span>TLS false-alarm probability</span><span>${metrics.periodMethod === 'TLS' ? fmtPercent(metrics.tlsFap) : '-'}</span></div>
     <div class="metric"><span>Ephemeris fit</span><span>${ephemerisFit}</span></div>
     <div class="metric"><span>Chi-sq p-value</span><span>${fmtPercent(metrics.pValue)}</span></div>
     <div class="metric"><span>Reduced chi-sq</span><span>${fmt(metrics.reducedChiSquared, 3)}</span></div>
@@ -2053,6 +2327,9 @@ function summaryForExport() {
     warnings,
     diagnostics: {
       detection_snr: metrics.detectionSnr,
+      tls_snr: metrics.tlsSnr,
+      tls_fap: metrics.tlsFap,
+      tls_odd_even_mismatch_sigma: metrics.tlsOddEvenMismatchSigma,
       odd_even_depth_mismatch: metrics.oddEvenDepthMismatch,
       depth_scatter_ratio: metrics.depthScatterRatio,
       ephemeris_match_count: metrics.ephemerisMatchCount,
@@ -2072,6 +2349,7 @@ function summaryForExport() {
       orbital_period_days: metrics.period,
       orbital_period_method: metrics.periodMethod,
       orbital_period_scatter: metrics.periodScatter,
+      orbital_period_uncertainty: metrics.periodUncertainty,
       harmonic_alias_corrected: Boolean(currentResult.harmonic_alias_corrected),
       harmonic_alias_period: currentResult.harmonic_alias_period ?? null,
       harmonic_alias_factor: currentResult.harmonic_alias_factor ?? null,
@@ -2087,6 +2365,9 @@ function summaryForExport() {
       reduced_chi_squared: metrics.reducedChiSquared,
       detection_snr: metrics.detectionSnr,
       period_sde: metrics.periodSde,
+      tls_sde_raw: metrics.tlsSdeRaw,
+      tls_fap: metrics.tlsFap,
+      tls_snr: metrics.tlsSnr,
       ephemeris_match_count: metrics.ephemerisMatchCount,
       ephemeris_match_fraction: metrics.ephemerisMatchFraction,
       ephemeris_event_match_count: metrics.ephemerisEventMatchCount,
@@ -2099,6 +2380,7 @@ function summaryForExport() {
     period_candidates: currentResult.period_candidates || [],
     period_search: currentResult.period_search || null,
     periodogram: currentResult.periodogram || null,
+    tls: currentResult.tls || null,
     transits: transitRowsForExport(),
   };
 }
@@ -3084,6 +3366,33 @@ function drawPhaseChart(geo) {
     ctx.fillRect(x - pointSize / 2, y - pointSize / 2, pointSize, pointSize);
   }
 
+  const transitModel = currentResult.transit_model;
+  if (
+    transitModel
+    && Array.isArray(transitModel.folded_phase_days)
+    && Array.isArray(transitModel.folded_flux)
+  ) {
+    ctx.strokeStyle = '#b45309';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    let hasModelPoint = false;
+    const modelCount = Math.min(transitModel.folded_phase_days.length, transitModel.folded_flux.length);
+    for (let i = 0; i < modelCount; i++) {
+      const phase = Number(transitModel.folded_phase_days[i]);
+      const value = Number(transitModel.folded_flux[i]);
+      if (!Number.isFinite(phase) || !Number.isFinite(value) || phase < xMin || phase > xMax) continue;
+      const x = xScale(phase);
+      const y = yScale(value);
+      if (!hasModelPoint) {
+        ctx.moveTo(x, y);
+        hasModelPoint = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (hasModelPoint) ctx.stroke();
+  }
+
   ctx.strokeStyle = '#063f3b';
   ctx.lineWidth = 2.6;
   ctx.beginPath();
@@ -3386,6 +3695,30 @@ function drawChart() {
     }
   }
   ctx.stroke();
+
+  if (hasTransitModel() && currentView !== 'raw') {
+    const modelTimes = currentResult.transit_model.time;
+    const modelFlux = currentResult.transit_model.flux;
+    ctx.strokeStyle = '#b45309';
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    let hasModelPoint = false;
+    const modelCount = Math.min(modelTimes.length, modelFlux.length);
+    for (let i = 0; i < modelCount; i++) {
+      const modelTime = Number(modelTimes[i]);
+      const modelValue = Number(modelFlux[i]);
+      if (!Number.isFinite(modelTime) || !Number.isFinite(modelValue) || modelTime < xMin || modelTime > xMax) continue;
+      const x = xScale(modelTime);
+      const y = yScale(modelValue);
+      if (!hasModelPoint) {
+        ctx.moveTo(x, y);
+        hasModelPoint = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (hasModelPoint) ctx.stroke();
+  }
 
   if (currentView === 'audit') {
     drawAuditResiduals(geo, viewport, auditMetrics, xScale);

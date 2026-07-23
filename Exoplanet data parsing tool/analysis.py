@@ -2,6 +2,8 @@ import math
 
 import numpy as np
 
+from tls_search import run_tls_search
+
 try:
     from scipy.signal import find_peaks, peak_widths
 except Exception:
@@ -24,11 +26,22 @@ MAX_PERIODOGRAM_POINTS = 1600
 DEFAULT_DETECTION_OPTIONS = {
     "strictness": 1.0,
     "smoothing": 1.0,
+    "search_mode": "bls",
     "min_depth": None,
     "min_duration": None,
     "max_duration": None,
     "min_period": None,
     "max_period": None,
+    "tls_template": "default",
+    "stellar_radius": None,
+    "stellar_mass": None,
+    "limb_darkening_u1": None,
+    "limb_darkening_u2": None,
+    "tls_oversampling": 3,
+    "tls_min_transits": 3,
+    "tls_threads": 1,
+    "tls_min_depth_ppm": 10.0,
+    "tls_duration_grid_step": 1.1,
 }
 
 
@@ -62,6 +75,26 @@ def parse_optional_float(form, name, low=None, high=None):
     return value
 
 
+def parse_optional_int(form, name, low=None, high=None):
+    value = parse_optional_float(form, name, low, high)
+    if value is None:
+        return None
+    if not float(value).is_integer():
+        raise ValueError(f"{name} must be a whole number.")
+    return int(value)
+
+
+def parse_choice(form, name, choices, default):
+    raw_value = field_value(form, name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    value = str(raw_value).strip().lower().replace("_", "-")
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{name} must be one of: {allowed}.")
+    return choices[value]
+
+
 def parse_detection_options(form):
     options = dict(DEFAULT_DETECTION_OPTIONS)
     strictness = parse_optional_float(form, "strictness", 0.2, 5.0)
@@ -70,12 +103,45 @@ def parse_detection_options(form):
         options["strictness"] = clamp(strictness, 0.2, 5.0)
     if smoothing is not None:
         options["smoothing"] = clamp(smoothing, 0.25, 4.0)
+    options["search_mode"] = parse_choice(
+        form,
+        "searchMode",
+        {
+            "bls": "bls",
+            "bls-regularity": "bls",
+            "bls+regularity": "bls",
+            "tls": "tls",
+            "tls-style": "tls",
+        },
+        "bls",
+    )
 
     options["min_depth"] = parse_optional_float(form, "minDepth", 0.0, None)
     options["min_duration"] = parse_optional_float(form, "minDuration", 0.0, None)
     options["max_duration"] = parse_optional_float(form, "maxDuration", 0.0, None)
     options["min_period"] = parse_optional_float(form, "minPeriod", 0.0, None)
     options["max_period"] = parse_optional_float(form, "maxPeriod", 0.0, None)
+    options["tls_template"] = parse_choice(
+        form,
+        "tlsTemplate",
+        {"default": "default", "grazing": "grazing", "box": "box"},
+        "default",
+    )
+    options["stellar_radius"] = parse_optional_float(form, "stellarRadius", 0.1, 100.0)
+    options["stellar_mass"] = parse_optional_float(form, "stellarMass", 0.01, 100.0)
+    options["limb_darkening_u1"] = parse_optional_float(form, "limbDarkeningU1", -1.0, 2.0)
+    options["limb_darkening_u2"] = parse_optional_float(form, "limbDarkeningU2", -1.0, 2.0)
+    options["tls_oversampling"] = parse_optional_int(form, "tlsOversampling", 1, 9) or 3
+    options["tls_min_transits"] = parse_optional_int(form, "tlsMinTransits", 2, 10) or 3
+    options["tls_threads"] = parse_optional_int(form, "tlsThreads", 1, 8) or 1
+    options["tls_min_depth_ppm"] = parse_optional_float(form, "tlsMinDepthPpm", 0.1, 500000.0) or 10.0
+    options["tls_duration_grid_step"] = parse_optional_float(form, "tlsDurationGridStep", 1.01, 2.0) or 1.1
+    limb_u1 = options["limb_darkening_u1"]
+    limb_u2 = options["limb_darkening_u2"]
+    if (limb_u1 is None) != (limb_u2 is None):
+        raise ValueError("Both limbDarkeningU1 and limbDarkeningU2 are required when either is set.")
+    if limb_u1 is not None and (limb_u1 + limb_u2 < 0 or limb_u1 + limb_u2 > 1.5):
+        raise ValueError("Quadratic limb-darkening coefficients must have a sum between 0 and 1.5.")
     if (
         options["min_duration"] is not None
         and options["max_duration"] is not None
@@ -503,7 +569,7 @@ def estimate_period_with_bls(time, flux, options=None):
         model = BoxLeastSquares(time, flattened_flux)
         result = model.power(periods, durations)
     except Exception:
-        return None
+        return estimate_period_with_binned_bls(time, flux, options)
 
     if len(result.power) == 0 or not np.any(np.isfinite(result.power)):
         return None
@@ -558,6 +624,144 @@ def estimate_period_with_bls(time, flux, options=None):
         "method": "BLS",
         **(chi_squared or {}),
     }
+
+
+def normalized_flux_for_tls(time, flux):
+    flux = np.asarray(flux, dtype=float)
+    baseline = float(np.median(flux))
+    if math.isfinite(baseline) and baseline > 1e-9:
+        normalized = flux / baseline
+    else:
+        amplitude = float(np.percentile(np.abs(flux), 95))
+        scale = 1000000.0 if amplitude > 1.0 else 1.0
+        normalized = 1.0 + flux / scale
+
+    flattened = flattened_flux_for_period_search(time, normalized)
+    if flattened is None:
+        return None, None
+    tls_flux = 1.0 + flattened
+    finite = tls_flux[np.isfinite(tls_flux)]
+    if finite.size == 0:
+        return None, None
+    positive_floor = max(float(np.percentile(finite, 0.01)), 1e-6)
+    tls_flux = np.maximum(tls_flux, positive_floor)
+    residual = tls_flux - 1.0
+    residual_median = float(np.median(residual))
+    residual_mad = float(np.median(np.abs(residual - residual_median)))
+    robust_noise = max(1.4826 * residual_mad, float(np.std(residual)), 1e-9)
+    return tls_flux, robust_noise
+
+
+def estimate_period_with_tls(time, flux, options=None):
+    if len(time) < 50:
+        raise ValueError("TLS needs at least 50 finite light-curve samples.")
+    if options is None:
+        options = dict(DEFAULT_DETECTION_OPTIONS)
+
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    if full_span <= 0:
+        return None
+
+    tls_flux, tls_noise = normalized_flux_for_tls(time, flux)
+    if tls_flux is None:
+        return None
+    min_period, max_period = period_search_bounds(cadence, full_span, options)
+    max_period = min(max_period, full_span / max(int(options.get("tls_min_transits", 3)), 1))
+    if min_period >= max_period:
+        raise ValueError(
+            "TLS period bounds do not leave room for the requested minimum number of transits."
+        )
+
+    tls_options = {
+        **options,
+        "period_min": float(min_period),
+        "period_max": float(max_period),
+    }
+    result = run_tls_search(time, tls_flux, tls_options)
+    flattened_flux = tls_flux - 1.0
+    chi_squared = chi_squared_transit_probability(
+        time,
+        flattened_flux,
+        result["period"],
+        result["duration"],
+        result["transit_time"],
+    )
+    expected_count = result.get("transit_count")
+    if expected_count is None:
+        first_epoch = math.ceil((time[0] - result["transit_time"]) / result["period"])
+        last_epoch = math.floor((time[-1] - result["transit_time"]) / result["period"])
+        expected_count = max(1, int(last_epoch - first_epoch + 1))
+
+    return {
+        "period": result["period"],
+        "period_uncertainty": result.get("period_uncertainty"),
+        "scatter": result.get("period_uncertainty") or 0.0,
+        "count": int(expected_count),
+        "duration": result["duration"],
+        "transit_time": result["transit_time"],
+        "power": result.get("power"),
+        "sde": result.get("sde"),
+        "sde_raw": result.get("sde_raw"),
+        "fap": result.get("fap"),
+        "snr": result.get("snr"),
+        "candidates": result.get("candidates", []),
+        "periodogram": result.get("periodogram"),
+        "search_min_period": float(min_period),
+        "search_max_period": float(max_period),
+        "search_min_duration": options.get("min_duration"),
+        "search_max_duration": options.get("max_duration"),
+        "method": "TLS",
+        "tls_noise": tls_noise,
+        "tls_result": result,
+        "transit_model": result.get("model"),
+        **(chi_squared or {}),
+    }
+
+
+def transits_from_tls_result(time, flux, tls_period):
+    if tls_period is None:
+        return []
+    result = tls_period.get("tls_result") or {}
+    duration = finite_number(tls_period.get("duration"))
+    if duration is None or duration <= 0:
+        return []
+
+    transit_times = finite_values(result.get("transit_times", []))
+    model_depths = finite_values(result.get("transit_depth_fractions", []))
+    model_counts = finite_values(result.get("per_transit_count", []))
+    transits = []
+    for index, center in enumerate(transit_times):
+        start = center - duration / 2.0
+        end = center + duration / 2.0
+        left = int(np.searchsorted(time, start, side="left"))
+        right = int(np.searchsorted(time, end, side="right"))
+        if right - left < 2:
+            continue
+
+        shoulder_start = int(np.searchsorted(time, center - duration * 2.5, side="left"))
+        shoulder_left = int(np.searchsorted(time, center - duration * 0.75, side="right"))
+        shoulder_right = int(np.searchsorted(time, center + duration * 0.75, side="left"))
+        shoulder_end = int(np.searchsorted(time, center + duration * 2.5, side="right"))
+        shoulders = np.r_[flux[shoulder_start:shoulder_left], flux[shoulder_right:shoulder_end]]
+        in_flux = np.asarray(flux[left:right], dtype=float)
+        baseline = float(np.median(shoulders)) if shoulders.size >= 3 else float(np.median(flux))
+        depth = max(0.0, baseline - float(np.median(in_flux)))
+        if depth <= 0 and index < len(model_depths):
+            depth = max(0.0, float(model_depths[index]) * max(abs(baseline), 1.0))
+
+        transits.append({
+            "start": float(start),
+            "end": float(end),
+            "center": float(center),
+            "duration": float(duration),
+            "depth": float(depth),
+            "points": int(model_counts[index]) if index < len(model_counts) else int(right - left),
+            "flux_min": float(np.min(in_flux)),
+            "flux_max": float(max(np.max(in_flux), baseline)),
+            "source": "TLS model",
+        })
+    return prune_overlapping_transits(transits)
 
 
 def transit_regularity_tolerance(period, durations):
@@ -1268,24 +1472,42 @@ def detect_transits(time, flux, options=None):
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
     median_flux = float(np.median(flux))
-    detection = detect_transits_by_prominence(time, flux, median_flux, options)
-    threshold_detection = detect_transits_by_threshold(time, flux, median_flux, options)
-    if detection is None:
-        detection = threshold_detection
-    elif threshold_detection is not None and len(threshold_detection["transits"]) > len(detection["transits"]):
+    search_mode = options.get("search_mode", "bls")
+    if search_mode == "tls":
+        flux_mad = float(np.median(np.abs(flux - median_flux)))
         detection = {
-            **detection,
-            "transits": prune_overlapping_transits(detection["transits"] + threshold_detection["transits"]),
-            "robust_noise": min(float(detection["robust_noise"]), float(threshold_detection["robust_noise"])),
-            "smooth_points": min(int(detection["smooth_points"]), int(threshold_detection["smooth_points"])),
+            "transits": [],
+            "robust_noise": max(1.4826 * flux_mad, 1e-9),
+            "smooth_points": 1,
         }
+    else:
+        detection = detect_transits_by_prominence(time, flux, median_flux, options)
+        threshold_detection = detect_transits_by_threshold(time, flux, median_flux, options)
+        if detection is None:
+            detection = threshold_detection
+        elif threshold_detection is not None and len(threshold_detection["transits"]) > len(detection["transits"]):
+            detection = {
+                **detection,
+                "transits": prune_overlapping_transits(detection["transits"] + threshold_detection["transits"]),
+                "robust_noise": min(float(detection["robust_noise"]), float(threshold_detection["robust_noise"])),
+                "smooth_points": min(int(detection["smooth_points"]), int(threshold_detection["smooth_points"])),
+            }
 
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    bls_period = estimate_period_with_bls(time, flux, options)
-    bls_period = dealiased_bls_period(bls_period, transits, time, flux)
-    regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
-    use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
+    tls_period = estimate_period_with_tls(time, flux, options) if search_mode == "tls" else None
+    if tls_period is not None:
+        tls_transits = transits_from_tls_result(time, flux, tls_period)
+        if tls_transits:
+            transits = tls_transits
+        bls_period = None
+        regularity_period = None
+        use_regularity_period = False
+    else:
+        bls_period = estimate_period_with_bls(time, flux, options)
+        bls_period = dealiased_bls_period(bls_period, transits, time, flux)
+        regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
+        use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
     p_value = None
     chi_squared_flat = None
     chi_squared_box = None
@@ -1294,10 +1516,49 @@ def detect_transits(time, flux, options=None):
     period_epoch = None
     period_duration = None
     period_sde = None
+    period_uncertainty = None
     period_candidates = []
     period_search = None
-    periodogram = bls_period.get("periodogram") if bls_period is not None else None
-    if bls_period is not None and not use_regularity_period:
+    periodogram = None
+    tls_sde_raw = None
+    tls_fap = None
+    tls_snr = None
+    tls_details = None
+    transit_model = None
+    if tls_period is not None:
+        period = tls_period["period"]
+        period_scatter = tls_period["scatter"]
+        period_uncertainty = tls_period.get("period_uncertainty")
+        period_match_count = tls_period["count"]
+        period_method = tls_period["method"]
+        p_value = tls_period.get("p_value")
+        chi_squared_flat = tls_period.get("chi_squared_flat")
+        chi_squared_box = tls_period.get("chi_squared_box")
+        reduced_chi_squared_box = tls_period.get("reduced_chi_squared_box")
+        delta_chi_squared = tls_period.get("delta_chi_squared")
+        period_epoch = tls_period.get("transit_time")
+        period_duration = tls_period.get("duration")
+        period_sde = tls_period.get("sde")
+        tls_sde_raw = tls_period.get("sde_raw")
+        tls_fap = tls_period.get("fap")
+        tls_snr = tls_period.get("snr")
+        period_candidates = tls_period.get("candidates", [])
+        periodogram = tls_period.get("periodogram")
+        period_search = {
+            "min_period": tls_period.get("search_min_period"),
+            "max_period": tls_period.get("search_max_period"),
+            "min_duration": tls_period.get("search_min_duration"),
+            "max_duration": tls_period.get("search_max_duration"),
+        }
+        tls_result = tls_period.get("tls_result") or {}
+        tls_details = {
+            key: value
+            for key, value in tls_result.items()
+            if key not in ("candidates", "periodogram", "model")
+        }
+        transit_model = tls_period.get("transit_model")
+    elif bls_period is not None and not use_regularity_period:
+        periodogram = bls_period.get("periodogram")
         period = bls_period["period"]
         period_scatter = bls_period["scatter"]
         period_match_count = bls_period["count"]
@@ -1350,6 +1611,7 @@ def detect_transits(time, flux, options=None):
             *(bls_period.get("candidates", []) if bls_period is not None else []),
         ]
         if bls_period is not None:
+            periodogram = bls_period.get("periodogram")
             period_search = {
                 "min_period": bls_period.get("search_min_period"),
                 "max_period": bls_period.get("search_max_period"),
@@ -1385,9 +1647,15 @@ def detect_transits(time, flux, options=None):
         "period_epoch": period_epoch,
         "period_duration": period_duration,
         "period_sde": period_sde,
+        "period_uncertainty": period_uncertainty,
         "period_candidates": period_candidates,
         "period_search": period_search,
         "periodogram": periodogram,
+        "tls_sde_raw": tls_sde_raw,
+        "tls_fap": tls_fap,
+        "tls_snr": tls_snr,
+        "tls": tls_details,
+        "transit_model": transit_model,
         "p_value": p_value,
         "p_value_percent": None if p_value is None else p_value * 100.0,
         "chi_squared_flat": chi_squared_flat,
@@ -1595,9 +1863,13 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
     even_depth = median_or_none(even_depths)
     depth_center = median_or_none(depths)
     robust_noise = detection.get("robust_noise")
-    detection_snr = None
+    local_depth_snr = None
     if depth_center is not None and robust_noise is not None and math.isfinite(float(robust_noise)) and float(robust_noise) > 0:
-        detection_snr = depth_center / float(robust_noise)
+        local_depth_snr = depth_center / float(robust_noise)
+    tls_snr = finite_number(detection.get("tls_snr"))
+    detection_snr = tls_snr if detection.get("period_method") == "TLS" and tls_snr is not None else local_depth_snr
+    tls_details = detection.get("tls") or {}
+    tls_odd_even_mismatch = finite_number(tls_details.get("odd_even_mismatch_sigma"))
 
     odd_even_depth_mismatch = None
     if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
@@ -1606,6 +1878,10 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
     ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference, observed_ranges)
     diagnostics = {
         "detection_snr": detection_snr,
+        "local_depth_snr": local_depth_snr,
+        "tls_snr": tls_snr,
+        "tls_fap": finite_number(detection.get("tls_fap")),
+        "tls_odd_even_mismatch_sigma": tls_odd_even_mismatch,
         "median_transit_points": median_or_none(point_counts),
         "depth_scatter_ratio": coefficient_of_variation(depths),
         "odd_depth": odd_depth,
@@ -1635,7 +1911,13 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
             "detail": "The app could not estimate a repeating orbital period.",
         })
     if detection.get("period_method") and detection.get("period_method") != "BLS":
-        if detection.get("period_method") == "transit regularity":
+        if detection.get("period_method") == "TLS":
+            warnings.append({
+                "severity": "info",
+                "title": "Physical TLS search",
+                "detail": "The period was fitted with a limb-darkened transit template including ingress and egress.",
+            })
+        elif detection.get("period_method") == "transit regularity":
             warnings.append({
                 "severity": "info",
                 "title": "Period selected by regularity",
@@ -1654,11 +1936,35 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
             "title": "Weak model significance",
             "detail": "The box model is not much better than a flat light curve by the current chi-squared estimate.",
         })
+    tls_fap = finite_number(detection.get("tls_fap"))
+    tls_sde = finite_number(detection.get("period_sde"))
+    if detection.get("period_method") == "TLS" and tls_sde is not None and tls_sde < 5:
+        warnings.append({
+            "severity": "caution",
+            "title": "TLS peak below candidate threshold",
+            "detail": f"TLS SDE is {tls_sde:.2f}; candidate review normally starts around SDE 5 and strong evidence around SDE 7.",
+        })
+    if detection.get("period_method") == "TLS" and tls_fap is not None and tls_fap > 0.01:
+        warnings.append({
+            "severity": "caution",
+            "title": "Weak TLS false-alarm estimate",
+            "detail": f"TLS reports a white-noise false-alarm probability of about {tls_fap:.2%}; red noise can make this optimistic.",
+        })
     if detection_snr is not None and detection_snr < 7:
         warnings.append({
             "severity": "caution",
-            "title": "Low depth SNR",
-            "detail": f"Median transit depth is about {detection_snr:.2f}x the robust noise.",
+            "title": "Low search SNR" if detection.get("period_method") == "TLS" else "Low depth SNR",
+            "detail": (
+                f"TLS reports a combined transit SNR of {detection_snr:.2f}."
+                if detection.get("period_method") == "TLS"
+                else f"Median transit depth is about {detection_snr:.2f}x the robust noise."
+            ),
+        })
+    if tls_odd_even_mismatch is not None and tls_odd_even_mismatch >= 5:
+        warnings.append({
+            "severity": "danger",
+            "title": "TLS odd/even mismatch",
+            "detail": f"TLS measures an odd/even depth difference of {tls_odd_even_mismatch:.2f} sigma.",
         })
     if odd_even_depth_mismatch is not None and odd_even_depth_mismatch > 0.5 and len(odd_depths) >= 2 and len(even_depths) >= 2:
         warnings.append({
@@ -1674,7 +1980,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
         })
     if (
         len(transits) >= 3
-        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS-style")
+        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS")
         and diagnostics["ephemeris_match_fraction"] is not None
     ):
         match_fraction = diagnostics["ephemeris_match_fraction"]
@@ -1684,7 +1990,7 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
         expected_count = diagnostics["expected_transit_count"]
         expected_coverage = diagnostics["expected_transit_coverage"]
         well_covered_events = (
-            detection.get("period_method") in ("transit regularity", "TLS-style")
+            detection.get("period_method") in ("transit regularity", "TLS")
             and event_count is not None
             and event_count >= 3
             and (
@@ -1760,6 +2066,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     period_method = detection.get("period_method")
     period_sde = finite_number(detection.get("period_sde"))
     detection_snr = finite_number(diagnostics.get("detection_snr"))
+    tls_fap = finite_number(detection.get("tls_fap"))
     p_value = finite_number(detection.get("p_value"))
     depth_scatter_ratio = finite_number(diagnostics.get("depth_scatter_ratio"))
     odd_even_mismatch = finite_number(diagnostics.get("odd_even_depth_mismatch"))
@@ -1773,10 +2080,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     expected_transit_count = finite_number(diagnostics.get("expected_transit_count"))
     expected_transit_coverage = finite_number(diagnostics.get("expected_transit_coverage"))
     timing_residual_ratio = finite_number(diagnostics.get("timing_residual_ratio"))
-    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity")
+    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity", "TLS")
     period_label = "BLS period" if period_method == "BLS" else "selected period"
     well_covered_ephemeris = (
-        period_method == "transit regularity"
+        period_method in ("transit regularity", "TLS")
         and ephemeris_event_match_count is not None
         and ephemeris_event_match_count >= 3
         and (
@@ -1825,6 +2132,8 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
 
     if period is not None and period > 0 and period_method == "BLS":
         support("Stable BLS period", f"Best period is {period:.6g} days from the BLS search.", 22)
+    elif period is not None and period > 0 and period_method == "TLS":
+        support("Physical TLS period", f"Best period is {period:.6g} days from the limb-darkened TLS search.", 22)
     elif period is not None and period > 0 and period_method == "transit regularity":
         support("Frequent transit regularity", f"Best repeating interval is {period:.6g} days from the boxed transit cadence.", 20)
     elif period is not None and period > 0:
@@ -1833,27 +2142,37 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     else:
         limit("No stable period", "A repeating orbital period was not recovered.", -18)
 
+    sde_label = "TLS SDE" if period_method == "TLS" else "Period SDE"
     sde_result = score_band(period_sde, (
-        (10.0, 22, "Very strong period peak", f"Period SDE is {format_metric(period_sde)}."),
-        (7.0, 17, "Strong period peak", f"Period SDE is {format_metric(period_sde)}."),
-        (5.0, 8, "Moderate period peak", f"Period SDE is {format_metric(period_sde)}."),
+        (10.0, 22, "Very strong period peak", f"{sde_label} is {format_metric(period_sde)}."),
+        (7.0, 17, "Strong period peak", f"{sde_label} is {format_metric(period_sde)}."),
+        (5.0, 8, "Moderate period peak", f"{sde_label} is {format_metric(period_sde)}."),
     ))
     if sde_result is not None:
         points, title, detail = sde_result
         support(title, detail, points)
     elif period_sde is not None:
-        limit("Weak period peak", f"Period SDE is only {period_sde:.2f}.", -10)
+        limit("Weak period peak", f"{sde_label} is only {period_sde:.2f}.", -10)
 
+    snr_title = "TLS signal SNR" if period_method == "TLS" else "transit depth SNR"
     snr_result = score_band(detection_snr, (
-        (10.0, 22, "High transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
-        (7.0, 16, "Good transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
-        (5.0, 8, "Marginal transit depth SNR", f"Median depth is {format_metric(detection_snr)}x the robust noise."),
+        (10.0, 22, f"High {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
+        (7.0, 16, f"Good {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
+        (5.0, 8, f"Marginal {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
     ))
     if snr_result is not None:
         points, title, detail = snr_result
         support(title, detail, points)
     elif detection_snr is not None:
-        limit("Low transit depth SNR", f"Median depth is only {detection_snr:.2f}x the robust noise.", -14)
+        limit(f"Low {snr_title}", f"Search SNR is only {detection_snr:.2f}.", -14)
+
+    if period_method == "TLS" and tls_fap is not None:
+        if tls_fap <= 0.001:
+            support("Low TLS false-alarm probability", f"White-noise FAP is {tls_fap:.3%}.", 10)
+        elif tls_fap <= 0.01:
+            support("Useful TLS false-alarm estimate", f"White-noise FAP is {tls_fap:.2%}.", 6)
+        else:
+            limit("Weak TLS false-alarm estimate", f"White-noise FAP is {tls_fap:.2%}.", -10)
 
     if p_value is not None:
         if p_value <= 1e-6:
@@ -1937,13 +2256,13 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         score -= 6
 
     raw_candidate_score = int(round(clamp(score, 0, 100)))
-    required_period_sde = 3.5 if period_method == "TLS-style" else 5
+    required_period_sde = 7 if period_method == "TLS" else 5
     high_repeat_confidence = (
         transit_count >= 5
         and detection_snr is not None
         and detection_snr >= 5
         and period_sde is not None
-        and period_sde >= (5 if period_method == "TLS-style" else 8)
+        and period_sde >= (7 if period_method == "TLS" else 8)
         and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.85)
         and (expected_transit_coverage is None or expected_transit_coverage >= 0.65)
         and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.2)
@@ -1951,10 +2270,11 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     strong_requirements_met = (
         transit_count >= 3
         and period is not None
-        and period_method in ("BLS", "TLS-style")
+        and period_method in ("BLS", "TLS")
         and detection_snr is not None
         and (detection_snr >= 7 or high_repeat_confidence)
         and (period_sde is None or period_sde >= required_period_sde)
+        and (period_method != "TLS" or tls_fap is None or tls_fap <= 0.01)
         and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.75)
         and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.3)
         and danger_count == 0
@@ -1967,6 +2287,15 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         and not well_covered_ephemeris
         and off_ephemeris_count is not None
         and off_ephemeris_count >= 2
+    )
+    credible_tls_signal = (
+        period_method != "TLS"
+        or (
+            period_sde is not None
+            and period_sde >= 5
+            and detection_snr is not None
+            and detection_snr >= 5
+        )
     )
 
     if transit_count == 0:
@@ -2012,7 +2341,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "This is a strong candidate, not a confirmed planet."
         )
         recommendation = "Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed."
-    elif raw_candidate_score >= 45 and transit_count >= 2:
+    elif raw_candidate_score >= 45 and transit_count >= 2 and credible_tls_signal:
         status = "possible_candidate"
         title = "Possible transit candidate"
         short_label = "Possible candidate"
@@ -2054,6 +2383,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "period_method": period_method,
             "period_sde": period_sde,
             "detection_snr": detection_snr,
+            "tls_fap": tls_fap,
             "p_value": p_value,
             "depth_scatter_ratio": depth_scatter_ratio,
             "odd_even_depth_mismatch": odd_even_mismatch,
