@@ -185,6 +185,21 @@ def transit_preserving_smoothing_width(requested_width, cadence, duration):
     return int(min(int(requested_width), max_width))
 
 
+def smoothed_transit_display_bounds(start, end, cadence, smooth_width, domain_min, domain_max):
+    start = float(start)
+    end = float(end)
+    cadence = float(cadence)
+    smooth_width = int(smooth_width)
+    if not math.isfinite(cadence) or cadence <= 0 or smooth_width <= 1:
+        return start, end
+
+    smoothing_radius = (smooth_width // 2) * cadence
+    return (
+        float(max(domain_min, start - smoothing_radius)),
+        float(min(domain_max, end + smoothing_radius)),
+    )
+
+
 def moving_average(values, width):
     if width <= 1:
         return values.copy()
@@ -2698,6 +2713,17 @@ def analyze(time, flux, options=None):
         display_transit["start"] = float(transit["start"] - time_reference)
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
+        if transit_model is not None and display_model_flux is not None:
+            display_start, display_end = smoothed_transit_display_bounds(
+                display_transit["start"],
+                display_transit["end"],
+                cadence,
+                smooth_width,
+                float(display_time[0]),
+                float(display_time[-1]),
+            )
+            display_transit["display_start"] = display_start
+            display_transit["display_end"] = display_end
         display_transits.append(display_transit)
     observed_ranges = [
         (float(time[start] - time_reference), float(time[end - 1] - time_reference))

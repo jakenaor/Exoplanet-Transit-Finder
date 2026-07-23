@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -159,6 +160,106 @@ class TLSSearchTests(unittest.TestCase):
 
         self.assertAlmostEqual(duration, 0.04, delta=0.0003)
 
+    def test_unfolded_tls_model_restores_gap_compressed_duration(self):
+        period = 1.0
+        centers = np.arange(0.5, 4.0, period)
+        model_time = np.concatenate([
+            np.linspace(center - period / 2.0, center + period / 2.0, 1001)
+            for center in centers
+        ])
+        model_flux = np.concatenate([
+            np.where(
+                np.abs(np.linspace(-period / 2.0, period / 2.0, 1001)) <= 0.05,
+                0.98,
+                1.0,
+            )
+            for _ in centers
+        ])
+        folded_phase = np.linspace(0.0, 1.0, 1001)
+        compressed_folded_flux = np.where(np.abs(folded_phase - 0.5) <= 0.025, 0.98, 1.0)
+        fake_result = SimpleNamespace(
+            period=period,
+            duration=0.05,
+            T0=centers[0],
+            periods=np.asarray([0.9, period, 1.1]),
+            power=np.asarray([1.0, 9.0, 1.0]),
+            power_raw=np.asarray([1.0, 9.0, 1.0]),
+            model_lightcurve_time=model_time,
+            model_lightcurve_model=model_flux,
+            model_folded_phase=folded_phase,
+            model_folded_model=compressed_folded_flux,
+            transit_times=centers,
+            transit_depths=np.full(len(centers), 0.98),
+            per_transit_count=np.full(len(centers), 100),
+            transit_count=len(centers),
+            distinct_transit_count=len(centers),
+            empty_transit_count=0,
+            depth=0.98,
+            SDE=9.0,
+            SDE_raw=9.0,
+            FAP=0.001,
+            snr=20.0,
+        )
+        fake_model = mock.Mock()
+        fake_model.power.return_value = fake_result
+        observed_time = np.r_[
+            np.linspace(0.0, 1.0, 1001),
+            np.linspace(3.0, 4.0, 1001),
+        ]
+
+        with mock.patch.object(tls_search, "transitleastsquares", return_value=fake_model):
+            result = tls_search.run_tls_search(
+                observed_time,
+                np.ones_like(observed_time),
+                {
+                    "period_min": 0.8,
+                    "period_max": 1.2,
+                    "tls_threads": 1,
+                },
+            )
+
+        self.assertAlmostEqual(result["folded_engine_duration"], 0.05, delta=0.002)
+        self.assertAlmostEqual(result["duration"], 0.10, delta=0.002)
+        self.assertAlmostEqual(result["unfolded_model_duration"], 0.10, delta=0.002)
+        self.assertAlmostEqual(result["sampling_fill_factor"], 0.5, delta=0.002)
+        self.assertAlmostEqual(result["uncompressed_duration"], 0.10, delta=0.002)
+        self.assertEqual(
+            result["duration_source"],
+            "TLS duration with sampling-gap compression removed",
+        )
+        self.assertAlmostEqual(
+            tls_search.duration_from_folded_model(
+                result["model"]["folded_phase_days"],
+                result["model"]["folded_flux"],
+                period,
+            ),
+            0.10,
+            delta=0.002,
+        )
+
+    def test_observed_duration_refinement_covers_ingress_and_egress(self):
+        time_values = np.linspace(0.0, 8.0, 8001)
+        period = 1.0
+        epoch = 0.5
+        phase = ((time_values - epoch + period / 2.0) % period) - period / 2.0
+        flux_values = np.ones_like(time_values)
+        flux_values[np.abs(phase) <= 0.05] = 0.98
+        flux_values += np.random.default_rng(91).normal(0.0, 0.0001, len(flux_values))
+
+        refinement = tls_search.observed_phase_folded_duration(
+            time_values,
+            flux_values,
+            period,
+            epoch,
+            seed_duration=0.06,
+        )
+
+        self.assertIsNotNone(refinement)
+        self.assertLessEqual(refinement["measured_start"], -0.049)
+        self.assertGreaterEqual(refinement["measured_end"], 0.049)
+        self.assertGreaterEqual(refinement["duration"], 0.10)
+        self.assertLess(refinement["duration"], 0.13)
+
     def test_observation_aligned_model_keeps_every_visible_transit(self):
         time_values = np.linspace(0.0, 10.0, 10001)
         period = 1.0
@@ -206,6 +307,19 @@ class TLSSearchTests(unittest.TestCase):
 
         self.assertEqual(width, 5)
         self.assertLess(width * cadence, duration / 2.0)
+
+    def test_smoothed_tls_box_bounds_cover_filter_radius(self):
+        display_start, display_end = analysis.smoothed_transit_display_bounds(
+            start=1.0,
+            end=1.1,
+            cadence=0.01,
+            smooth_width=5,
+            domain_min=0.0,
+            domain_max=2.0,
+        )
+
+        self.assertAlmostEqual(display_start, 0.98)
+        self.assertAlmostEqual(display_end, 1.12)
 
     def test_segment_smoothing_does_not_bridge_observation_gaps(self):
         values = np.r_[np.zeros(20), np.ones(20)]

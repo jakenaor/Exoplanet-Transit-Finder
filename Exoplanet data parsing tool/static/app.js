@@ -3621,11 +3621,19 @@ function drawChart() {
   ctx.save();
   clipToChartPlot(geo);
   currentResult.transits.forEach((t, index) => {
-    if (t.end < xMin || t.start > xMax) return;
+    const paddedStart = Number(t.display_start);
+    const paddedEnd = Number(t.display_end);
+    const useDisplayBounds = currentView !== 'raw'
+      && !t.manually_edited
+      && Number.isFinite(paddedStart)
+      && Number.isFinite(paddedEnd);
+    const boxStart = useDisplayBounds ? paddedStart : t.start;
+    const boxEnd = useDisplayBounds ? paddedEnd : t.end;
+    if (boxEnd < xMin || boxStart > xMax) return;
     const range = transitFluxRange(t, flux);
     if (!range) return;
-    const x1 = Math.max(pad.left, xScale(t.start));
-    const x2 = Math.min(width - pad.right, xScale(t.end));
+    const x1 = Math.max(pad.left, xScale(boxStart));
+    const x2 = Math.min(width - pad.right, xScale(boxEnd));
     const y1 = Math.max(pad.top, Math.min(pad.top + innerH, yScale(range.high)));
     const y2 = Math.max(pad.top, Math.min(pad.top + innerH, yScale(range.low)));
     const boxWidth = Math.max(8, x2 - x1);
