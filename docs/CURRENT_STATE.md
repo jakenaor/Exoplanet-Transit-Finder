@@ -324,6 +324,7 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 - Broad automated period search can still prefer aliases. Use period min/max controls when a target period range is known.
 - Batch processing is sequential and client-driven. It is cancellable and shows backend state/elapsed time, but does not yet expose exact period-grid completion percentages.
 - Cleaned-view TLS overlays are display-smoothed for direct comparison with the cleaned line; the phase-folded overlay remains the unsmoothed physical model.
+- Known TLS duration bug to fix later: TLS can recover the correct ephemeris and box every observed transit, while the reported/drawn duration remains too narrow to encompass the full observed ingress-to-egress curve. The orange model and transit boxes may therefore begin after the flux starts falling or end before it returns to baseline.
 - FITS support handles table HDUs with recognizable time/flux columns; it does not analyze FITS image cubes or arbitrary instrument-specific products yet.
 - The data cleaning report/panel is still pending.
 - The automated regression suite covers job completion/cancellation, disconnect handling, TLS option parsing, limb-darkening validation, physical TLS recovery, pure-noise rejection, JSON serialization, and BLS runtime fallback. Broader real-dataset coverage is still needed.
