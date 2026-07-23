@@ -11,6 +11,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
 sys.path.insert(0, str(APP_DIR))
 
 import analysis  # noqa: E402
+import tls_search  # noqa: E402
 
 
 class FormItem:
@@ -118,6 +119,91 @@ class TLSSearchTests(unittest.TestCase):
 
         self.assertIs(result, sentinel)
         fallback.assert_called_once()
+
+    def test_model_compaction_preserves_narrow_transit_bottoms(self):
+        time_values = np.arange(200000, dtype=float)
+        flux_values = np.ones_like(time_values)
+        transit_indices = np.arange(1000, 199000, 5000)
+        flux_values[transit_indices] = 0.975
+
+        compact_time, compact_flux = tls_search.compact_model(
+            time_values,
+            flux_values,
+            max_points=2000,
+        )
+
+        kept_times = set(np.asarray(compact_time, dtype=int).tolist())
+        self.assertTrue(set(transit_indices.tolist()).issubset(kept_times))
+        self.assertEqual(min(compact_flux), 0.975)
+        self.assertLessEqual(len(compact_time), 2000)
+
+    def test_duration_is_measured_from_folded_physical_model(self):
+        phase = np.linspace(-0.5, 0.5, 10001)
+        flux = np.ones_like(phase)
+        flux[np.abs(phase) <= 0.02] = 0.98
+
+        duration = tls_search.duration_from_folded_model(phase, flux, period=1.0)
+
+        self.assertAlmostEqual(duration, 0.04, delta=0.0003)
+
+    def test_observation_aligned_model_keeps_every_visible_transit(self):
+        time_values = np.linspace(0.0, 10.0, 10001)
+        period = 1.0
+        epoch = 0.2
+        folded_phase = np.linspace(-0.5, 0.5, 2001)
+        transit_shape = np.clip(1.0 - np.abs(folded_phase) / 0.025, 0.0, 1.0)
+        folded_flux = 1.0 - 0.02 * transit_shape
+        model = {
+            "folded_phase_days": folded_phase.tolist(),
+            "folded_flux": folded_flux.tolist(),
+        }
+
+        aligned = analysis.model_flux_at_observations(
+            time_values,
+            period,
+            epoch,
+            model,
+        )
+        smoothed = analysis.moving_average_by_segments(
+            aligned,
+            21,
+            [(0, len(time_values))],
+        )
+        keep = analysis.downsample_indices_for_series(
+            [np.ones_like(smoothed), smoothed],
+            max_points=400,
+        )
+        compact_time = time_values[keep]
+        compact_flux = smoothed[keep]
+
+        for center in np.arange(epoch, time_values[-1], period):
+            nearby = np.abs(compact_time - center) <= 0.03
+            self.assertTrue(np.any(nearby), f"missing model samples near {center}")
+            self.assertLess(float(np.min(compact_flux[nearby])), 0.99)
+
+    def test_plot_smoothing_cannot_average_over_whole_transit(self):
+        cadence = 2.0 / (24.0 * 60.0)
+        duration = 0.0232
+
+        width = analysis.transit_preserving_smoothing_width(
+            requested_width=95,
+            cadence=cadence,
+            duration=duration,
+        )
+
+        self.assertEqual(width, 5)
+        self.assertLess(width * cadence, duration / 2.0)
+
+    def test_segment_smoothing_does_not_bridge_observation_gaps(self):
+        values = np.r_[np.zeros(20), np.ones(20)]
+        smoothed = analysis.moving_average_by_segments(
+            values,
+            9,
+            [(0, 20), (20, 40)],
+        )
+
+        self.assertTrue(np.allclose(smoothed[:20], 0.0))
+        self.assertTrue(np.allclose(smoothed[20:], 1.0))
 
 
 if __name__ == "__main__":

@@ -165,12 +165,48 @@ def odd_window_width(base_width, scale, minimum, maximum):
     return int(min(width, maximum if maximum % 2 == 1 else maximum - 1))
 
 
+def transit_preserving_smoothing_width(requested_width, cadence, duration):
+    if (
+        duration is None
+        or not math.isfinite(float(duration))
+        or float(duration) <= 0
+        or not math.isfinite(float(cadence))
+        or float(cadence) <= 0
+    ):
+        return int(requested_width)
+
+    transit_samples = float(duration) / float(cadence)
+    max_width = max(1, int(math.floor(transit_samples / 3.0)))
+    if max_width % 2 == 0:
+        max_width = max(1, max_width - 1)
+    return int(min(int(requested_width), max_width))
+
+
 def moving_average(values, width):
     if width <= 1:
         return values.copy()
     kernel = np.ones(width, dtype=float) / width
     padded = np.pad(values, (width // 2, width - 1 - width // 2), mode="edge")
     return np.convolve(padded, kernel, mode="valid")
+
+
+def moving_average_by_segments(values, width, segments):
+    values = np.asarray(values, dtype=float)
+    if width <= 1 or not segments:
+        return values.copy()
+
+    smoothed = values.copy()
+    for start, end in segments:
+        length = int(end - start)
+        if length <= 1:
+            continue
+        segment_width = min(int(width), length)
+        if segment_width % 2 == 0:
+            segment_width -= 1
+        if segment_width <= 1:
+            continue
+        smoothed[start:end] = moving_average(values[start:end], segment_width)
+    return smoothed
 
 
 def observing_segments(time):
@@ -2438,10 +2474,74 @@ def downsample_indices(flux, max_points=MAX_PLOT_POINTS):
     return np.asarray(sorted(set(keep)), dtype=int)
 
 
+def downsample_indices_for_series(series_values, max_points=MAX_PLOT_POINTS):
+    series = [np.asarray(values, dtype=float) for values in series_values if values is not None]
+    if not series:
+        return np.asarray([], dtype=int)
+    size = min(len(values) for values in series)
+    if size <= max_points:
+        return np.arange(size, dtype=int)
+
+    points_per_bucket = max(2, 2 * len(series))
+    bucket_count = max(1, (max_points - 2) // points_per_bucket)
+    edges = np.linspace(0, size, bucket_count + 1, dtype=int)
+    keep = {0, size - 1}
+    for start, end in zip(edges[:-1], edges[1:]):
+        if end <= start:
+            continue
+        for values in series:
+            bucket = values[start:end]
+            finite = np.isfinite(bucket)
+            if not np.any(finite):
+                continue
+            finite_indices = np.flatnonzero(finite)
+            finite_values = bucket[finite]
+            keep.add(start + int(finite_indices[int(np.argmin(finite_values))]))
+            keep.add(start + int(finite_indices[int(np.argmax(finite_values))]))
+    return np.asarray(sorted(keep), dtype=int)
+
+
 def downsample_for_plot(time, flux, smooth_flux, max_points=MAX_PLOT_POINTS):
     n = len(time)
     keep = downsample_indices(smooth_flux if n > max_points else flux, max_points)
     return time[keep], flux[keep], smooth_flux[keep]
+
+
+def model_flux_at_observations(time, period, epoch, transit_model):
+    if (
+        transit_model is None
+        or period is None
+        or epoch is None
+        or not math.isfinite(float(period))
+        or float(period) <= 0
+        or not math.isfinite(float(epoch))
+    ):
+        return None
+
+    model_phase = np.asarray(transit_model.get("folded_phase_days", []), dtype=float)
+    model_flux = np.asarray(transit_model.get("folded_flux", []), dtype=float)
+    size = min(model_phase.size, model_flux.size)
+    if size < 2:
+        return None
+    model_phase = model_phase[:size]
+    model_flux = model_flux[:size]
+    valid = np.isfinite(model_phase) & np.isfinite(model_flux)
+    model_phase = model_phase[valid]
+    model_flux = model_flux[valid]
+    if model_phase.size < 2:
+        return None
+
+    order = np.argsort(model_phase)
+    model_phase = model_phase[order]
+    model_flux = model_flux[order]
+    model_phase, unique_indices = np.unique(model_phase, return_index=True)
+    model_flux = model_flux[unique_indices]
+    if model_phase.size < 2:
+        return None
+
+    period = float(period)
+    phase = ((np.asarray(time, dtype=float) - float(epoch) + period / 2.0) % period) - period / 2.0
+    return np.interp(phase, model_phase, model_flux, left=1.0, right=1.0)
 
 
 def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration, max_points=MAX_PLOT_POINTS):
@@ -2532,12 +2632,43 @@ def analyze(time, flux, options=None):
     raw_low, raw_high = robust_flux_limits(analysis_flux, sigma=4.0)
     raw_clipped = np.clip(analysis_flux, raw_low, raw_high)
 
+    transit_model = detection.get("transit_model")
     base_smooth_width = int(max(25, min(251, len(analysis_flux) // 300)))
     smooth_width = odd_window_width(base_smooth_width, float(options["smoothing"]), 5, 601)
-    smooth_flux = moving_average(raw_clipped, smooth_width)
-    plot_time, plot_raw, plot_smooth = downsample_for_plot(display_time, raw_clipped, smooth_flux)
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    period_sde = finite_number(detection.get("period_sde"))
+    if transit_model is not None and period_sde is not None and period_sde >= 5.0:
+        smooth_width = transit_preserving_smoothing_width(
+            smooth_width,
+            cadence,
+            detection.get("period_duration"),
+        )
+    smooth_flux = moving_average_by_segments(raw_clipped, smooth_width, segments)
+
+    observed_model_flux = model_flux_at_observations(
+        time,
+        detection.get("period"),
+        detection.get("period_epoch"),
+        transit_model,
+    )
+    display_model_flux = None
+    if observed_model_flux is not None:
+        display_model_flux = moving_average_by_segments(observed_model_flux, smooth_width, segments)
+
+    plot_keep = downsample_indices_for_series(
+        [smooth_flux, display_model_flux] if display_model_flux is not None else [smooth_flux],
+        MAX_PLOT_POINTS,
+    )
+    plot_time = display_time[plot_keep]
+    plot_raw = raw_clipped[plot_keep]
+    plot_smooth = smooth_flux[plot_keep]
     raw_flux_min, raw_flux_max = domain_for(raw_clipped, 0.5, 99.5)
-    clean_flux_min, clean_flux_max = domain_for(smooth_flux, 0.2, 99.8)
+    clean_domain_values = (
+        np.r_[smooth_flux, display_model_flux]
+        if display_model_flux is not None
+        else smooth_flux
+    )
+    clean_flux_min, clean_flux_max = domain_for(clean_domain_values, 0.2, 99.8)
     phase_folded = build_phase_folded_plot(
         time,
         raw_clipped,
@@ -2546,6 +2677,16 @@ def analyze(time, flux, options=None):
         detection["period_epoch"],
         detection["period_duration"],
     )
+
+    if transit_model is not None and display_model_flux is not None:
+        transit_model = {
+            **transit_model,
+            "time": plot_time.tolist(),
+            "flux": display_model_flux[plot_keep].tolist(),
+            "time_series_representation": "observation-aligned and plot-smoothed",
+            "plot_smooth_points": smooth_width,
+        }
+        detection = {**detection, "transit_model": transit_model}
 
     display_transits = []
     for transit in detection["transits"]:
@@ -2574,7 +2715,10 @@ def analyze(time, flux, options=None):
         zoom_time_min = float(max(0.0, first["start"] - pad))
         zoom_time_max = float(min(display_time[-1], last["end"] + pad))
         zoom_mask = (display_time >= zoom_time_min) & (display_time <= zoom_time_max)
-        zoom_flux_min, zoom_flux_max = domain_for(smooth_flux[zoom_mask], 0.0, 100.0)
+        zoom_values = smooth_flux[zoom_mask]
+        if display_model_flux is not None:
+            zoom_values = np.r_[zoom_values, display_model_flux[zoom_mask]]
+        zoom_flux_min, zoom_flux_max = domain_for(zoom_values, 0.0, 100.0)
         zoom_domain = {
             "time_min": zoom_time_min,
             "time_max": zoom_time_max,

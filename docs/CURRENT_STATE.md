@@ -100,6 +100,8 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - TLS SDE, raw SDE, white-noise FAP, combined SNR, period uncertainty, odd/even mismatch, per-transit statistics, and model payloads.
   - TLS-derived transit boxes instead of relying on the local prominence detector for shallow signals.
   - Physical model overlays in time-series and phase-folded views.
+  - Time-series model overlays are evaluated at the actual observation timestamps, smoothed with the same transit-safe display window as the cleaned curve, and downsampled with transit extrema preserved.
+  - Transit duration is measured from the fitted folded physical model. The reference engine's original gap-fill-adjusted value is retained as `engine_duration` for diagnostics.
 - Period displayed in Julian days.
 - Period search controls:
   - Minimum period.
@@ -286,6 +288,13 @@ Observed verification results from recent work:
   - A bounded `3-4` day, oversampling `1` job completed in about `20.76` seconds and recovered `3.525006` days, TLS SDE about `26.84`, FAP `8.0032e-5`, and combined SNR about `60.67`.
   - A separate broad TLS job was cancelled in about `1.09` seconds; its worker stopped and the app still returned HTTP `200` for the index page.
   - The regression suite now covers spawned-job completion, running-job cancellation, disconnect-safe JSON writes, job-route parsing, TLS recovery/noise gating, and BLS fallback.
+- 2026-07-22 TLS time-overlay/duration fix verification:
+  - The pre-fix WASP-43 payload retained a time-series model-bottom point for only `4/49` observed transits after uniform compaction.
+  - The reference result's global gap-fill correction reported about `0.002404` days (3.46 minutes), while its fitted folded model spans about `0.023388` days (33.68 minutes).
+  - The corrected constrained TLS run recovered the same `0.8134680414`-day period, used the folded-model duration, and produced `49/49` observed transits with aligned model samples.
+  - Cleaned-view smoothing was capped from `95` samples (about 190 minutes) to `5` samples for this transit, preventing the display line from averaging away the event.
+  - The model and cleaned line now use the same `8060`-point observation-aligned plot grid; the median absolute difference between their per-transit bottoms was about `0.0030` relative flux.
+  - Model compaction now retains bucket minima/maxima, and regression tests cover narrow-transit preservation, folded-model duration measurement, observation-aligned model coverage, transit-safe smoothing, and segment-boundary smoothing.
 
 Commands used for basic checks:
 
@@ -312,6 +321,7 @@ As of 2026-07-20, the in-app browser surface was unavailable in the coding sessi
 - Top period candidates are exposed, but harmonics/aliases are not yet analyzed deeply.
 - Broad automated period search can still prefer aliases. Use period min/max controls when a target period range is known.
 - Batch processing is sequential and client-driven. It is cancellable and shows backend state/elapsed time, but does not yet expose exact period-grid completion percentages.
+- Cleaned-view TLS overlays are display-smoothed for direct comparison with the cleaned line; the phase-folded overlay remains the unsmoothed physical model.
 - FITS support handles table HDUs with recognizable time/flux columns; it does not analyze FITS image cubes or arbitrary instrument-specific products yet.
 - The data cleaning report/panel is still pending.
 - The automated regression suite covers job completion/cancellation, disconnect handling, TLS option parsing, limb-darkening validation, physical TLS recovery, pure-noise rejection, JSON serialization, and BLS runtime fallback. Broader real-dataset coverage is still needed.

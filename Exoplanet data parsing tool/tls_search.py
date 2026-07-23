@@ -116,10 +116,57 @@ def compact_model(time_values, flux_values, max_points=MAX_MODEL_POINTS):
     time_values = time_values[valid]
     flux_values = flux_values[valid]
     if time_values.size > max_points:
-        keep = np.linspace(0, time_values.size - 1, max_points, dtype=int)
+        # Uniform subsampling can skip every sample in a narrow transit. Retain
+        # the local minimum and maximum from each time-ordered bucket so ingress,
+        # the transit bottom, egress, and baseline survive compaction.
+        bucket_count = max(1, (max_points - 2) // 2)
+        edges = np.linspace(0, time_values.size, bucket_count + 1, dtype=int)
+        keep = {0, int(time_values.size - 1)}
+        for start, end in zip(edges[:-1], edges[1:]):
+            if end <= start:
+                continue
+            bucket = flux_values[start:end]
+            keep.add(start + int(np.argmin(bucket)))
+            keep.add(start + int(np.argmax(bucket)))
+        keep = np.asarray(sorted(keep), dtype=int)
         time_values = time_values[keep]
         flux_values = flux_values[keep]
     return time_values.tolist(), flux_values.tolist()
+
+
+def duration_from_folded_model(phase_days, model_flux, period=None):
+    phase_days = np.asarray(phase_days, dtype=float).reshape(-1)
+    model_flux = np.asarray(model_flux, dtype=float).reshape(-1)
+    size = min(phase_days.size, model_flux.size)
+    if size < 3:
+        return None
+    phase_days = phase_days[:size]
+    model_flux = model_flux[:size]
+    valid = np.isfinite(phase_days) & np.isfinite(model_flux)
+    phase_days = phase_days[valid]
+    model_flux = model_flux[valid]
+    if phase_days.size < 3:
+        return None
+
+    baseline = float(np.max(model_flux))
+    bottom = float(np.min(model_flux))
+    depth = baseline - bottom
+    if not math.isfinite(depth) or depth <= 0:
+        return None
+
+    # The reference result duration can be compressed by its global gap
+    # fill-factor correction. The fitted folded model still contains the true
+    # T14-like support, so measure where it differs materially from baseline.
+    in_transit = model_flux < baseline - depth * 0.001
+    if np.count_nonzero(in_transit) < 2:
+        return None
+    transit_phase = phase_days[in_transit]
+    duration = float(np.max(transit_phase) - np.min(transit_phase))
+    if duration <= 0:
+        return None
+    if period is not None and duration >= float(period) * 0.5:
+        return None
+    return duration
 
 
 def tls_engine_version():
@@ -207,6 +254,10 @@ def run_tls_search(time, flux, options):
     folded_phase = np.asarray(getattr(results, "model_folded_phase", []), dtype=float)
     folded_model = np.asarray(getattr(results, "model_folded_model", []), dtype=float)
     folded_phase_days = (folded_phase - 0.5) * period if folded_phase.size else folded_phase
+    engine_duration = duration
+    fitted_model_duration = duration_from_folded_model(folded_phase_days, folded_model, period)
+    if fitted_model_duration is not None:
+        duration = fitted_model_duration
     model_folded_phase, model_folded_flux = compact_model(folded_phase_days, folded_model)
 
     transit_times = [time_origin + value for value in finite_list(getattr(results, "transit_times", []))]
@@ -224,6 +275,7 @@ def run_tls_search(time, flux, options):
         "period": period,
         "period_uncertainty": finite_number(getattr(results, "period_uncertainty", None)),
         "duration": duration,
+        "engine_duration": engine_duration,
         "transit_time": time_origin + transit_time_relative,
         "power": finite_number(getattr(results, "SDE_raw", None)),
         "sde": finite_number(getattr(results, "SDE", None)),
