@@ -608,7 +608,7 @@ function updateDetectionReadouts() {
 function resetDetectionControls() {
   strictnessInput.value = '1';
   smoothingInput.value = '1';
-  searchModeInput.value = 'bls';
+  searchModeInput.value = 'tls';
   tlsTemplateInput.value = 'default';
   stellarRadiusInput.value = '';
   stellarMassInput.value = '';
@@ -617,7 +617,7 @@ function resetDetectionControls() {
   tlsOversamplingInput.value = '3';
   tlsMinTransitsInput.value = '3';
   tlsMinDepthPpmInput.value = '10';
-  tlsThreadsInput.value = '1';
+  tlsThreadsInput.value = '4';
   tlsDurationGridStepInput.value = '1.1';
   minDepthInput.value = '';
   minDurationInput.value = '';

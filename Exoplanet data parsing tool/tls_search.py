@@ -201,7 +201,7 @@ def run_tls_search(time, flux, options):
         "oversampling_factor": int(options.get("tls_oversampling", 3)),
         "duration_grid_step": float(options.get("tls_duration_grid_step", 1.1)),
         "transit_depth_min": float(options.get("tls_min_depth_ppm", 10.0)) / 1000000.0,
-        "use_threads": int(options.get("tls_threads", 1)),
+        "use_threads": int(options.get("tls_threads", 4)),
         "show_progress_bar": False,
         "verbose": False,
     }

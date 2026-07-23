@@ -26,7 +26,7 @@ MAX_PERIODOGRAM_POINTS = 1600
 DEFAULT_DETECTION_OPTIONS = {
     "strictness": 1.0,
     "smoothing": 1.0,
-    "search_mode": "bls",
+    "search_mode": "tls",
     "min_depth": None,
     "min_duration": None,
     "max_duration": None,
@@ -39,7 +39,7 @@ DEFAULT_DETECTION_OPTIONS = {
     "limb_darkening_u2": None,
     "tls_oversampling": 3,
     "tls_min_transits": 3,
-    "tls_threads": 1,
+    "tls_threads": 4,
     "tls_min_depth_ppm": 10.0,
     "tls_duration_grid_step": 1.1,
 }
@@ -113,7 +113,7 @@ def parse_detection_options(form):
             "tls": "tls",
             "tls-style": "tls",
         },
-        "bls",
+        DEFAULT_DETECTION_OPTIONS["search_mode"],
     )
 
     options["min_depth"] = parse_optional_float(form, "minDepth", 0.0, None)
@@ -133,7 +133,10 @@ def parse_detection_options(form):
     options["limb_darkening_u2"] = parse_optional_float(form, "limbDarkeningU2", -1.0, 2.0)
     options["tls_oversampling"] = parse_optional_int(form, "tlsOversampling", 1, 9) or 3
     options["tls_min_transits"] = parse_optional_int(form, "tlsMinTransits", 2, 10) or 3
-    options["tls_threads"] = parse_optional_int(form, "tlsThreads", 1, 8) or 1
+    options["tls_threads"] = (
+        parse_optional_int(form, "tlsThreads", 1, 8)
+        or DEFAULT_DETECTION_OPTIONS["tls_threads"]
+    )
     options["tls_min_depth_ppm"] = parse_optional_float(form, "tlsMinDepthPpm", 0.1, 500000.0) or 10.0
     options["tls_duration_grid_step"] = parse_optional_float(form, "tlsDurationGridStep", 1.01, 2.0) or 1.1
     limb_u1 = options["limb_darkening_u1"]
@@ -1508,7 +1511,7 @@ def detect_transits(time, flux, options=None):
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
     median_flux = float(np.median(flux))
-    search_mode = options.get("search_mode", "bls")
+    search_mode = options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
     if search_mode == "tls":
         flux_mad = float(np.median(np.abs(flux - median_flux)))
         detection = {

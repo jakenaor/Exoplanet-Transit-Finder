@@ -81,7 +81,7 @@
             </label>
             <select id="searchModeInput">
               <option value="bls">BLS + regularity</option>
-              <option value="tls">Physical TLS</option>
+              <option value="tls" selected>Physical TLS</option>
             </select>
           </div>
           <div id="tlsOptions" class="tls-options" hidden>
@@ -125,7 +125,7 @@
               </div>
               <div class="control-row">
                 <label class="control-label" for="tlsThreadsInput"><span>CPU workers</span></label>
-                <input id="tlsThreadsInput" type="number" min="1" max="8" step="1" value="1">
+                <input id="tlsThreadsInput" type="number" min="1" max="8" step="1" value="4">
               </div>
               <div class="control-row">
                 <label class="control-label" for="tlsDurationGridStepInput"><span>Duration grid step</span></label>

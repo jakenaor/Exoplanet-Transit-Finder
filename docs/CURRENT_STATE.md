@@ -92,11 +92,13 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails at runtime.
 - Physical Transit Least Squares using `transitleastsquares` 1.32:
+  - Physical TLS is the default search mode.
   - Limb-darkened, grazing, and box comparison templates.
   - Ingress/egress-aware fitting over the unbinned phase-folded light curve.
   - Physically constrained period/duration grids.
   - Optional stellar mass/radius and quadratic limb-darkening priors.
   - Configurable period oversampling, duration-grid step, minimum transit count, minimum depth, and CPU workers.
+  - Four CPU workers are used by default to parallelize the unchanged TLS search grid without changing the fitted result.
   - TLS SDE, raw SDE, white-noise FAP, combined SNR, period uncertainty, odd/even mismatch, per-transit statistics, and model payloads.
   - TLS-derived transit boxes instead of relying on the local prominence detector for shallow signals.
   - Physical model overlays in time-series and phase-folded views.

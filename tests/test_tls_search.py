@@ -46,6 +46,19 @@ def synthetic_light_curve(seed=4, depth=0.006):
 
 
 class TLSOptionTests(unittest.TestCase):
+    def test_tls_and_four_workers_are_defaults(self):
+        options = analysis.parse_detection_options({})
+
+        self.assertEqual(options["search_mode"], "tls")
+        self.assertEqual(options["tls_threads"], 4)
+
+        index_html = (APP_DIR / "static" / "index.html").read_text()
+        app_js = (APP_DIR / "static" / "app.js").read_text()
+        self.assertIn('<option value="tls" selected>Physical TLS</option>', index_html)
+        self.assertIn('id="tlsThreadsInput" type="number" min="1" max="8" step="1" value="4"', index_html)
+        self.assertIn("searchModeInput.value = 'tls';", app_js)
+        self.assertIn("tlsThreadsInput.value = '4';", app_js)
+
     def test_parses_physical_tls_options(self):
         options = analysis.parse_detection_options({
             "searchMode": FormItem("tls"),
