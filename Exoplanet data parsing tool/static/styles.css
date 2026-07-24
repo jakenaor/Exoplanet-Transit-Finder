@@ -960,6 +960,14 @@ th {
   flex: 0 0 auto;
 }
 
+.progress-elapsed {
+  margin-top: -3px;
+  color: #737d89;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
 .progress-track {
   height: 9px;
   overflow: hidden;

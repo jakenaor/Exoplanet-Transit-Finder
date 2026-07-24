@@ -66,6 +66,7 @@ let activeAnalysisJobId = null;
 let analysisCancelRequested = false;
 let progressTimer = null;
 let progressValues = [];
+let progressElapsedStates = [];
 let currentResult = null;
 let currentView = 'zoom';
 let currentViewport = null;
@@ -364,9 +365,52 @@ function stopProgressTimer() {
   }
 }
 
+function renderProgressElapsed(index) {
+  if (!analysisProgressEl) return;
+  const row = analysisProgressEl.querySelector(`[data-progress-index="${index}"]`);
+  const elapsedEl = row?.querySelector('[data-progress-elapsed]');
+  const state = progressElapsedStates[index];
+  if (!elapsedEl || !state) return;
+  elapsedEl.hidden = !state.visible;
+  if (!state.visible) return;
+  const liveSeconds = state.seconds + (
+    state.ticking ? Math.max(0, Date.now() - state.updatedAt) / 1000 : 0
+  );
+  elapsedEl.textContent = `Elapsed ${formatJobElapsed(liveSeconds)}`;
+}
+
+function startProgressTimer() {
+  stopProgressTimer();
+  progressTimer = window.setInterval(() => {
+    progressElapsedStates.forEach((state, index) => {
+      if (state?.visible) renderProgressElapsed(index);
+    });
+  }, 250);
+}
+
+function setProgressElapsed(index, seconds, ticking = true, visible = true) {
+  progressElapsedStates[index] = {
+    seconds: Math.max(0, Number(seconds) || 0),
+    updatedAt: Date.now(),
+    ticking,
+    visible,
+  };
+  renderProgressElapsed(index);
+}
+
+function pauseProgressElapsed(index) {
+  const state = progressElapsedStates[index];
+  if (!state) return;
+  const seconds = state.seconds + (
+    state.ticking ? Math.max(0, Date.now() - state.updatedAt) / 1000 : 0
+  );
+  setProgressElapsed(index, seconds, false, state.visible);
+}
+
 function resetAnalysisProgress() {
   stopProgressTimer();
   progressValues = [];
+  progressElapsedStates = [];
   if (analysisProgressEl) {
     analysisProgressEl.hidden = true;
     analysisProgressEl.innerHTML = '';
@@ -376,6 +420,12 @@ function resetAnalysisProgress() {
 function renderProgressRows(files) {
   stopProgressTimer();
   progressValues = files.map(() => 0);
+  progressElapsedStates = files.map(() => ({
+    seconds: 0,
+    updatedAt: Date.now(),
+    ticking: false,
+    visible: false,
+  }));
   if (!analysisProgressEl) return;
   updateSidebarWidth(files);
   analysisProgressEl.hidden = files.length === 0;
@@ -385,11 +435,13 @@ function renderProgressRows(files) {
         <span title="${escapeHtml(file.name)}">${index + 1}. ${escapeHtml(file.name)}</span>
         <span data-progress-percent>Pending</span>
       </div>
+      <div class="progress-elapsed" data-progress-elapsed hidden>Elapsed 0s</div>
       <div class="progress-track" role="progressbar" aria-label="Analysis progress for ${escapeHtml(file.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <div class="progress-fill"></div>
       </div>
     </div>
   `).join('');
+  if (files.length) startProgressTimer();
   showRunStatus();
 }
 
@@ -407,9 +459,9 @@ function setFileProgress(index, value, label, state = 'active') {
 }
 
 function beginFileProgress(index) {
-  stopProgressTimer();
   showRunStatus();
   setFileProgress(index, 8, 'Uploading', 'active');
+  setProgressElapsed(index, 0, true, true);
 }
 
 function setIndeterminateFileProgress(index, label) {
@@ -424,7 +476,7 @@ function setIndeterminateFileProgress(index, label) {
 }
 
 function finishFileProgress(index, outcome = 'complete') {
-  stopProgressTimer();
+  pauseProgressElapsed(index);
   const labels = { complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' };
   setFileProgress(index, outcome === 'cancelled' ? 0 : 100, labels[outcome] || 'Failed', outcome);
 }
@@ -747,6 +799,8 @@ function formatJobElapsed(seconds) {
 }
 
 function updateProgressFromJob(index, job, searchMode) {
+  const active = ['queued', 'running', 'cancelling'].includes(job.status);
+  setProgressElapsed(index, job.elapsed_seconds, active, true);
   if (job.status === 'queued') {
     const position = Number(job.queue_position);
     const label = Number.isFinite(position) ? `Queued #${position}` : 'Queued';
@@ -757,7 +811,7 @@ function updateProgressFromJob(index, job, searchMode) {
   if (job.status === 'cancelling') {
     setIndeterminateFileProgress(index, 'Cancelling…');
   } else if (job.status === 'running') {
-    setIndeterminateFileProgress(index, `${engine} running • ${formatJobElapsed(job.elapsed_seconds)}`);
+    setIndeterminateFileProgress(index, `${engine} running`);
   }
 }
 

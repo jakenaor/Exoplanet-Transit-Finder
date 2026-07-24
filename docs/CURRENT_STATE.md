@@ -52,11 +52,12 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
-- The bottom-right UI version indicator is currently `v55`. Increment it for every subsequent bug fix; adding the indicator itself intentionally did not increment the version.
+- The title-line UI version indicator is currently `v56`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.
 - Run Status reports queued/running state and honest elapsed time instead of a synthetic completion percentage.
+- Every active Run Status row shows a dedicated elapsed timer while uploading, queued, running, or cancelling. It is anchored to backend elapsed time on each poll and ticks locally between polls.
 - The visible Cancel analysis control terminates the active analysis process and its TLS worker-process group without stopping the web server.
 - Sidebar width expands from selected/progress filenames, and progress filenames wrap to two lines before truncating.
 - Batch Results uses a custom styled picker with two-line filenames and compact verdict/transit badges instead of the native OS dropdown.
