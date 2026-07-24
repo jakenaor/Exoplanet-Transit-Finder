@@ -382,6 +382,39 @@ class TLSSearchTests(unittest.TestCase):
         self.assertAlmostEqual(display_start, 0.98)
         self.assertAlmostEqual(display_end, 1.12)
 
+    def test_phase_folded_bins_preserve_individual_transit_shape(self):
+        cadence = 10.0 / (24.0 * 60.0)
+        time_values = np.arange(0.0, 60.0, cadence)
+        period = 3.5
+        epoch = 1.2
+        duration = 0.15
+        phase = ((time_values - epoch + period / 2.0) % period) - period / 2.0
+        absolute_phase = np.abs(phase)
+        transit_profile = np.zeros_like(phase)
+        transit_profile[absolute_phase <= 0.045] = 1.0
+        ingress = (absolute_phase > 0.045) & (absolute_phase < duration / 2.0)
+        transit_profile[ingress] = (
+            duration / 2.0 - absolute_phase[ingress]
+        ) / (duration / 2.0 - 0.045)
+        flux_values = 1.0 - 0.016 * transit_profile
+
+        folded = analysis.build_phase_folded_plot(
+            time_values,
+            flux_values,
+            flux_values,
+            period,
+            epoch,
+            duration,
+        )
+        binned_phase = np.asarray(folded["binned_phase"])
+        binned_flux = np.asarray(folded["binned_flux"])
+        in_transit_bins = np.abs(binned_phase) <= duration / 2.0
+        outside_transit = (np.abs(binned_phase) >= 0.11) & (np.abs(binned_phase) <= 0.18)
+
+        self.assertGreaterEqual(np.count_nonzero(in_transit_bins), 16)
+        self.assertLess(float(np.min(binned_flux[in_transit_bins])), 0.985)
+        self.assertGreater(float(np.min(binned_flux[outside_transit])), 0.999)
+
     def test_segment_smoothing_does_not_bridge_observation_gaps(self):
         values = np.r_[np.zeros(20), np.ones(20)]
         smoothed = analysis.moving_average_by_segments(

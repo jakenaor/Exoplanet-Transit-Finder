@@ -2623,8 +2623,33 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
     point_raw = raw_flux[keep]
     point_smooth = smooth_flux[keep]
 
-    bin_count = int(max(60, min(280, len(phase) // 180)))
-    edges = np.linspace(-period / 2.0, period / 2.0, bin_count + 1)
+    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
+    duration_value = float(duration) if duration is not None and math.isfinite(duration) and duration > 0 else None
+    focus_half_width = max(period * 0.04, cadence * 30.0, 1.0)
+    if duration_value is not None:
+        focus_half_width = max(focus_half_width, duration_value * 4.0)
+    focus_half_width = min(period / 2.0, focus_half_width)
+
+    global_bin_count = int(max(60, min(280, len(phase) // 180)))
+    global_edges = np.linspace(-period / 2.0, period / 2.0, global_bin_count + 1)
+    focus_point_count = int(np.count_nonzero(np.abs(phase) <= focus_half_width))
+    if duration_value is not None:
+        target_focus_width = max(cadence, duration_value / 24.0)
+    else:
+        target_focus_width = max(cadence, focus_half_width / 80.0)
+    desired_focus_bins = int(math.ceil(2.0 * focus_half_width / target_focus_width))
+    data_limited_focus_bins = max(40, focus_point_count // 8)
+    focus_bin_count = int(max(
+        40,
+        min(600, desired_focus_bins, data_limited_focus_bins),
+    ))
+    focus_edges = np.linspace(-focus_half_width, focus_half_width, focus_bin_count + 1)
+    edges = np.unique(np.r_[
+        global_edges[global_edges < -focus_half_width],
+        focus_edges,
+        global_edges[global_edges > focus_half_width],
+    ])
+    bin_count = len(edges) - 1
     bin_ids = np.digitize(phase, edges) - 1
     binned_phase = []
     binned_flux = []
@@ -2637,20 +2662,11 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
 
     binned_phase = np.asarray(binned_phase, dtype=float)
     binned_flux = np.asarray(binned_flux, dtype=float)
-    if binned_flux.size >= 7:
-        binned_flux = moving_average(binned_flux, 5)
 
     if binned_flux.size >= 5:
         flux_min, flux_max = domain_for(binned_flux, 0.0, 100.0)
     else:
         flux_min, flux_max = domain_for(raw_flux, 0.5, 99.5)
-
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    duration_value = float(duration) if duration is not None and math.isfinite(duration) and duration > 0 else None
-    focus_half_width = max(period * 0.04, cadence * 30.0, 1.0)
-    if duration_value is not None:
-        focus_half_width = max(focus_half_width, duration_value * 4.0)
-    focus_half_width = min(period / 2.0, focus_half_width)
 
     focus_mask = (binned_phase >= -focus_half_width) & (binned_phase <= focus_half_width)
     if np.count_nonzero(focus_mask) >= 5:

@@ -48,6 +48,26 @@ main {
   transition: grid-template-columns .22s cubic-bezier(.22, 1, .36, 1);
 }
 
+.app-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.app-title-row h1 {
+  margin-bottom: 0;
+}
+
+.version-indicator {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: .04em;
+  opacity: .55;
+}
+
 h1 {
   margin: 0 0 4px;
   font-size: 25px;

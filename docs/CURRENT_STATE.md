@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-07-22
+Last updated: 2026-07-24
 
 ## Canonical Location
 
@@ -52,6 +52,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
+- The bottom-right UI version indicator is currently `v55`. Increment it for every subsequent bug fix; adding the indicator itself intentionally did not increment the version.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.
@@ -80,6 +81,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
 - Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
+- Phase-folded median curves use duration-aware fine bins around phase zero and coarse bins elsewhere. They are not smoothed across phase bins, so short ingress, egress, and flat-bottom structure remain visible.
 - Periodogram chart mode that plots compact BLS power/SDE over searched periods and marks top candidates.
 - Ephemeris audit chart mode:
   - Shows predicted period windows from the recovered ephemeris.
@@ -193,6 +195,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Period min/max controls made period aliases visible and controllable; constraining the Kepler sample to `380-390` days previously returned about `386.16` days.
 - A repo-local `.venv` fixed Pylance missing-import warnings for `numpy`, `scipy`, and `astropy`.
 - Phase-folded view made repeated transit structure visually obvious when centered on phase 0.
+- Duration-aware phase binning fixed the HD 209458 folded curve, where only about 2.6 global bins previously covered the transit and a five-bin moving average broadened it into a false V/trapezoid. The current payload resolves that transit with 21 median bins and matches the individual-transit morphology.
 - Local curve-bounded boxes are much more readable than full-height boxes.
 - Manual editing is useful for correcting imperfect automatic boxes.
 - Detection strictness and smoothing controls affect candidate counts.
