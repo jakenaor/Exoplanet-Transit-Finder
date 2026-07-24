@@ -87,7 +87,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Colors detected boxes red when they are off-period.
   - Draws residual connectors and a compact ephemeris-fit legend.
 - Robust clipping and moving-average smoothing for visualization.
-- Per-observing-segment median normalization for gapped/multi-zone light curves.
+- Input-aware normalization for gapped/multi-zone light curves: absolute/relative flux uses per-observing-segment medians, while zero-centered residual flux is converted from fractional or ppm units to a baseline near 1 before segment normalization.
 - Transit detection using scipy peak/prominence logic with fallback threshold detection.
 - BLS orbital period estimate using `astropy.timeseries.BoxLeastSquares`.
 - Binned-BLS fallback period estimate when the full BLS path is unavailable or fails at runtime.

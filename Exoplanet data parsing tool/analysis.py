@@ -253,8 +253,52 @@ def observing_segments(time):
     ]
 
 
+def flux_normalization_plan(flux):
+    values = np.asarray(flux, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            "input_representation": "absolute or relative flux",
+            "residual_scale": None,
+            "method": "per-observing-segment median",
+        }
+
+    baseline = float(np.median(finite))
+    low, high = np.percentile(finite, [5.0, 95.0])
+    mad = float(np.median(np.abs(finite - baseline)))
+    robust_spread = max(1.4826 * mad, float((high - low) / 2.0), 1e-12)
+    crosses_zero = low < 0 < high
+    residual_like = (
+        not math.isfinite(baseline)
+        or baseline <= 1e-9
+        or (crosses_zero and abs(baseline) <= robust_spread * 5.0)
+    )
+    if not residual_like:
+        return {
+            "input_representation": "absolute or relative flux",
+            "residual_scale": None,
+            "method": "per-observing-segment median",
+        }
+
+    amplitude = float(np.percentile(np.abs(finite), 95.0))
+    residual_scale = 1000000.0 if amplitude > 1.0 else 1.0
+    return {
+        "input_representation": (
+            "zero-centered residual flux (ppm)"
+            if residual_scale == 1000000.0
+            else "zero-centered residual relative flux"
+        ),
+        "residual_scale": residual_scale,
+        "method": "residual-to-relative conversion, then per-observing-segment median",
+    }
+
+
 def normalize_flux_by_segments(time, flux):
+    plan = flux_normalization_plan(flux)
     normalized = np.asarray(flux, dtype=float).copy()
+    residual_scale = plan["residual_scale"]
+    if residual_scale is not None:
+        normalized = 1.0 + normalized / residual_scale
     segments = observing_segments(time)
 
     for start, end in segments:
@@ -682,13 +726,13 @@ def estimate_period_with_bls(time, flux, options=None):
 
 def normalized_flux_for_tls(time, flux):
     flux = np.asarray(flux, dtype=float)
-    baseline = float(np.median(flux))
-    if math.isfinite(baseline) and baseline > 1e-9:
-        normalized = flux / baseline
+    plan = flux_normalization_plan(flux)
+    residual_scale = plan["residual_scale"]
+    if residual_scale is not None:
+        normalized = 1.0 + flux / residual_scale
     else:
-        amplitude = float(np.percentile(np.abs(flux), 95))
-        scale = 1000000.0 if amplitude > 1.0 else 1.0
-        normalized = 1.0 + flux / scale
+        baseline = float(np.median(flux))
+        normalized = flux / baseline
 
     flattened = flattened_flux_for_period_search(time, normalized)
     if flattened is None:
@@ -2643,6 +2687,7 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
 def analyze(time, flux, options=None):
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
+    normalization_plan = flux_normalization_plan(flux)
     analysis_flux, segments = normalize_flux_by_segments(time, flux)
     detection = detect_transits(time, analysis_flux, options)
     time_reference = float(time[0])
@@ -2761,7 +2806,9 @@ def analyze(time, flux, options=None):
         "time_unit": "Julian days since first observation",
         "flux_unit": "relative flux",
         "normalization": {
-            "method": "per-observing-segment median",
+            "method": normalization_plan["method"],
+            "input_representation": normalization_plan["input_representation"],
+            "residual_scale": normalization_plan["residual_scale"],
             "segment_count": len(segments),
             "segment_time_ranges": [
                 {

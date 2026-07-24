@@ -90,6 +90,44 @@ class TLSOptionTests(unittest.TestCase):
 
 
 class TLSSearchTests(unittest.TestCase):
+    def test_zero_centered_ppm_flux_is_converted_before_segment_normalization(self):
+        time_values = np.linspace(0.0, 20.0, 2001)
+        residual_ppm = np.random.default_rng(14).normal(3.0, 110.0, len(time_values))
+        residual_ppm[995:1006] -= 450.0
+
+        normalized, segments = analysis.normalize_flux_by_segments(
+            time_values,
+            residual_ppm,
+        )
+        plan = analysis.flux_normalization_plan(residual_ppm)
+        tls_flux, _ = analysis.normalized_flux_for_tls(time_values, residual_ppm)
+
+        self.assertEqual(segments, [(0, len(time_values))])
+        self.assertEqual(plan["input_representation"], "zero-centered residual flux (ppm)")
+        self.assertEqual(plan["residual_scale"], 1000000.0)
+        self.assertAlmostEqual(float(np.median(normalized)), 1.0, delta=1e-12)
+        self.assertGreater(float(np.min(normalized)), 0.999)
+        self.assertLess(float(np.max(normalized)), 1.001)
+        self.assertAlmostEqual(float(np.median(tls_flux)), 1.0, delta=1e-12)
+        self.assertGreater(float(np.min(tls_flux)), 0.999)
+        self.assertLess(float(np.max(tls_flux)), 1.001)
+
+    def test_absolute_relative_flux_keeps_fractional_transit_depth(self):
+        time_values = np.linspace(0.0, 10.0, 1001)
+        relative_flux = np.ones_like(time_values)
+        relative_flux[495:506] = 0.99
+
+        normalized, _ = analysis.normalize_flux_by_segments(
+            time_values,
+            relative_flux,
+        )
+        plan = analysis.flux_normalization_plan(relative_flux)
+
+        self.assertEqual(plan["input_representation"], "absolute or relative flux")
+        self.assertIsNone(plan["residual_scale"])
+        self.assertAlmostEqual(float(np.median(normalized)), 1.0)
+        self.assertAlmostEqual(float(np.min(normalized)), 0.99)
+
     def test_recovers_transit_with_reference_tls(self):
         time, flux, injected_period = synthetic_light_curve()
         result = analysis.analyze(time, flux, tls_options())
