@@ -262,18 +262,27 @@ def rescale_folded_model_duration(phase_days, model_flux, target_duration, perio
     in_transit = model_flux < baseline - depth * 0.001
     if np.count_nonzero(in_transit) < 2:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    transit_phase = phase_days[in_transit]
-    source_duration = float(np.max(transit_phase) - np.min(transit_phase))
+    transit_indices = np.flatnonzero(in_transit)
+    left_index = max(0, int(transit_indices[0]) - 1)
+    right_index = min(len(phase_days) - 1, int(transit_indices[-1]) + 1)
+    source_left = float(phase_days[left_index])
+    source_right = float(phase_days[right_index])
+    source_duration = source_right - source_left
     if source_duration <= 0:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
-    center = float((np.min(transit_phase) + np.max(transit_phase)) / 2.0)
+    source_center = (source_left + source_right) / 2.0
+    target_center = 0.0
     scale = target_duration / source_duration
-    scaled_transit_phase = center + (transit_phase - center) * scale
-    outside_target = np.abs(phase_days - center) > target_duration / 2.0
-    keep_baseline = (~in_transit) & outside_target
-    scaled_phase = np.r_[phase_days[keep_baseline], scaled_transit_phase]
-    scaled_flux = np.r_[model_flux[keep_baseline], model_flux[in_transit]]
+    contact_window = np.arange(len(phase_days))
+    contact_window = (contact_window >= left_index) & (contact_window <= right_index)
+    scaled_contact_phase = target_center + (
+        phase_days[contact_window] - source_center
+    ) * scale
+    outside_target = np.abs(phase_days - target_center) > target_duration / 2.0
+    keep_baseline = (~contact_window) & (~in_transit) & outside_target
+    scaled_phase = np.r_[phase_days[keep_baseline], scaled_contact_phase]
+    scaled_flux = np.r_[model_flux[keep_baseline], model_flux[contact_window]]
     scaled_order = np.argsort(scaled_phase)
     scaled_phase = scaled_phase[scaled_order]
     scaled_flux = scaled_flux[scaled_order]
@@ -536,7 +545,7 @@ def run_tls_search(time, flux, options):
         corrected_model_duration = None
 
     if corrected_model_duration is not None:
-        duration = corrected_model_duration
+        duration = uncompressed_duration
         payload_phase = corrected_phase
         payload_flux = corrected_flux
         duration_source = "TLS duration with sampling-gap compression removed"
@@ -572,8 +581,11 @@ def run_tls_search(time, flux, options):
             observed_flux,
             period,
         )
-        if observed_model_duration is not None and observed_model_duration > duration:
-            duration = observed_model_duration
+        if (
+            observed_model_duration is not None
+            and observed_refinement["duration"] > duration
+        ):
+            duration = observed_refinement["duration"]
             payload_phase = observed_phase
             payload_flux = observed_flux
             duration_source = "TLS model widened to observed phase-folded ingress/egress"

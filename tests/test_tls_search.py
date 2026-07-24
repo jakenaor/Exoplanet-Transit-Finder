@@ -227,15 +227,13 @@ class TLSSearchTests(unittest.TestCase):
             result["duration_source"],
             "TLS duration with sampling-gap compression removed",
         )
-        self.assertAlmostEqual(
-            tls_search.duration_from_folded_model(
-                result["model"]["folded_phase_days"],
-                result["model"]["folded_flux"],
-                period,
-            ),
-            0.10,
-            delta=0.002,
+        folded_phase = np.asarray(result["model"]["folded_phase_days"])
+        folded_flux = np.asarray(result["model"]["folded_flux"])
+        contact_indices = np.flatnonzero(
+            np.isclose(np.abs(folded_phase), result["duration"] / 2.0)
         )
+        self.assertEqual(contact_indices.size, 2)
+        self.assertTrue(np.allclose(folded_flux[contact_indices], 1.0))
 
     def test_observed_duration_refinement_covers_ingress_and_egress(self):
         time_values = np.linspace(0.0, 8.0, 8001)
@@ -259,6 +257,31 @@ class TLSSearchTests(unittest.TestCase):
         self.assertGreaterEqual(refinement["measured_end"], 0.049)
         self.assertGreaterEqual(refinement["duration"], 0.10)
         self.assertLess(refinement["duration"], 0.13)
+
+    def test_rescaled_folded_model_is_centered_inside_duration_box(self):
+        phase = np.linspace(-0.5, 0.5, 1001)
+        shifted_model = np.where(
+            (phase >= -0.07) & (phase <= 0.03),
+            0.98,
+            1.0,
+        )
+
+        scaled_phase, scaled_flux = tls_search.rescale_folded_model_duration(
+            phase,
+            shifted_model,
+            target_duration=0.06,
+            period=1.0,
+        )
+        support = scaled_phase[scaled_flux < 0.999]
+        left_contact = int(np.argmin(np.abs(scaled_phase + 0.03)))
+        right_contact = int(np.argmin(np.abs(scaled_phase - 0.03)))
+
+        self.assertAlmostEqual(float(scaled_phase[left_contact]), -0.03, delta=1e-9)
+        self.assertAlmostEqual(float(scaled_phase[right_contact]), 0.03, delta=1e-9)
+        self.assertAlmostEqual(float(scaled_flux[left_contact]), 1.0)
+        self.assertAlmostEqual(float(scaled_flux[right_contact]), 1.0)
+        self.assertGreater(float(np.min(support)), -0.03)
+        self.assertLess(float(np.max(support)), 0.03)
 
     def test_observation_aligned_model_keeps_every_visible_transit(self):
         time_values = np.linspace(0.0, 10.0, 10001)
