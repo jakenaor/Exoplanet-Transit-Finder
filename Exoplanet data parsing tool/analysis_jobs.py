@@ -1,5 +1,6 @@
 """Background process management for long-running light-curve analyses."""
 
+import inspect
 import multiprocessing
 import os
 import signal
@@ -15,13 +16,40 @@ TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
 def _analysis_worker(send_connection, time_values, flux_values, options, runner):
     """Run one analysis in an isolated process and return one terminal message."""
+    def publish_progress(stage, stage_label):
+        try:
+            send_connection.send({
+                "status": "progress",
+                "stage": str(stage),
+                "stage_label": str(stage_label),
+            })
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
     try:
         if hasattr(os, "setsid"):
             try:
                 os.setsid()
             except OSError:
                 pass
-        result = runner(time_values, flux_values, options)
+        try:
+            parameters = inspect.signature(runner).parameters.values()
+            supports_progress = any(
+                parameter.name == "progress_callback"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_progress = False
+        if supports_progress:
+            result = runner(
+                time_values,
+                flux_values,
+                options,
+                progress_callback=publish_progress,
+            )
+        else:
+            result = runner(time_values, flux_values, options)
         message = {"status": "completed", "result": result}
     except BaseException as exc:  # The parent must hear about worker-level failures.
         message = {"status": "failed", "error": str(exc) or exc.__class__.__name__}
@@ -69,6 +97,8 @@ class AnalysisJobManager:
             "connection": None,
             "result": None,
             "error": None,
+            "stage": "queued",
+            "stage_label": "Waiting for analysis worker",
         }
         with self.lock:
             if self.closed:
@@ -97,10 +127,14 @@ class AnalysisJobManager:
             if record["status"] == "queued":
                 record["status"] = "cancelled"
                 record["finished_at"] = time.time()
+                record["stage"] = "cancelled"
+                record["stage_label"] = "Cancelled"
                 self._drop_inputs_locked(record)
                 self._schedule_locked()
                 return self._public_record_locked(record)
             record["status"] = "cancelling"
+            record["stage"] = "cancelling"
+            record["stage_label"] = "Cancelling analysis"
             process = record.get("process")
 
         self._terminate_process(process)
@@ -114,6 +148,8 @@ class AnalysisJobManager:
                 record["finished_at"] = time.time()
                 record["error"] = None
                 record["result"] = None
+                record["stage"] = "cancelled"
+                record["stage_label"] = "Cancelled"
                 self._drop_inputs_locked(record)
             self._schedule_locked()
             return self._public_record_locked(record)
@@ -132,6 +168,8 @@ class AnalysisJobManager:
                 if record["status"] == "queued":
                     record["status"] = "cancelled"
                     record["finished_at"] = time.time()
+                    record["stage"] = "cancelled"
+                    record["stage_label"] = "Cancelled"
                     self._drop_inputs_locked(record)
 
         for process in active:
@@ -171,6 +209,8 @@ class AnalysisJobManager:
         process.daemon = False
         record["status"] = "running"
         record["started_at"] = time.time()
+        record["stage"] = "starting"
+        record["stage_label"] = "Starting analysis"
         record["process"] = process
         record["connection"] = receive_connection
         try:
@@ -181,6 +221,8 @@ class AnalysisJobManager:
             record["status"] = "failed"
             record["error"] = f"Could not start analysis worker: {exc}"
             record["finished_at"] = time.time()
+            record["stage"] = "failed"
+            record["stage_label"] = "Analysis failed"
             self._drop_inputs_locked(record)
             return
         send_connection.close()
@@ -195,7 +237,20 @@ class AnalysisJobManager:
     def _monitor(self, job_id, process, receive_connection):
         message = None
         try:
-            message = receive_connection.recv()
+            while True:
+                incoming = receive_connection.recv()
+                if incoming.get("status") != "progress":
+                    message = incoming
+                    break
+                with self.lock:
+                    record = self.jobs.get(job_id)
+                    if record is None or record["status"] != "running":
+                        continue
+                    record["stage"] = incoming.get("stage") or record.get("stage")
+                    record["stage_label"] = (
+                        incoming.get("stage_label")
+                        or record.get("stage_label")
+                    )
         except (EOFError, OSError):
             pass
         finally:
@@ -208,9 +263,13 @@ class AnalysisJobManager:
                 return
             if record["status"] in {"cancelled", "cancelling"}:
                 record["status"] = "cancelled"
+                record["stage"] = "cancelled"
+                record["stage_label"] = "Cancelled"
             elif message and message.get("status") == "completed":
                 record["status"] = "completed"
                 record["result"] = message.get("result")
+                record["stage"] = "completed"
+                record["stage_label"] = "Complete"
             else:
                 record["status"] = "failed"
                 record["error"] = (
@@ -218,6 +277,8 @@ class AnalysisJobManager:
                     if message
                     else f"Analysis worker exited unexpectedly (exit code {process.exitcode})."
                 )
+                record["stage"] = "failed"
+                record["stage_label"] = "Analysis failed"
             record["finished_at"] = record.get("finished_at") or time.time()
             record["process"] = None
             record["connection"] = None
@@ -244,6 +305,8 @@ class AnalysisJobManager:
             "finished_at": record.get("finished_at"),
             "elapsed_seconds": max(0.0, end - start),
             "queue_position": queued_before + 1 if record["status"] == "queued" else None,
+            "stage": record.get("stage"),
+            "stage_label": record.get("stage_label"),
         }
         if record["status"] == "failed":
             payload["error"] = record.get("error") or "Analysis failed."

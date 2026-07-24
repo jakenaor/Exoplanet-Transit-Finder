@@ -809,9 +809,9 @@ function updateProgressFromJob(index, job, searchMode) {
   }
   const engine = searchMode === 'tls' ? 'TLS' : 'Analysis';
   if (job.status === 'cancelling') {
-    setIndeterminateFileProgress(index, 'Cancelling…');
+    setIndeterminateFileProgress(index, job.stage_label || 'Cancelling…');
   } else if (job.status === 'running') {
-    setIndeterminateFileProgress(index, `${engine} running`);
+    setIndeterminateFileProgress(index, job.stage_label || `${engine} running`);
   }
 }
 

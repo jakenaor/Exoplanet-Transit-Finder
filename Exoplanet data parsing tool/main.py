@@ -65,6 +65,8 @@ def format_analysis_job_poll(job_id, job):
     queue_position = job.get("queue_position")
     if queue_position is not None:
         details.append(f"queue={queue_position}")
+    if job.get("stage_label"):
+        details.append(f"stage={json.dumps(str(job['stage_label']))}")
     if status == "failed" and job.get("error"):
         details.append(f"error={json.dumps(str(job['error']))}")
     return " ".join(details)

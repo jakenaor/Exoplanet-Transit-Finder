@@ -2700,12 +2700,23 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
     }
 
 
-def analyze(time, flux, options=None):
+def analyze(time, flux, options=None, progress_callback=None):
+    def report_progress(stage, stage_label):
+        if callable(progress_callback):
+            progress_callback(stage, stage_label)
+
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
+    report_progress("preparing", "Preparing light curve")
     normalization_plan = flux_normalization_plan(flux)
     analysis_flux, segments = normalize_flux_by_segments(time, flux)
+    search_mode = options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
+    if search_mode == "tls":
+        report_progress("tls_search", "Searching periods with TLS")
+    else:
+        report_progress("bls_search", "Searching periods with BLS")
     detection = detect_transits(time, analysis_flux, options)
+    report_progress("building", "Building transit model and plots")
     time_reference = float(time[0])
     display_time = time - time_reference
     raw_low, raw_high = robust_flux_limits(analysis_flux, sigma=4.0)
@@ -2790,6 +2801,7 @@ def analyze(time, flux, options=None):
         (float(time[start] - time_reference), float(time[end - 1] - time_reference))
         for start, end in segments
     ]
+    report_progress("vetting", "Calculating diagnostics")
     diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference, observed_ranges)
     planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
 
@@ -2816,6 +2828,7 @@ def analyze(time, flux, options=None):
             "flux_max": zoom_flux_max,
         }
 
+    report_progress("finalizing", "Finalizing results")
     return {
         "total_points": int(len(time)),
         "time_reference": time_reference,

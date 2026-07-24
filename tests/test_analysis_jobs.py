@@ -28,6 +28,12 @@ def slow_runner(time_values, flux_values, options):
     return {"finished": True}
 
 
+def staged_runner(time_values, flux_values, options, progress_callback=None):
+    progress_callback("tls_search", "Searching periods with TLS")
+    time.sleep(0.3)
+    return {"finished": True}
+
+
 def wait_for_terminal(manager, job_id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -68,6 +74,27 @@ class AnalysisJobManagerTests(unittest.TestCase):
         self.assertLess(job["elapsed_seconds"], 10)
         self.assertEqual(manager.get(submitted["job_id"])["status"], "cancelled")
 
+    def test_running_job_reports_worker_stage(self):
+        manager = AnalysisJobManager(start_method="spawn", runner=staged_runner)
+        self.addCleanup(manager.shutdown)
+        submitted = manager.submit(np.arange(20), np.ones(20), {})
+        deadline = time.monotonic() + 5
+        observed = None
+        while time.monotonic() < deadline:
+            job = manager.get(submitted["job_id"])
+            if job.get("stage") == "tls_search":
+                observed = job
+                break
+            time.sleep(0.02)
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed["status"], "running")
+        self.assertEqual(observed["stage_label"], "Searching periods with TLS")
+        self.assertEqual(
+            wait_for_terminal(manager, submitted["job_id"])["status"],
+            "completed",
+        )
+
 
 class DisconnectHandlingTests(unittest.TestCase):
     def test_periodic_job_poll_log_shows_progress_without_result_payload(self):
@@ -79,6 +106,7 @@ class DisconnectHandlingTests(unittest.TestCase):
                     "source_file": "kepler curve.csv",
                     "elapsed_seconds": 3723.456,
                     "queue_position": None,
+                    "stage_label": "Searching periods with TLS",
                     "result": {"large": "payload"},
                 },
             )
@@ -86,7 +114,8 @@ class DisconnectHandlingTests(unittest.TestCase):
         self.assertEqual(
             message,
             '[2026-07-24 09:30:00] [analysis poll] job=abcdef12 '
-            'file="kepler curve.csv" status=running elapsed=3723.5s',
+            'file="kepler curve.csv" status=running elapsed=3723.5s '
+            'stage="Searching periods with TLS"',
         )
         self.assertNotIn("payload", message)
 
