@@ -835,16 +835,8 @@ canvas.dragging {
   cursor: grabbing;
 }
 
-canvas.editing {
-  cursor: ew-resize;
-}
-
 tbody tr {
-  cursor: pointer;
-}
-
-tbody tr.selected {
-  background: rgba(15, 118, 110, .08);
+  cursor: default;
 }
 
 .empty {

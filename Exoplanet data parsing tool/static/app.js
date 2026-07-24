@@ -16,7 +16,6 @@ const rowsEl = document.getElementById('transitRows');
 const canvas = document.getElementById('chart');
 const ctx = canvas.getContext('2d');
 const viewButtons = [...document.querySelectorAll('.view-button[data-view]')];
-const editBoxesButton = document.getElementById('editBoxesButton');
 const strictnessInput = document.getElementById('strictnessInput');
 const strictnessValue = document.getElementById('strictnessValue');
 const smoothingInput = document.getElementById('smoothingInput');
@@ -71,11 +70,7 @@ let currentResult = null;
 let currentView = 'zoom';
 let currentViewport = null;
 let dragState = null;
-let boxDragState = null;
 let lastPointer = null;
-let selectedTransitIndex = null;
-let editBoxesEnabled = false;
-let transitBoxCache = [];
 const chartPad = { left: 72, right: 48, top: 42, bottom: 66 };
 
 const fmt = (value, digits = 6) => {
@@ -685,18 +680,6 @@ function markDetectionControlsChanged() {
   }
 }
 
-function canEditBoxes() {
-  return Boolean(currentResult && editBoxesEnabled && currentView !== 'phase' && currentView !== 'periodogram');
-}
-
-function syncEditButton() {
-  editBoxesButton.disabled = !currentResult || currentView === 'phase' || currentView === 'periodogram';
-  editBoxesButton.classList.toggle('active', editBoxesEnabled && !editBoxesButton.disabled);
-  if (editBoxesButton.disabled) {
-    canvas.classList.remove('editing');
-  }
-}
-
 function syncExportButtons() {
   const disabled = !currentResult;
   exportCsvButton.disabled = disabled;
@@ -709,10 +692,6 @@ function syncExportButtons() {
 function clearResultView() {
   currentResult = null;
   currentViewport = null;
-  selectedTransitIndex = null;
-  boxDragState = null;
-  transitBoxCache = [];
-  editBoxesEnabled = false;
   emptyEl.style.display = 'grid';
   assessmentEl.innerHTML = `
     <div class="assessment-card pending">
@@ -754,7 +733,6 @@ function clearResultView() {
   `;
   rowsEl.innerHTML = '<tr><td colspan="10" style="text-align:left;color:#60656f;">No transit candidates yet.</td></tr>';
   updateChartHeading();
-  syncEditButton();
   syncExportButtons();
   drawChart();
 }
@@ -871,9 +849,6 @@ async function analyzeFile(file, options, onJobUpdate = () => {}) {
         const payload = job.result;
         if (!payload) throw new Error('Completed analysis did not include a result.');
         payload.source_file = file.name;
-        payload.original_period = payload.period;
-        payload.original_period_method = payload.period_method;
-        payload.boxesEdited = false;
         return payload;
       }
       if (job.status === 'failed') throw new Error(job.error || 'Analysis failed.');
@@ -896,10 +871,6 @@ function selectBatchResult(index) {
   selectedFile = item.file;
   currentResult = item.result;
   currentViewport = null;
-  selectedTransitIndex = null;
-  boxDragState = null;
-  transitBoxCache = [];
-  editBoxesEnabled = false;
   renderBatchSelect();
   renderResult(currentResult);
   setStatus(`Showing ${item.file.name}.`);
@@ -1094,21 +1065,21 @@ viewButtons.forEach(button => {
     currentViewport = null;
     viewButtons.forEach(item => item.classList.toggle('active', item === button));
     updateChartHeading();
-    syncEditButton();
     drawChart();
   });
 });
 
-editBoxesButton.addEventListener('click', () => {
-  editBoxesEnabled = !editBoxesEnabled;
-  if (!editBoxesEnabled) selectedTransitIndex = null;
-  syncEditButton();
-  renderTransitRows();
-  drawChart();
-});
-
 function hasPhaseFold() {
   return Boolean(currentResult && currentResult.phase_folded && currentResult.phase_folded.phase.length);
+}
+
+function hasTransitStack() {
+  return Boolean(
+    currentResult
+    && currentResult.transit_stack
+    && Array.isArray(currentResult.transit_stack.traces)
+    && currentResult.transit_stack.traces.length
+  );
 }
 
 function hasTransitModel() {
@@ -1192,6 +1163,17 @@ function updateChartHeading() {
     return;
   }
 
+  if (currentView === 'stack') {
+    chartTitleEl.textContent = 'Transit Stack Inspector';
+    if (hasTransitStack()) {
+      const traceCount = currentResult.transit_stack.traces.length;
+      subtitleEl.textContent = `${traceCount.toLocaleString()} locally normalized transits aligned on their fitted centers. Thin lines are individual events; the dark line is their median.`;
+    } else {
+      subtitleEl.textContent = 'Transit stacking needs detected transits; reanalyze older saved results to generate it.';
+    }
+    return;
+  }
+
   if (currentView === 'periodogram') {
     chartTitleEl.textContent = 'Periodogram';
     const series = periodogramSeries();
@@ -1223,80 +1205,6 @@ function updateChartHeading() {
 
   chartTitleEl.textContent = 'Flux Over Time';
   subtitleEl.textContent = `${currentResult.plot.time.length.toLocaleString()} plotted points shown from ${currentResult.total_points.toLocaleString()} total samples. Time is shown as Julian days since JD ${fmt(currentResult.time_reference, 5)}.`;
-}
-
-function estimatePeriodFromTransitBoxes() {
-  const centers = currentResult.transits
-    .map(transit => Number(transit.center))
-    .filter(value => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  if (centers.length < 2) return { period: null, scatter: null, count: 0 };
-
-  const originalPeriod = Number(currentResult.original_period ?? currentResult.period);
-  let periodSamples = [];
-  if (Number.isFinite(originalPeriod) && originalPeriod > 0) {
-    for (let left = 0; left < centers.length; left++) {
-      for (let right = left + 1; right < centers.length; right++) {
-        const gap = centers[right] - centers[left];
-        const cycles = Math.round(gap / originalPeriod);
-        if (cycles < 1) continue;
-        const normalizedGap = gap / cycles;
-        if (Math.abs(normalizedGap - originalPeriod) / originalPeriod <= 0.3) {
-          periodSamples.push(normalizedGap);
-        }
-      }
-    }
-  }
-
-  if (!periodSamples.length) {
-    periodSamples = centers.slice(1).map((center, index) => center - centers[index]);
-  }
-
-  const period = average(periodSamples);
-  return {
-    period,
-    scatter: standardDeviation(periodSamples, period),
-    count: periodSamples.length,
-  };
-}
-
-function estimatePValueFromTransitBoxes() {
-  if (!currentResult || !currentResult.transits.length) return null;
-  const times = currentResult.plot.time;
-  const flux = currentResult.plot.smooth_flux;
-  const usableFlux = [];
-  const inTransit = [];
-
-  for (let i = 0; i < times.length; i++) {
-    const value = Number(flux[i]);
-    if (!Number.isFinite(value)) continue;
-    usableFlux.push(value);
-    inTransit.push(currentResult.transits.some(transit => times[i] >= transit.start && times[i] <= transit.end));
-  }
-
-  const inValues = usableFlux.filter((value, index) => inTransit[index]);
-  const outValues = usableFlux.filter((value, index) => !inTransit[index]);
-  if (inValues.length < 3 || outValues.length < 3) return null;
-
-  const baseline = average(usableFlux);
-  const flatResiduals = usableFlux.map(value => value - baseline);
-  const residualMedian = median(flatResiduals) ?? 0;
-  const mad = median(flatResiduals.map(value => Math.abs(value - residualMedian))) ?? 0;
-  const sigma = Math.max(1.4826 * mad, standardDeviation(flatResiduals, 0) ?? 0, 1e-9);
-  const inLevel = average(inValues);
-  const outLevel = average(outValues);
-  if (inLevel === null || outLevel === null || inLevel >= outLevel) return null;
-
-  const chiFlat = usableFlux.reduce((sum, value) => sum + ((value - baseline) / sigma) ** 2, 0);
-  const chiBox = usableFlux.reduce((sum, value, index) => {
-    const model = inTransit[index] ? inLevel : outLevel;
-    return sum + ((value - model) / sigma) ** 2;
-  }, 0);
-  const delta = Math.max(0, chiFlat - chiBox);
-  return {
-    pValue: chiSquareOneDegreePValue(delta),
-    deltaChiSquared: delta,
-  };
 }
 
 function ephemerisDiagnosticsForTransits(transits, period, epoch, duration, expectedCount, observedRanges = null) {
@@ -1485,20 +1393,9 @@ function currentAnalysisMetrics() {
   const radiusRatios = currentResult.transits
     .map(transit => Number(transit.radius_ratio))
     .filter(value => Number.isFinite(value) && value >= 0);
-  const rawDepths = currentResult.transits
-    .map(transit => Number(transit.depth))
-    .filter(value => Number.isFinite(value) && value >= 0);
   const transitPoints = currentResult.transits
     .map(transit => Number(transit.points))
     .filter(value => Number.isFinite(value) && value >= 0);
-  const oddDepths = rawDepths.filter((_, index) => index % 2 === 0);
-  const evenDepths = rawDepths.filter((_, index) => index % 2 === 1);
-  const oddMedian = median(oddDepths);
-  const evenMedian = median(evenDepths);
-  const editedOddEvenMismatch = (
-    oddMedian !== null && evenMedian !== null && Math.max(oddMedian, evenMedian) > 0
-  ) ? Math.abs(oddMedian - evenMedian) / Math.max(oddMedian, evenMedian) : null;
-  const editedDepthScatterRatio = coefficientOfVariation(rawDepths);
   const metrics = {
     period: currentResult.period,
     periodMethod: currentResult.period_method,
@@ -1520,47 +1417,11 @@ function currentAnalysisMetrics() {
     medianDepthFraction: median(depthFractions),
     medianRadiusRatio: median(radiusRatios),
     detectionSnr: currentResult.detection_snr,
-    oddEvenDepthMismatch: currentResult.boxesEdited ? editedOddEvenMismatch : currentResult.odd_even_depth_mismatch,
-    depthScatterRatio: currentResult.boxesEdited ? editedDepthScatterRatio : currentResult.depth_scatter_ratio,
+    oddEvenDepthMismatch: currentResult.odd_even_depth_mismatch,
+    depthScatterRatio: currentResult.depth_scatter_ratio,
     medianTransitPoints: median(transitPoints),
     maxRadiusRatio: radiusRatios.length ? Math.max(...radiusRatios) : null,
   };
-
-  if (currentResult.boxesEdited) {
-    const editedDepthCenter = median(rawDepths);
-    metrics.detectionSnr = (
-      editedDepthCenter !== null
-      && Number.isFinite(Number(currentResult.robust_noise))
-      && Number(currentResult.robust_noise) > 0
-    ) ? editedDepthCenter / Number(currentResult.robust_noise) : null;
-    metrics.periodSde = null;
-    const periodStats = estimatePeriodFromTransitBoxes();
-    if (periodStats.period !== null) {
-      const centers = currentResult.transits
-        .map(transit => Number(transit.center))
-        .filter(value => Number.isFinite(value))
-        .sort((a, b) => a - b);
-      const durations = currentResult.transits
-        .map(transit => Number(transit.duration))
-        .filter(value => Number.isFinite(value) && value > 0);
-      metrics.period = periodStats.period;
-      metrics.periodMethod = 'edited boxes';
-      metrics.periodScatter = periodStats.scatter;
-      metrics.periodMatchCount = periodStats.count;
-      metrics.periodEpoch = centers.length ? centers[0] : metrics.periodEpoch;
-      metrics.periodDuration = median(durations);
-      metrics.periodUncertainty = null;
-      metrics.tlsFap = null;
-      metrics.tlsSnr = null;
-      metrics.tlsSdeRaw = null;
-    }
-
-    const pValueStats = estimatePValueFromTransitBoxes();
-    if (pValueStats && pValueStats.pValue !== null) {
-      metrics.pValue = pValueStats.pValue;
-      metrics.deltaChiSquared = pValueStats.deltaChiSquared;
-    }
-  }
 
   Object.assign(
     metrics,
@@ -1603,7 +1464,7 @@ function currentWarnings(metrics = currentAnalysisMetrics()) {
     oddMedian !== null && evenMedian !== null && Math.max(oddMedian, evenMedian) > 0
   ) ? Math.abs(oddMedian - evenMedian) / Math.max(oddMedian, evenMedian) : null;
   const rawDepthCenter = median(rawDepths);
-  const snr = currentResult.boxesEdited || !Number.isFinite(Number(metrics.detectionSnr)) ? (
+  const snr = !Number.isFinite(Number(metrics.detectionSnr)) ? (
     rawDepthCenter !== null && Number.isFinite(Number(currentResult.robust_noise)) && currentResult.robust_noise > 0
       ? rawDepthCenter / currentResult.robust_noise
       : null
@@ -2254,7 +2115,6 @@ function renderResult(result) {
   emptyEl.style.display = 'none';
   renderMetrics();
   updateChartHeading();
-  syncEditButton();
   syncExportButtons();
   renderTransitRows();
   drawChart();
@@ -2263,7 +2123,7 @@ function renderResult(result) {
 function renderTransitRows() {
   if (!currentResult) return;
   rowsEl.innerHTML = currentResult.transits.length ? currentResult.transits.map((t, index) => `
-    <tr data-transit-index="${index}" class="${index === selectedTransitIndex ? 'selected' : ''}">
+    <tr>
       <td>Transit ${index + 1}</td>
       <td>${fmt(t.start)}</td>
       <td>${fmt(t.center)}</td>
@@ -2277,14 +2137,6 @@ function renderTransitRows() {
     </tr>
   `).join('') : '<tr><td colspan="10" style="text-align:left;color:#60656f;">No statistically strong transit candidates found.</td></tr>';
 }
-
-rowsEl.addEventListener('click', event => {
-  const row = event.target.closest('tr[data-transit-index]');
-  if (!row || !currentResult) return;
-  selectedTransitIndex = Number(row.dataset.transitIndex);
-  renderTransitRows();
-  drawChart();
-});
 
 function exportBaseName() {
   const fileStem = selectedFile
@@ -2329,7 +2181,6 @@ function transitRowsForExport() {
     radius_ratio: transit.radius_ratio,
     depth_basis: transit.depth_basis,
     points: transit.points,
-    manually_edited: Boolean(transit.manually_edited),
   }));
 }
 
@@ -2352,7 +2203,6 @@ function exportTransitCsv() {
     'radius_ratio',
     'depth_basis',
     'points',
-    'manually_edited',
   ];
   const csv = [
     headers.join(','),
@@ -2376,7 +2226,6 @@ function summaryForExport() {
     flux_unit: currentResult.flux_unit,
     normalization: currentResult.normalization,
     detection_options: currentResult.detection_options,
-    boxes_edited: Boolean(currentResult.boxesEdited),
     planet_assessment: planetAssessment,
     warnings,
     diagnostics: {
@@ -2694,6 +2543,16 @@ function getChartGeometry() {
 
 function getInitialDomain() {
   if (!currentResult) return null;
+  if (currentView === 'stack') {
+    if (!hasTransitStack()) return null;
+    const stackDomain = currentResult.transit_stack.domain;
+    return {
+      xMin: stackDomain.time_min,
+      xMax: stackDomain.time_max,
+      yMin: stackDomain.flux_min,
+      yMax: stackDomain.flux_max,
+    };
+  }
   if (currentView === 'phase') {
     if (!hasPhaseFold()) return null;
     const phaseDomain = currentResult.phase_folded.focus_domain || currentResult.phase_folded.domain;
@@ -2719,6 +2578,16 @@ function getInitialDomain() {
 
 function getLimitDomain() {
   if (!currentResult) return null;
+  if (currentView === 'stack') {
+    if (!hasTransitStack()) return null;
+    const stackDomain = currentResult.transit_stack.domain;
+    return {
+      xMin: stackDomain.time_min,
+      xMax: stackDomain.time_max,
+      yMin: stackDomain.flux_min,
+      yMax: stackDomain.flux_max,
+    };
+  }
   if (currentView === 'phase') {
     if (!hasPhaseFold()) return null;
     const phaseDomain = currentResult.phase_folded.domain;
@@ -2851,115 +2720,10 @@ function transitFluxRange(transit, flux) {
   return { low: low - padding, high: high + padding };
 }
 
-function minimumTransitDuration() {
-  if (!currentResult) return 1e-6;
-  const span = Math.max(1e-9, currentResult.domain.time_max - currentResult.domain.time_min);
-  return Math.max(span * 0.00025, 1e-6);
-}
-
-function applyDepthMetrics(transit, baseline) {
-  if (!transit || !Number.isFinite(Number(transit.depth)) || Number(transit.depth) < 0) {
-    transit.depth_fraction = null;
-    transit.depth_percent = null;
-    transit.depth_ppm = null;
-    transit.radius_ratio = null;
-    transit.depth_basis = null;
-    return;
-  }
-  const depth = Number(transit.depth);
-  const normalizedFraction = Number.isFinite(Number(baseline)) && baseline > 0
-    ? depth / Number(baseline)
-    : null;
-  const useNormalizedFlux = normalizedFraction !== null && normalizedFraction <= 0.5;
-  const depthFraction = useNormalizedFlux ? normalizedFraction : depth / 1000000;
-  transit.depth_fraction = depthFraction;
-  transit.depth_percent = depthFraction * 100;
-  transit.depth_ppm = depthFraction * 1000000;
-  transit.radius_ratio = Math.sqrt(depthFraction);
-  transit.depth_basis = useNormalizedFlux ? 'fractional flux' : 'ppm flux';
-}
-
-function clampTransitBounds(start, end) {
-  const minDuration = minimumTransitDuration();
-  const domain = currentResult.domain;
-  start = Math.max(domain.time_min, Math.min(domain.time_max - minDuration, start));
-  end = Math.max(start + minDuration, Math.min(domain.time_max, end));
-  return { start, end };
-}
-
-function refreshTransitStats(transit) {
-  const times = currentResult.plot.time;
-  const flux = currentResult.plot.smooth_flux;
-  let low = Infinity;
-  let high = -Infinity;
-  let count = 0;
-  for (let i = 0; i < times.length; i++) {
-    if (times[i] < transit.start || times[i] > transit.end) continue;
-    const value = flux[i];
-    if (!Number.isFinite(value)) continue;
-    low = Math.min(low, value);
-    high = Math.max(high, value);
-    count += 1;
-  }
-  if (count > 0) {
-    transit.flux_min = low;
-    transit.flux_max = high;
-    transit.points = count;
-    const baseline = Number.isFinite(currentResult.median_flux) ? currentResult.median_flux : high;
-    transit.depth = Math.max(0, baseline - low);
-    applyDepthMetrics(transit, baseline);
-  }
-}
-
-function setTransitBounds(index, start, end) {
-  const transit = currentResult.transits[index];
-  if (!transit) return;
-  const bounds = clampTransitBounds(start, end);
-  transit.start = bounds.start;
-  transit.end = bounds.end;
-  transit.center = (bounds.start + bounds.end) / 2;
-  transit.duration = bounds.end - bounds.start;
-  transit.manually_edited = true;
-  currentResult.boxesEdited = true;
-  refreshTransitStats(transit);
-  renderMetrics();
-}
-
-function hitTestTransitBox(point) {
-  if (!canEditBoxes()) return null;
-  for (let i = transitBoxCache.length - 1; i >= 0; i--) {
-    const box = transitBoxCache[i];
-    const xMin = Math.min(box.x1, box.x2);
-    const xMax = Math.max(box.x1, box.x2);
-    const yMin = Math.min(box.y1, box.y2);
-    const yMax = Math.max(box.y1, box.y2);
-    if (point.x < xMin - 6 || point.x > xMax + 6 || point.y < yMin - 6 || point.y > yMax + 6) {
-      continue;
-    }
-    const leftDistance = Math.abs(point.x - xMin);
-    const rightDistance = Math.abs(point.x - xMax);
-    if (leftDistance <= 8) return { index: box.index, mode: 'left' };
-    if (rightDistance <= 8) return { index: box.index, mode: 'right' };
-    return { index: box.index, mode: 'move' };
-  }
-  return null;
-}
-
 function updateCanvasCursor(point = lastPointer) {
   if (dragState) {
     canvas.style.cursor = 'grabbing';
     return;
-  }
-  if (boxDragState) {
-    canvas.style.cursor = boxDragState.mode === 'move' ? 'move' : 'ew-resize';
-    return;
-  }
-  if (point && canEditBoxes()) {
-    const hit = hitTestTransitBox(point);
-    if (hit) {
-      canvas.style.cursor = hit.mode === 'move' ? 'move' : 'ew-resize';
-      return;
-    }
   }
   canvas.style.cursor = 'grab';
 }
@@ -3127,7 +2891,6 @@ function drawPeriodogramMarker(geo, viewport, xScale, period, color, label, offs
 }
 
 function drawPeriodogramChart(geo) {
-  transitBoxCache = [];
   const width = geo.width;
   const height = geo.height;
   const pad = geo.pad;
@@ -3255,33 +3018,6 @@ function drawPeriodogramChart(geo) {
 
 canvas.addEventListener('pointermove', event => {
   lastPointer = pointerPosition(event);
-  if (boxDragState && currentResult) {
-    const pointData = dataAtCanvasPoint(lastPointer, boxDragState.viewport);
-    const original = boxDragState.original;
-    const minDuration = minimumTransitDuration();
-    if (boxDragState.mode === 'left') {
-      setTransitBounds(boxDragState.index, Math.min(pointData.x, original.end - minDuration), original.end);
-    } else if (boxDragState.mode === 'right') {
-      setTransitBounds(boxDragState.index, original.start, Math.max(pointData.x, original.start + minDuration));
-    } else {
-      const shift = pointData.x - boxDragState.anchorData.x;
-      let start = original.start + shift;
-      let end = original.end + shift;
-      if (start < currentResult.domain.time_min) {
-        end += currentResult.domain.time_min - start;
-        start = currentResult.domain.time_min;
-      }
-      if (end > currentResult.domain.time_max) {
-        start -= end - currentResult.domain.time_max;
-        end = currentResult.domain.time_max;
-      }
-      setTransitBounds(boxDragState.index, start, end);
-    }
-    renderTransitRows();
-    drawChart();
-    updateCanvasCursor(lastPointer);
-    return;
-  }
   if (!dragState || !currentResult) {
     updateCanvasCursor(lastPointer);
     return;
@@ -3310,32 +3046,6 @@ canvas.addEventListener('pointerdown', event => {
   lastPointer = point;
   const viewport = getViewport();
   if (!viewport) return;
-  const hit = hitTestTransitBox(point);
-  if (hit) {
-    const transit = currentResult.transits[hit.index];
-    selectedTransitIndex = hit.index;
-    boxDragState = {
-      index: hit.index,
-      mode: hit.mode,
-      anchorData: dataAtCanvasPoint(point, viewport),
-      viewport: cloneDomain(viewport),
-      original: {
-        start: transit.start,
-        end: transit.end,
-      },
-    };
-    canvas.classList.add('editing');
-    renderTransitRows();
-    drawChart();
-    updateCanvasCursor(point);
-    canvas.setPointerCapture(event.pointerId);
-    return;
-  }
-  if (canEditBoxes()) {
-    selectedTransitIndex = null;
-    renderTransitRows();
-    drawChart();
-  }
   dragState = {
     x: point.x,
     y: point.y,
@@ -3346,15 +3056,6 @@ canvas.addEventListener('pointerdown', event => {
 });
 
 function finishDrag(event) {
-  if (boxDragState) {
-    boxDragState = null;
-    canvas.classList.remove('editing');
-    updateCanvasCursor(lastPointer);
-    if (event && canvas.hasPointerCapture(event.pointerId)) {
-      canvas.releasePointerCapture(event.pointerId);
-    }
-    return;
-  }
   if (!dragState) return;
   dragState = null;
   canvas.classList.remove('dragging');
@@ -3389,7 +3090,6 @@ document.addEventListener('keydown', event => {
 });
 
 function drawPhaseChart(geo) {
-  transitBoxCache = [];
   const width = geo.width;
   const height = geo.height;
   const pad = geo.pad;
@@ -3506,6 +3206,187 @@ function drawPhaseChart(geo) {
   ctx.stroke();
   ctx.restore();
 
+  updateCanvasCursor(lastPointer);
+}
+
+function drawTransitStackLegend(geo, hasModel) {
+  const { width, pad } = geo;
+  const items = [
+    { color: 'rgba(15, 118, 110, 0.5)', text: 'Individual transits', lineWidth: 1.2 },
+    { color: '#063f3b', text: 'Median stack', lineWidth: 3 },
+  ];
+  if (hasModel) items.push({ color: '#b45309', text: 'TLS model', lineWidth: 2.2 });
+
+  ctx.save();
+  ctx.font = '700 11px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  const itemWidths = items.map(item => 24 + ctx.measureText(item.text).width + 10);
+  const legendWidth = Math.min(
+    width - pad.left - pad.right,
+    itemWidths.reduce((sum, itemWidth) => sum + itemWidth, 0) + 12
+  );
+  const xStart = Math.max(pad.left + 8, width - pad.right - legendWidth - 6);
+  const y = pad.top + 15;
+  let x = xStart + 8;
+  ctx.fillStyle = 'rgba(251, 252, 253, 0.9)';
+  ctx.strokeStyle = 'rgba(215, 220, 227, 0.95)';
+  ctx.lineWidth = 1;
+  ctx.fillRect(xStart, pad.top + 4, legendWidth, 22);
+  ctx.strokeRect(xStart, pad.top + 4, legendWidth, 22);
+  items.forEach(item => {
+    const widthNeeded = 24 + ctx.measureText(item.text).width + 10;
+    if (x + widthNeeded > xStart + legendWidth) return;
+    ctx.strokeStyle = item.color;
+    ctx.lineWidth = item.lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 14, y);
+    ctx.stroke();
+    ctx.fillStyle = '#3f4650';
+    ctx.fillText(item.text, x + 20, y);
+    x += widthNeeded;
+  });
+  ctx.restore();
+}
+
+function drawTransitStackChart(geo) {
+  const { width, height, pad, innerW, innerH } = geo;
+  if (!hasTransitStack()) {
+    drawNotice('Transit stacking needs detected transits from a new analysis.', width, height);
+    return;
+  }
+
+  const stack = currentResult.transit_stack;
+  const viewport = getViewport();
+  if (!viewport) {
+    drawNotice('Transit stacking needs detected transits from a new analysis.', width, height);
+    return;
+  }
+
+  const { xMin, xMax, yMin, yMax } = viewport;
+  const xScale = value => pad.left + ((value - xMin) / (xMax - xMin || 1)) * innerW;
+  const yScale = value => pad.top + (1 - ((value - yMin) / (yMax - yMin || 1))) * innerH;
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, width, height);
+
+  const duration = Number(stack.duration);
+  if (Number.isFinite(duration) && duration > 0) {
+    const start = Math.max(xMin, -duration / 2);
+    const end = Math.min(xMax, duration / 2);
+    if (end > start) {
+      ctx.fillStyle = 'rgba(180, 83, 9, 0.11)';
+      ctx.fillRect(xScale(start), pad.top, Math.max(1, xScale(end) - xScale(start)), innerH);
+    }
+  }
+
+  drawChartAxes(geo, viewport, {
+    xDigits: 4,
+    yDigits: 4,
+    xLabel: 'Days from transit center',
+    yLabel: 'Normalized flux',
+  });
+
+  const zeroX = xScale(0);
+  if (zeroX >= pad.left && zeroX <= width - pad.right) {
+    ctx.strokeStyle = 'rgba(180, 83, 9, 0.68)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(zeroX, pad.top);
+    ctx.lineTo(zeroX, pad.top + innerH);
+    ctx.stroke();
+  }
+
+  const model = currentResult.transit_model;
+  const hasModel = Boolean(
+    model
+    && Array.isArray(model.folded_phase_days)
+    && Array.isArray(model.folded_flux)
+    && model.folded_phase_days.length
+    && model.folded_flux.length
+  );
+  const traceColors = [
+    '#0f766e',
+    '#2563eb',
+    '#7c3aed',
+    '#0891b2',
+    '#047857',
+    '#4f46e5',
+  ];
+
+  ctx.save();
+  clipToChartPlot(geo);
+  stack.traces.forEach((trace, traceIndex) => {
+    const phases = Array.isArray(trace.phase_days) ? trace.phase_days : [];
+    const values = Array.isArray(trace.flux) ? trace.flux : [];
+    const count = Math.min(phases.length, values.length);
+    ctx.strokeStyle = traceColors[traceIndex % traceColors.length];
+    ctx.globalAlpha = 0.27;
+    ctx.lineWidth = 1.15;
+    ctx.beginPath();
+    let hasPoint = false;
+    for (let index = 0; index < count; index++) {
+      const phase = Number(phases[index]);
+      const value = Number(values[index]);
+      if (!Number.isFinite(phase) || !Number.isFinite(value) || phase < xMin || phase > xMax) continue;
+      const x = xScale(phase);
+      const y = yScale(value);
+      if (!hasPoint) {
+        ctx.moveTo(x, y);
+        hasPoint = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (hasPoint) ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+
+  if (hasModel) {
+    ctx.strokeStyle = '#b45309';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    let hasModelPoint = false;
+    const count = Math.min(model.folded_phase_days.length, model.folded_flux.length);
+    for (let index = 0; index < count; index++) {
+      const phase = Number(model.folded_phase_days[index]);
+      const value = Number(model.folded_flux[index]);
+      if (!Number.isFinite(phase) || !Number.isFinite(value) || phase < xMin || phase > xMax) continue;
+      const x = xScale(phase);
+      const y = yScale(value);
+      if (!hasModelPoint) {
+        ctx.moveTo(x, y);
+        hasModelPoint = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (hasModelPoint) ctx.stroke();
+  }
+
+  const medianPhases = Array.isArray(stack.median_phase_days) ? stack.median_phase_days : [];
+  const medianValues = Array.isArray(stack.median_flux) ? stack.median_flux : [];
+  ctx.strokeStyle = '#063f3b';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  let hasMedianPoint = false;
+  const medianCount = Math.min(medianPhases.length, medianValues.length);
+  for (let index = 0; index < medianCount; index++) {
+    const phase = Number(medianPhases[index]);
+    const value = Number(medianValues[index]);
+    if (!Number.isFinite(phase) || !Number.isFinite(value) || phase < xMin || phase > xMax) continue;
+    const x = xScale(phase);
+    const y = yScale(value);
+    if (!hasMedianPoint) {
+      ctx.moveTo(x, y);
+      hasMedianPoint = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  if (hasMedianPoint) ctx.stroke();
+  ctx.restore();
+
+  drawTransitStackLegend(geo, hasModel);
   updateCanvasCursor(lastPointer);
 }
 
@@ -3643,6 +3524,11 @@ function drawChart() {
     return;
   }
 
+  if (currentView === 'stack') {
+    drawTransitStackChart(geo);
+    return;
+  }
+
   const times = currentResult.plot.time;
   const rawFlux = currentResult.plot.raw_flux;
   const smoothFlux = currentResult.plot.smooth_flux;
@@ -3662,7 +3548,6 @@ function drawChart() {
 
   ctx.fillStyle = '#fbfcfd';
   ctx.fillRect(0, 0, width, height);
-  transitBoxCache = [];
   const auditMetrics = currentView === 'audit' ? currentAnalysisMetrics() : null;
   if (currentView === 'audit' && (!Number.isFinite(Number(auditMetrics.period)) || !Number.isFinite(Number(auditMetrics.periodEpoch)))) {
     drawNotice('Ephemeris audit needs a recovered period and epoch.', width, height);
@@ -3678,7 +3563,6 @@ function drawChart() {
     const paddedStart = Number(t.display_start);
     const paddedEnd = Number(t.display_end);
     const useDisplayBounds = currentView !== 'raw'
-      && !t.manually_edited
       && Number.isFinite(paddedStart)
       && Number.isFinite(paddedEnd);
     const boxStart = useDisplayBounds ? paddedStart : t.start;
@@ -3693,13 +3577,6 @@ function drawChart() {
     const boxWidth = Math.max(8, x2 - x1);
     const boxTop = Math.min(y1, y2);
     const boxHeight = Math.max(8, Math.abs(y2 - y1));
-    transitBoxCache.push({
-      index,
-      x1,
-      x2: x1 + boxWidth,
-      y1: boxTop,
-      y2: boxTop + boxHeight,
-    });
     const auditClassification = auditMetrics ? classifyTransitForEphemeris(t, auditMetrics) : null;
     const auditMatched = auditClassification && auditClassification.status === 'matched';
     const auditOffPeriod = auditClassification && auditClassification.status === 'off';
@@ -3707,17 +3584,11 @@ function drawChart() {
       ? 'rgba(21, 128, 61, 0.2)'
       : (auditOffPeriod ? 'rgba(180, 35, 24, 0.18)' : 'rgba(180, 83, 9, 0.22)');
     ctx.fillRect(x1, boxTop, boxWidth, boxHeight);
-    const selected = index === selectedTransitIndex;
-    ctx.strokeStyle = selected
-      ? 'rgba(15, 118, 110, 1)'
-      : (auditMatched ? 'rgba(21, 128, 61, 1)' : (auditOffPeriod ? 'rgba(180, 35, 24, 1)' : 'rgba(180, 83, 9, 1)'));
-    ctx.lineWidth = selected ? 3.2 : 2.5;
+    ctx.strokeStyle = auditMatched
+      ? 'rgba(21, 128, 61, 1)'
+      : (auditOffPeriod ? 'rgba(180, 35, 24, 1)' : 'rgba(180, 83, 9, 1)');
+    ctx.lineWidth = 2.5;
     ctx.strokeRect(x1, boxTop, boxWidth, boxHeight);
-    if (selected && canEditBoxes()) {
-      ctx.fillStyle = 'rgba(15, 118, 110, 0.95)';
-      ctx.fillRect(x1 - 3, boxTop, 6, boxHeight);
-      ctx.fillRect(x1 + boxWidth - 3, boxTop, 6, boxHeight);
-    }
     ctx.fillStyle = auditMatched ? '#166534' : (auditOffPeriod ? '#991b1b' : '#8a3f06');
     ctx.font = '700 12px system-ui, sans-serif';
     ctx.textAlign = 'left';

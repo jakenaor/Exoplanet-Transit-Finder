@@ -2700,6 +2700,118 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
     }
 
 
+def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace_points=320):
+    """Align and locally normalize individual events for display-only inspection."""
+    time = np.asarray(time, dtype=float)
+    smooth_flux = np.asarray(smooth_flux, dtype=float)
+    if time.size < 3 or time.size != smooth_flux.size or not transits:
+        return None
+
+    duration_value = finite_number(duration)
+    if duration_value is None or duration_value <= 0:
+        durations = finite_values([item.get("duration") for item in transits])
+        duration_value = float(np.median(durations)) if durations else None
+    if duration_value is None or duration_value <= 0:
+        return None
+
+    finite_time = time[np.isfinite(time)]
+    if finite_time.size < 3:
+        return None
+    positive_steps = np.diff(np.sort(finite_time))
+    positive_steps = positive_steps[positive_steps > 0]
+    cadence = float(np.median(positive_steps)) if positive_steps.size else duration_value / 20.0
+    half_window = max(duration_value * 3.0, cadence * 12.0)
+    period_value = finite_number(period)
+    if period_value is not None and period_value > 0:
+        half_window = min(half_window, period_value * 0.35)
+    half_window = max(half_window, duration_value * 1.5, cadence * 4.0)
+
+    traces = []
+    combined_phase = []
+    combined_flux = []
+    for index, transit in enumerate(transits):
+        center = finite_number(transit.get("center"))
+        if center is None:
+            continue
+        mask = (
+            np.isfinite(time)
+            & np.isfinite(smooth_flux)
+            & (time >= center - half_window)
+            & (time <= center + half_window)
+        )
+        if np.count_nonzero(mask) < 3:
+            continue
+
+        offsets = time[mask] - center
+        values = smooth_flux[mask]
+        order = np.argsort(offsets)
+        offsets = offsets[order]
+        values = values[order]
+
+        baseline_mask = np.abs(offsets) >= duration_value * 0.75
+        if np.count_nonzero(baseline_mask) >= 6:
+            slope, intercept = np.polyfit(offsets[baseline_mask], values[baseline_mask], 1)
+            baseline_curve = slope * offsets + intercept
+            if not np.all(np.isfinite(baseline_curve)) or np.any(baseline_curve <= 0):
+                baseline_curve = np.full_like(values, float(np.median(values[baseline_mask])))
+        else:
+            baseline_values = values[baseline_mask] if np.any(baseline_mask) else values
+            baseline_curve = np.full_like(values, float(np.median(baseline_values)))
+        valid_baseline = np.isfinite(baseline_curve) & (baseline_curve > 0)
+        if np.count_nonzero(valid_baseline) < 3:
+            continue
+        offsets = offsets[valid_baseline]
+        values = values[valid_baseline]
+        baseline_curve = baseline_curve[valid_baseline]
+        normalized = values / baseline_curve
+
+        combined_phase.append(offsets)
+        combined_flux.append(normalized)
+        keep = downsample_indices_for_series([normalized], max_trace_points)
+        traces.append({
+            "transit_index": index + 1,
+            "center": float(center),
+            "phase_days": offsets[keep].tolist(),
+            "flux": normalized[keep].tolist(),
+            "point_count": int(offsets.size),
+            "baseline": float(np.median(baseline_curve)),
+        })
+
+    if not traces:
+        return None
+
+    all_phase = np.concatenate(combined_phase)
+    all_flux = np.concatenate(combined_flux)
+    target_bin_width = max(cadence, duration_value / 36.0)
+    bin_count = int(max(48, min(400, math.ceil(2.0 * half_window / target_bin_width))))
+    edges = np.linspace(-half_window, half_window, bin_count + 1)
+    bin_ids = np.digitize(all_phase, edges) - 1
+    median_phase = []
+    median_flux = []
+    for bin_index in range(bin_count):
+        mask = bin_ids == bin_index
+        if not np.any(mask):
+            continue
+        median_phase.append(float(np.median(all_phase[mask])))
+        median_flux.append(float(np.median(all_flux[mask])))
+
+    domain_values = np.r_[all_flux, np.asarray(median_flux, dtype=float)]
+    flux_min, flux_max = domain_for(domain_values, 0.2, 99.8)
+    return {
+        "traces": traces,
+        "median_phase_days": median_phase,
+        "median_flux": median_flux,
+        "duration": float(duration_value),
+        "window_half_width": float(half_window),
+        "domain": {
+            "time_min": float(-half_window),
+            "time_max": float(half_window),
+            "flux_min": flux_min,
+            "flux_max": flux_max,
+        },
+    }
+
+
 def analyze(time, flux, options=None, progress_callback=None):
     def report_progress(stage, stage_label):
         if callable(progress_callback):
@@ -2765,6 +2877,13 @@ def analyze(time, flux, options=None, progress_callback=None):
         smooth_flux,
         detection["period"],
         detection["period_epoch"],
+        detection["period_duration"],
+    )
+    transit_stack = build_transit_stack(
+        time,
+        smooth_flux,
+        detection["transits"],
+        detection["period"],
         detection["period_duration"],
     )
 
@@ -2861,6 +2980,7 @@ def analyze(time, flux, options=None, progress_callback=None):
         "clean_domain": {"flux_min": clean_flux_min, "flux_max": clean_flux_max},
         "zoom_domain": zoom_domain,
         "phase_folded": phase_folded,
+        "transit_stack": transit_stack,
         "plot_smooth_points": smooth_width,
         "diagnostics": diagnostics,
         "warnings": warnings,

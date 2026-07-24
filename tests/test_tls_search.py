@@ -88,8 +88,54 @@ class TLSOptionTests(unittest.TestCase):
                 "limbDarkeningU1": FormItem("0.4"),
             })
 
+    def test_transit_stack_view_replaces_manual_box_editor(self):
+        index_html = (APP_DIR / "static" / "index.html").read_text()
+        app_js = (APP_DIR / "static" / "app.js").read_text()
+
+        self.assertIn('data-view="stack">Transit stack</button>', index_html)
+        self.assertIn("function drawTransitStackChart(geo)", app_js)
+        self.assertNotIn("Edit boxes", index_html)
+        self.assertNotIn("editBoxesButton", app_js)
+
 
 class TLSSearchTests(unittest.TestCase):
+    def test_transit_stack_aligns_and_normalizes_individual_events(self):
+        time = np.linspace(0.0, 8.0, 4001)
+        period = 2.0
+        duration = 0.16
+        centers = [1.0, 3.0, 5.0, 7.0]
+        flux = 1.0 + 0.0004 * (time - 4.0)
+        for center in centers:
+            phase = np.abs(time - center)
+            shape = np.clip(1.0 - phase / (duration / 2.0), 0.0, 1.0)
+            flux -= 0.012 * shape
+        transits = [
+            {
+                "center": center,
+                "start": center - duration / 2.0,
+                "end": center + duration / 2.0,
+                "duration": duration,
+            }
+            for center in centers
+        ]
+
+        stack = analysis.build_transit_stack(time, flux, transits, period, duration)
+
+        self.assertIsNotNone(stack)
+        self.assertEqual(len(stack["traces"]), len(centers))
+        self.assertTrue(all(trace["point_count"] > 100 for trace in stack["traces"]))
+        self.assertTrue(all(
+            min(trace["phase_days"]) < 0 < max(trace["phase_days"])
+            for trace in stack["traces"]
+        ))
+        median_phase = np.asarray(stack["median_phase_days"])
+        median_flux = np.asarray(stack["median_flux"])
+        self.assertLess(float(np.min(median_flux[np.abs(median_phase) < 0.02])), 0.99)
+        shoulder = median_flux[np.abs(median_phase) > duration]
+        self.assertAlmostEqual(float(np.median(shoulder)), 1.0, delta=0.001)
+        self.assertGreater(stack["window_half_width"], duration)
+        json.dumps(stack)
+
     def test_zero_centered_ppm_flux_is_converted_before_segment_normalization(self):
         time_values = np.linspace(0.0, 20.0, 2001)
         residual_ppm = np.random.default_rng(14).normal(3.0, 110.0, len(time_values))

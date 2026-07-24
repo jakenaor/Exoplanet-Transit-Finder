@@ -40,7 +40,7 @@ Future sessions should work in `Exoplanet-Transit-Finder` and the tracked `Exopl
 
 ## Product Goal
 
-Build a local Python web app for exoplanet transit analysis. The user uploads one or more CSV/FITS light curves, the app plots the light curve, detects transit-like dips, boxes transits, estimates orbital period, provides significance estimates, supports manual exploration/editing, and exports the results.
+Build a local Python web app for exoplanet transit analysis. The user uploads one or more CSV/FITS light curves, the app plots the light curve, detects transit-like dips, boxes transits, estimates orbital period, provides significance estimates, supports interactive exploration, and exports the results.
 
 For CSV input, the app expects `Time` and `Flux` columns. For FITS input, it accepts common time and flux columns such as `TIME`, `BJD`, `BTJD`, `JD`, `MJD`, `PDCSAP_FLUX`, `SAP_FLUX`, and `FLUX`.
 
@@ -52,7 +52,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
-- The title-line UI version indicator is currently `v57`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
+- The title-line UI version indicator is currently `v58`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.
@@ -82,8 +82,13 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Batch dropdown labels include the current planet-candidate verdict for each successful file.
 - Failed batch items are kept visible in the dropdown but disabled.
 - Large dataset handling with downsampling for plotting.
-- Raw clipped, full cleaned, transit zoom, and phase-folded chart modes.
+- Raw clipped, full cleaned, transit zoom, phase-folded, transit-stack, periodogram, and ephemeris-audit chart modes.
 - Phase-folded median curves use duration-aware fine bins around phase zero and coarse bins elsewhere. They are not smoothed across phase bins, so short ingress, egress, and flat-bottom structure remain visible.
+- Transit Stack Inspector:
+  - Aligns every detected event on its fitted center without changing the fitted period, duration, boxes, or candidate score.
+  - Locally detrends and normalizes each event so their shapes can be compared on the same relative-flux scale.
+  - Draws individual events as thin colored traces, their median as a dark trace, and the physical TLS model in orange.
+  - Shades the fitted transit-duration interval and supports the same pan/zoom controls as the other charts.
 - Periodogram chart mode that plots compact BLS power/SDE over searched periods and marks top candidates.
 - Ephemeris audit chart mode:
   - Shows predicted period windows from the recovered ephemeris.
@@ -123,13 +128,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Left arrow: expand sideways.
   - Right arrow: contract sideways.
   - Click/drag: pan viewport.
-- Manual transit box editing:
-  - Toggle `Edit boxes`.
-  - Select a box.
-  - Drag left/right edges to resize.
-  - Drag inside a box to move it.
-  - Table updates immediately.
-  - Sidebar period and chi-squared p-value recalculate after manual edits.
+- Manual transit box editing was removed in `v58`. TLS-derived boxes are authoritative, and the former `Edit boxes` control and its client-side metric/export recalculation paths no longer exist.
 - Detection sensitivity controls:
   - Strictness.
   - Smoothing.
@@ -379,19 +378,20 @@ The project now includes the reference physical Transit Least Squares engine. Pr
 Current feature sequence status:
 
 1. Phase-folded light curve: done.
-2. Manual transit box editing: done.
+2. Manual transit box editing: removed in `v58`; superseded by authoritative TLS boxes.
 3. Detection sensitivity controls: done.
 4. Export results: done.
 5. Transit depth in percent/ppm and radius-ratio estimate: done.
 6. False-positive warnings: done.
 7. Planet/no-planet assessment: done.
 8. Ephemeris audit view: done.
-9. Data cleaning panel: next.
-10. Sensitivity/no-planet upper-limit message: pending.
-11. Physical TLS search mode: done.
-12. Reset/home view button: pending.
+9. Transit Stack Inspector: done.
+10. Data cleaning panel: next.
+11. Sensitivity/no-planet upper-limit message: pending.
+12. Physical TLS search mode: done.
+13. Reset/home view button: pending.
 
-Additional useful future features after step 12:
+Additional useful future features after step 13:
 
 - Transit prediction from period and epoch.
 - Better candidate-period ranking with explicit harmonic/alias grouping.
