@@ -12,7 +12,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
 sys.path.insert(0, str(APP_DIR))
 
 from analysis_jobs import AnalysisJobManager  # noqa: E402
-from main import TransitRequestHandler  # noqa: E402
+from main import TransitRequestHandler, format_analysis_job_poll  # noqa: E402
 
 
 def quick_runner(time_values, flux_values, options):
@@ -70,6 +70,43 @@ class AnalysisJobManagerTests(unittest.TestCase):
 
 
 class DisconnectHandlingTests(unittest.TestCase):
+    def test_periodic_job_poll_log_shows_progress_without_result_payload(self):
+        with mock.patch("main.time.strftime", return_value="2026-07-24 09:30:00"):
+            message = format_analysis_job_poll(
+                "abcdef123456",
+                {
+                    "status": "running",
+                    "source_file": "kepler curve.csv",
+                    "elapsed_seconds": 3723.456,
+                    "queue_position": None,
+                    "result": {"large": "payload"},
+                },
+            )
+
+        self.assertEqual(
+            message,
+            '[2026-07-24 09:30:00] [analysis poll] job=abcdef12 '
+            'file="kepler curve.csv" status=running elapsed=3723.5s',
+        )
+        self.assertNotIn("payload", message)
+
+    def test_failed_job_poll_log_includes_error(self):
+        with mock.patch("main.time.strftime", return_value="2026-07-24 09:31:00"):
+            message = format_analysis_job_poll(
+                "9876543210",
+                {
+                    "status": "failed",
+                    "source_file": "curve.csv",
+                    "elapsed_seconds": 12,
+                    "queue_position": None,
+                    "error": "TLS did not fit a valid transit.",
+                },
+            )
+
+        self.assertIn("job=98765432", message)
+        self.assertIn("status=failed", message)
+        self.assertIn('error=\"TLS did not fit a valid transit.\"', message)
+
     def test_json_write_treats_broken_pipe_as_client_disconnect(self):
         handler = object.__new__(TransitRequestHandler)
         handler.client_address = ("127.0.0.1", 51000)

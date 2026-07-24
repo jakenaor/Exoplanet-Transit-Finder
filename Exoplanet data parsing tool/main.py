@@ -46,6 +46,30 @@ def open_browser_soon(url):
     threading.Thread(target=open_browser, daemon=True).start()
 
 
+def format_analysis_job_poll(job_id, job):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    short_id = str(job_id)[:8]
+    if job is None:
+        return f"[{timestamp}] [analysis poll] job={short_id} status=not-found"
+
+    status = str(job.get("status") or "unknown")
+    elapsed = max(0.0, float(job.get("elapsed_seconds") or 0.0))
+    source_file = json.dumps(str(job.get("source_file") or "unknown"))
+    details = [
+        f"[{timestamp}] [analysis poll]",
+        f"job={short_id}",
+        f"file={source_file}",
+        f"status={status}",
+        f"elapsed={elapsed:.1f}s",
+    ]
+    queue_position = job.get("queue_position")
+    if queue_position is not None:
+        details.append(f"queue={queue_position}")
+    if status == "failed" and job.get("error"):
+        details.append(f"error={json.dumps(str(job['error']))}")
+    return " ".join(details)
+
+
 class TransitRequestHandler(BaseHTTPRequestHandler):
     server_version = "TransitFinder/1.0"
 
@@ -54,6 +78,7 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         job_id = self.analysis_job_id(path)
         if job_id is not None:
             job = self.server.analysis_jobs.get(job_id)
+            print(format_analysis_job_poll(job_id, job), flush=True)
             if job is None:
                 self.write_json({"error": "Analysis job not found."}, status=404)
             else:
