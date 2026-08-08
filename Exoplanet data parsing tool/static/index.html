@@ -12,11 +12,38 @@
       <div>
         <div class="app-title-row">
           <h1>Transit Finder</h1>
-          <span class="version-indicator" aria-label="Application version 59">v59</span>
+          <span class="version-indicator" aria-label="Application version 62">v62</span>
         </div>
         <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
         <p id="sessionIndicator" class="session-indicator" aria-live="polite">Preparing session cache…</p>
       </div>
+
+      <section class="save-location-section" aria-labelledby="saveLocationHeading">
+        <h2 id="saveLocationHeading">Save File Location</h2>
+        <form id="saveLocationForm" class="save-location-form">
+          <label for="saveLocationInput">Folder for this session</label>
+          <div class="save-location-controls">
+            <input id="saveLocationInput" class="save-location-input" type="text" autocomplete="off" spellcheck="false" value="" placeholder="Loading save folder…">
+            <button id="saveLocationButton" type="submit">Apply</button>
+          </div>
+        </form>
+        <p id="saveLocationFile" class="save-location-file">Preparing session filename…</p>
+      </section>
+
+      <section class="load-cache-section" aria-labelledby="loadCacheHeading">
+        <div class="load-cache-heading-row">
+          <h2 id="loadCacheHeading">Load Cache</h2>
+          <button id="refreshCachesButton" class="refresh-caches-button" type="button">Refresh</button>
+        </div>
+        <label for="cacheSelect">Saved session</label>
+        <div class="load-cache-controls">
+          <select id="cacheSelect" disabled>
+            <option>Finding saved sessions…</option>
+          </select>
+          <button id="loadCacheButton" type="button" disabled>Load</button>
+        </div>
+        <p id="loadCacheStatus" class="load-cache-status" aria-live="polite">Checking known cache folders…</p>
+      </section>
 
       <label id="dropzone" class="dropzone" for="fileInput">
         <span>

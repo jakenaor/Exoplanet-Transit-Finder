@@ -12,7 +12,7 @@ import webbrowser
 from analysis import analyze, parse_detection_options
 from analysis_jobs import AnalysisJobManager
 from parsers import parse_light_curve_upload
-from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCache, validate_session_id
+from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCacheManager, validate_session_id
 
 
 HOST = "127.0.0.1"
@@ -78,6 +78,15 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/analysis-sessions":
+            try:
+                self.write_json({
+                    "sessions": self.server.session_cache.list_sessions(),
+                    "default_directory": str(self.server.session_cache.default_directory),
+                })
+            except Exception as exc:
+                self.write_json({"error": str(exc)}, status=400)
+            return
         session_id = self.analysis_session_id(path)
         if session_id is not None:
             try:
@@ -86,12 +95,14 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
                     self.write_json({
                         "exists": False,
                         "session_id": session_id,
-                        "cache_directory": str(self.server.session_cache.directory),
+                        "cache_directory": str(self.server.session_cache.directory_for(session_id)),
+                        "cache_file": str(self.server.session_cache.path_for(session_id)),
                     })
                 else:
                     self.write_json({
                         "exists": True,
-                        "cache_directory": str(self.server.session_cache.directory),
+                        "cache_directory": str(self.server.session_cache.directory_for(session_id)),
+                        "cache_file": str(self.server.session_cache.path_for(session_id)),
                         **document,
                     })
             except Exception as exc:
@@ -131,6 +142,25 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        location_session_id = self.analysis_session_location_id(path)
+        if location_session_id is not None:
+            try:
+                payload = self.read_json_request(16 * 1024)
+                relocated = self.server.session_cache.relocate(
+                    location_session_id,
+                    payload.get("directory"),
+                )
+                print(
+                    f"[session cache] session={location_session_id[:8]} location="
+                    f"{json.dumps(relocated['cache_directory'])} moved={relocated['moved']}",
+                    flush=True,
+                )
+                self.write_json({"updated": True, **relocated})
+            except CLIENT_DISCONNECT_ERRORS:
+                self.log_client_disconnect()
+            except Exception as exc:
+                self.write_json({"error": str(exc)}, status=400)
+            return
         session_id = self.analysis_session_id(path)
         if session_id is not None:
             try:
@@ -143,7 +173,6 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.write_json({
                     "saved": True,
-                    "cache_directory": str(self.server.session_cache.directory),
                     **saved,
                 })
             except CLIENT_DISCONNECT_ERRORS:
@@ -244,6 +273,20 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
+    @staticmethod
+    def analysis_session_location_id(path):
+        prefix = "/analysis-sessions/"
+        suffix = "/location"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        session_id = path[len(prefix):-len(suffix)]
+        if not session_id or "/" in session_id:
+            return None
+        try:
+            return validate_session_id(session_id)
+        except ValueError:
+            return None
+
     def write_file(self, path, content_type):
         body = read_static_file(path)
         try:
@@ -295,11 +338,11 @@ def main():
     except ValueError:
         max_jobs = 1
     server.analysis_jobs = AnalysisJobManager(max_running=max_jobs)
-    server.session_cache = SessionCache()
+    server.session_cache = SessionCacheManager()
 
     url = f"http://{HOST}:{server.server_port}/"
     print(f"Transit Finder running at {url}")
-    print(f"Session caches: {server.session_cache.directory}")
+    print(f"Default session cache location: {server.session_cache.default_directory}")
     print("Press Ctrl+C to stop.")
     open_browser_soon(url)
     try:

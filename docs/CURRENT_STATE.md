@@ -53,7 +53,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
-- The title-line UI version indicator is currently `v59`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
+- The title-line UI version indicator is currently `v62`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
 - Browser sessions are disk-backed:
   - The first page load adds a unique `?session=...` identifier to the localhost URL and immediately creates that session's cache file.
   - Completed or failed batch items are saved after every file, so already-finished analyses survive an accidental tab close.
@@ -62,6 +62,11 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
   - Cache writes are limited to 100 result entries and 250 MB per session. Session IDs are validated before they can become paths.
   - Original uploaded file bytes are not copied into the cache. A restored result can be viewed and exported, but re-running it requires selecting the source file again.
   - Cache files currently remain until the user deletes them manually.
+  - A compact `Save File Location` panel near the top of the sidebar shows the active cache directory and exact JSON filename for the current URL session.
+  - The folder is editable per session. `Apply` accepts an absolute path or a `~`-prefixed path, creates the folder when necessary, moves the existing cache file, and keeps future writes there.
+  - Custom per-session locations survive server restarts through an atomic hidden location registry in the default Desktop cache folder.
+  - A compact `Load Cache` panel discovers sessions in the default cache folder and in remembered custom locations, lists them newest-first with date and size, and restores the selected session by switching to its saved session URL.
+  - The cache list can be refreshed without reloading the page. Before switching caches, the current session is saved; switching is blocked while an analysis is actively running.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.

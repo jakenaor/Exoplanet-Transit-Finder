@@ -12,6 +12,14 @@ const periodCandidatesEl = document.getElementById('periodCandidates');
 const chartTitleEl = document.getElementById('chartTitle');
 const subtitleEl = document.getElementById('subtitle');
 const sessionIndicatorEl = document.getElementById('sessionIndicator');
+const saveLocationFormEl = document.getElementById('saveLocationForm');
+const saveLocationInputEl = document.getElementById('saveLocationInput');
+const saveLocationButtonEl = document.getElementById('saveLocationButton');
+const saveLocationFileEl = document.getElementById('saveLocationFile');
+const cacheSelectEl = document.getElementById('cacheSelect');
+const loadCacheButtonEl = document.getElementById('loadCacheButton');
+const refreshCachesButtonEl = document.getElementById('refreshCachesButton');
+const loadCacheStatusEl = document.getElementById('loadCacheStatus');
 const emptyEl = document.getElementById('empty');
 const rowsEl = document.getElementById('transitRows');
 const canvas = document.getElementById('chart');
@@ -82,6 +90,7 @@ let restoringSession = false;
 let sessionSaveTimer = null;
 let sessionSaveChain = Promise.resolve();
 let sessionReadyPromise = null;
+let knownSessionCaches = [];
 const chartPad = { left: 72, right: 48, top: 42, bottom: 66 };
 
 const fmt = (value, digits = 6) => {
@@ -391,6 +400,110 @@ function setSessionIndicator(message, state = '', title = '') {
   sessionIndicatorEl.title = title;
 }
 
+function setSaveFileLocation(directory, cacheFile = '') {
+  if (!saveLocationInputEl || !saveLocationFileEl || !directory) return;
+  const normalizedDirectory = String(directory).replace(/\/$/, '');
+  const fullCacheFile = cacheFile || `${normalizedDirectory}/session-${sessionId}.json`;
+  const filename = fullCacheFile.split('/').pop() || `session-${sessionId}.json`;
+  saveLocationInputEl.value = normalizedDirectory;
+  saveLocationInputEl.title = normalizedDirectory;
+  saveLocationFileEl.textContent = `Current file: ${filename}`;
+  saveLocationFileEl.className = 'save-location-file';
+  saveLocationFileEl.title = fullCacheFile;
+}
+
+function setSaveLocationFeedback(message, isError = false) {
+  if (!saveLocationFileEl) return;
+  saveLocationFileEl.textContent = message;
+  saveLocationFileEl.className = `save-location-file${isError ? ' error' : ''}`;
+}
+
+function formatCacheBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatCacheDate(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return 'unknown date';
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function updateLoadCacheButton() {
+  if (!cacheSelectEl || !loadCacheButtonEl) return;
+  const selected = knownSessionCaches.find(item => item.session_id === cacheSelectEl.value);
+  loadCacheButtonEl.disabled = !selected || !selected.loadable || selected.session_id === sessionId;
+}
+
+function renderSessionCacheList() {
+  if (!cacheSelectEl || !loadCacheStatusEl) return;
+  cacheSelectEl.replaceChildren();
+  if (!knownSessionCaches.length) {
+    const option = document.createElement('option');
+    option.textContent = 'No saved sessions found';
+    option.value = '';
+    cacheSelectEl.append(option);
+    cacheSelectEl.disabled = true;
+    loadCacheStatusEl.textContent = 'Run an analysis to create a cache you can reopen here.';
+    updateLoadCacheButton();
+    return;
+  }
+
+  knownSessionCaches.forEach(item => {
+    const option = document.createElement('option');
+    const current = item.session_id === sessionId ? ' · current' : '';
+    const unavailable = item.loadable ? '' : ' · too large';
+    option.value = item.session_id;
+    option.textContent = `${item.session_id.slice(0, 12)} · ${formatCacheDate(item.modified_at)} · ${formatCacheBytes(item.size_bytes)}${current}${unavailable}`;
+    option.title = item.cache_file || item.cache_directory || '';
+    option.disabled = !item.loadable;
+    option.selected = item.session_id === sessionId;
+    cacheSelectEl.append(option);
+  });
+  cacheSelectEl.disabled = false;
+  if (!cacheSelectEl.value) {
+    const firstLoadable = knownSessionCaches.find(item => item.loadable);
+    if (firstLoadable) cacheSelectEl.value = firstLoadable.session_id;
+  }
+  loadCacheStatusEl.textContent = `${knownSessionCaches.length} saved session${knownSessionCaches.length === 1 ? '' : 's'} found, newest first.`;
+  loadCacheStatusEl.className = 'load-cache-status';
+  updateLoadCacheButton();
+}
+
+async function refreshSessionCacheList() {
+  if (!cacheSelectEl || !loadCacheStatusEl) return;
+  refreshCachesButtonEl.disabled = true;
+  cacheSelectEl.disabled = true;
+  loadCacheStatusEl.textContent = 'Refreshing saved sessions…';
+  loadCacheStatusEl.className = 'load-cache-status';
+  try {
+    const response = await fetch('/analysis-sessions', { cache: 'no-store' });
+    const payload = await readJsonResponse(response);
+    if (!response.ok) throw new Error(payload.error || 'Could not find saved sessions.');
+    knownSessionCaches = Array.isArray(payload.sessions) ? payload.sessions : [];
+    renderSessionCacheList();
+  } catch (error) {
+    console.error('[session cache] list failed', error);
+    knownSessionCaches = [];
+    cacheSelectEl.replaceChildren();
+    const option = document.createElement('option');
+    option.textContent = 'Saved sessions unavailable';
+    cacheSelectEl.append(option);
+    loadCacheStatusEl.textContent = error.message;
+    loadCacheStatusEl.className = 'load-cache-status error';
+    updateLoadCacheButton();
+  } finally {
+    refreshCachesButtonEl.disabled = false;
+  }
+}
+
 function sessionStateSnapshot() {
   return {
     current_batch_index: currentBatchIndex,
@@ -413,7 +526,7 @@ function persistSessionNow() {
     sessionSaveTimer = null;
   }
   const snapshot = sessionStateSnapshot();
-  setSessionIndicator(`Session ${shortSessionId()} · saving to Desktop…`, 'saving');
+  setSessionIndicator(`Session ${shortSessionId()} · saving cache…`, 'saving');
   sessionSaveChain = sessionSaveChain.catch(() => false).then(async () => {
     try {
       const response = await fetch(`/analysis-sessions/${encodeURIComponent(sessionId)}`, {
@@ -423,8 +536,9 @@ function persistSessionNow() {
       });
       const payload = await readJsonResponse(response);
       if (!response.ok) throw new Error(payload.error || 'Could not save this analysis session.');
+      setSaveFileLocation(payload.cache_directory, payload.cache_file);
       setSessionIndicator(
-        `Session ${shortSessionId()} · saved on Desktop`,
+        `Session ${shortSessionId()} · cache saved`,
         '',
         payload.cache_file || payload.cache_directory || ''
       );
@@ -517,16 +631,17 @@ function restoreSessionState(state) {
 
 async function initializeSession() {
   ensureSessionId();
-  setSessionIndicator(`Session ${shortSessionId()} · checking Desktop cache…`, 'saving');
+  setSessionIndicator(`Session ${shortSessionId()} · checking saved cache…`, 'saving');
   try {
     const response = await fetch(`/analysis-sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
     const payload = await readJsonResponse(response);
     if (!response.ok) throw new Error(payload.error || 'Could not load this analysis session.');
+    setSaveFileLocation(payload.cache_directory, payload.cache_file);
     sessionInitialized = true;
     if (payload.exists) {
       const restoredCount = restoreSessionState(payload.state);
       setSessionIndicator(
-        `Session ${shortSessionId()} · restored from Desktop`,
+        `Session ${shortSessionId()} · restored from cache`,
         '',
         payload.cache_directory || ''
       );
@@ -542,7 +657,88 @@ async function initializeSession() {
     sessionInitialized = true;
     console.error('[session cache] load failed', error);
     setSessionIndicator(`Session ${shortSessionId()} · cache unavailable`, 'error', error.message);
+  } finally {
+    await refreshSessionCacheList();
   }
+}
+
+if (saveLocationFormEl) {
+  saveLocationFormEl.addEventListener('submit', async event => {
+    event.preventDefault();
+    await sessionReadyPromise;
+    const directory = saveLocationInputEl.value.trim();
+    if (!directory) {
+      setSaveLocationFeedback('Enter a save folder.', true);
+      saveLocationInputEl.focus();
+      return;
+    }
+
+    saveLocationButtonEl.disabled = true;
+    setSaveLocationFeedback('Updating this session’s save folder…');
+    try {
+      const response = await fetch(
+        `/analysis-sessions/${encodeURIComponent(sessionId)}/location`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ directory }),
+        }
+      );
+      const payload = await readJsonResponse(response);
+      if (!response.ok) throw new Error(payload.error || 'Could not update the save location.');
+      setSaveFileLocation(payload.cache_directory, payload.cache_file);
+      const saved = await persistSessionNow();
+      if (saved) {
+        setSessionIndicator(
+          `Session ${shortSessionId()} · ${payload.moved ? 'cache moved' : 'save location updated'}`,
+          '',
+          payload.cache_file || payload.cache_directory || ''
+        );
+        await refreshSessionCacheList();
+      }
+    } catch (error) {
+      console.error('[session cache] location update failed', error);
+      setSaveLocationFeedback(error.message, true);
+    } finally {
+      saveLocationButtonEl.disabled = false;
+    }
+  });
+}
+
+if (cacheSelectEl) {
+  cacheSelectEl.addEventListener('change', updateLoadCacheButton);
+}
+
+if (refreshCachesButtonEl) {
+  refreshCachesButtonEl.addEventListener('click', refreshSessionCacheList);
+}
+
+if (loadCacheButtonEl) {
+  loadCacheButtonEl.addEventListener('click', async () => {
+    await sessionReadyPromise;
+    const selectedSessionId = cacheSelectEl.value;
+    const selected = knownSessionCaches.find(item => item.session_id === selectedSessionId);
+    if (!selected || !selected.loadable || selectedSessionId === sessionId) return;
+    if (batchInProgress) {
+      loadCacheStatusEl.textContent = 'Wait for the active analysis to finish, or cancel it before loading another cache.';
+      loadCacheStatusEl.className = 'load-cache-status error';
+      return;
+    }
+
+    loadCacheButtonEl.disabled = true;
+    loadCacheStatusEl.textContent = `Saving this session before loading ${selectedSessionId.slice(0, 12)}…`;
+    const saved = await persistSessionNow();
+    if (!saved) {
+      loadCacheStatusEl.textContent = 'This session could not be saved, so the other cache was not loaded.';
+      loadCacheStatusEl.className = 'load-cache-status error';
+      updateLoadCacheButton();
+      return;
+    }
+
+    const url = new URL(window.location.href);
+    url.searchParams.set(SESSION_QUERY_KEY, selectedSessionId);
+    window.location.assign(`${url.pathname}${url.search}${url.hash}`);
+  });
 }
 
 function clampProgress(value) {

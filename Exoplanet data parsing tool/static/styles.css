@@ -85,6 +85,146 @@ main {
   opacity: .9;
 }
 
+.save-location-section {
+  display: grid;
+  gap: 5px;
+  padding: 10px 11px;
+  border: 1px solid #cfe0df;
+  border-radius: var(--radius);
+  background: #f5fbfa;
+}
+
+.save-location-section h2 {
+  margin: 0;
+  color: var(--accent-dark);
+  font-size: 11px;
+}
+
+.save-location-form {
+  display: grid;
+  gap: 4px;
+}
+
+.save-location-form label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.save-location-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.save-location-input {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 8px;
+  color: #334155;
+  font: 600 10px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+#saveLocationButton {
+  min-height: 32px;
+  padding: 6px 9px;
+  box-shadow: none;
+}
+
+.save-location-file {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.save-location-file.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.load-cache-section {
+  display: grid;
+  gap: 5px;
+  padding: 10px 11px;
+  border: 1px solid #d8dee8;
+  border-radius: var(--radius);
+  background: #f7f9fc;
+}
+
+.load-cache-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.load-cache-section h2 {
+  margin: 0;
+  font-size: 11px;
+}
+
+.load-cache-section label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.load-cache-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: stretch;
+}
+
+#cacheSelect {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 8px;
+  color: #334155;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+#loadCacheButton {
+  min-height: 32px;
+  padding: 6px 12px;
+  box-shadow: none;
+}
+
+.refresh-caches-button {
+  min-height: 0;
+  padding: 1px 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  box-shadow: none;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.refresh-caches-button:hover:not(:disabled) {
+  color: var(--accent-dark);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+.load-cache-status {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.load-cache-status.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 h1 {
   margin: 0 0 4px;
   font-size: 25px;
