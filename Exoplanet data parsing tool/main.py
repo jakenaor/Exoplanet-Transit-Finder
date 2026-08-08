@@ -12,6 +12,7 @@ import webbrowser
 from analysis import analyze, parse_detection_options
 from analysis_jobs import AnalysisJobManager
 from parsers import parse_light_curve_upload
+from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCache, validate_session_id
 
 
 HOST = "127.0.0.1"
@@ -77,6 +78,25 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        session_id = self.analysis_session_id(path)
+        if session_id is not None:
+            try:
+                document = self.server.session_cache.load(session_id)
+                if document is None:
+                    self.write_json({
+                        "exists": False,
+                        "session_id": session_id,
+                        "cache_directory": str(self.server.session_cache.directory),
+                    })
+                else:
+                    self.write_json({
+                        "exists": True,
+                        "cache_directory": str(self.server.session_cache.directory),
+                        **document,
+                    })
+            except Exception as exc:
+                self.write_json({"error": str(exc)}, status=400)
+            return
         job_id = self.analysis_job_id(path)
         if job_id is not None:
             job = self.server.analysis_jobs.get(job_id)
@@ -111,6 +131,26 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        session_id = self.analysis_session_id(path)
+        if session_id is not None:
+            try:
+                state = self.read_json_request(DEFAULT_MAX_SESSION_BYTES)
+                saved = self.server.session_cache.save(session_id, state)
+                print(
+                    f"[session cache] session={session_id[:8]} saved={saved['size_bytes']}B "
+                    f"path={json.dumps(saved['cache_file'])}",
+                    flush=True,
+                )
+                self.write_json({
+                    "saved": True,
+                    "cache_directory": str(self.server.session_cache.directory),
+                    **saved,
+                })
+            except CLIENT_DISCONNECT_ERRORS:
+                self.log_client_disconnect()
+            except Exception as exc:
+                self.write_json({"error": str(exc)}, status=400)
+            return
         if path not in {"/analyze", "/analysis-jobs"}:
             self.send_error(404)
             return
@@ -164,6 +204,23 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         source_file = getattr(file_item, "filename", None)
         return time_values, flux_values, options, source_file
 
+    def read_json_request(self, max_bytes):
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid session cache request length.") from exc
+        if content_length <= 0:
+            raise ValueError("Analysis session state is empty.")
+        if content_length > max_bytes:
+            raise ValueError("The analysis session is too large to save.")
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Analysis session state is not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Analysis session state must be a JSON object.")
+        return payload
+
     @staticmethod
     def analysis_job_id(path):
         prefix = "/analysis-jobs/"
@@ -173,6 +230,19 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         if not job_id or "/" in job_id:
             return None
         return job_id
+
+    @staticmethod
+    def analysis_session_id(path):
+        prefix = "/analysis-sessions/"
+        if not path.startswith(prefix):
+            return None
+        session_id = path[len(prefix):]
+        if not session_id or "/" in session_id:
+            return None
+        try:
+            return validate_session_id(session_id)
+        except ValueError:
+            return None
 
     def write_file(self, path, content_type):
         body = read_static_file(path)
@@ -225,9 +295,11 @@ def main():
     except ValueError:
         max_jobs = 1
     server.analysis_jobs = AnalysisJobManager(max_running=max_jobs)
+    server.session_cache = SessionCache()
 
     url = f"http://{HOST}:{server.server_port}/"
     print(f"Transit Finder running at {url}")
+    print(f"Session caches: {server.session_cache.directory}")
     print("Press Ctrl+C to stop.")
     open_browser_soon(url)
     try:

@@ -68,6 +68,23 @@ main {
   opacity: .55;
 }
 
+.session-indicator {
+  margin-top: 5px;
+  color: var(--quiet);
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: .72;
+}
+
+.session-indicator.saving {
+  color: var(--accent);
+}
+
+.session-indicator.error {
+  color: var(--danger);
+  opacity: .9;
+}
+
 h1 {
   margin: 0 0 4px;
   font-size: 25px;

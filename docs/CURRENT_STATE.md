@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-07-24
+Last updated: 2026-08-07
 
 ## Canonical Location
 
@@ -21,6 +21,7 @@ The active app files are:
 ```text
 Exoplanet data parsing tool/main.py
 Exoplanet data parsing tool/analysis_jobs.py
+Exoplanet data parsing tool/session_cache.py
 Exoplanet data parsing tool/analysis.py
 Exoplanet data parsing tool/parsers.py
 Exoplanet data parsing tool/tls_search.py
@@ -52,7 +53,15 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Running `python3 main.py` automatically opens the local app URL in the default browser unless `TRANSIT_FINDER_NO_BROWSER` is set.
 - `requirements.txt` pins `numpy>=1.26,<2`, `scipy>=1.13,<2`, `astropy>=6,<7`, and `transitleastsquares>=1.32,<2` so both Astropy BLS and the physical TLS engine work on the current Python 3.9 setup.
 - Frontend uses a full-window app shell with an independently scrolling sidebar, flexible chart canvas, and scrollable transit table.
-- The title-line UI version indicator is currently `v58`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
+- The title-line UI version indicator is currently `v59`. Increment it for every subsequent bug fix; adding and repositioning the indicator itself intentionally did not increment the version.
+- Browser sessions are disk-backed:
+  - The first page load adds a unique `?session=...` identifier to the localhost URL and immediately creates that session's cache file.
+  - Completed or failed batch items are saved after every file, so already-finished analyses survive an accidental tab close.
+  - Reopening the exact localhost URL restores processed results, the selected result, chart view, detection settings, transit table, metrics, and exports.
+  - Session cache files are atomic JSON documents stored in `~/Desktop/Exoplanet Transit Finder Sessions/`.
+  - Cache writes are limited to 100 result entries and 250 MB per session. Session IDs are validated before they can become paths.
+  - Original uploaded file bytes are not copied into the cache. A restored result can be viewed and exported, but re-running it requires selecting the source file again.
+  - Cache files currently remain until the user deletes them manually.
 - Sidebar panels are native accordion sections with smooth folding animations and CSS-drawn right/down arrows for closed/open states.
 - Run Status is its own accordion panel and auto-opens/expands to show all per-file progress bars when they are rendered or updated.
 - Long analyses run in isolated background processes. Uploads return immediately with a job ID, the frontend polls short-lived status requests, and completed results remain available even if an earlier poll disconnects.
@@ -66,6 +75,7 @@ The `Time` column is treated as continuous Julian days. UI plots show days since
 - Split app structure:
   - `main.py` handles HTTP routes, static assets, the compatibility `/analyze` route, and `/analysis-jobs` lifecycle routes.
   - `analysis_jobs.py` queues analyses in isolated processes, retains completed results, and provides process-group cancellation.
+  - `session_cache.py` atomically persists and restores one JSON cache file per URL session on the Desktop.
   - `parsers.py` handles CSV and FITS ingestion.
   - `analysis.py` handles cleaning, local detection, search selection, diagnostics, and plot payloads.
   - `tls_search.py` wraps the maintained Transit Least Squares engine and converts its models/statistics into compact JSON-safe payloads.
@@ -402,7 +412,7 @@ Additional useful future features after step 13:
 - Transit masks, signal cleansing, and iterative multi-planet search.
 - Optional uncertainty-column support.
 - Search progress reporting and quick-look binning/resampling.
-- Save/load edited sessions.
+- Add a session-cache browser/cleanup control; URL-based automatic session save/restore is implemented in `v59`.
 - Expand the regression suite to real mission light curves and additional failure modes.
 
 ## Current Git State Expectations

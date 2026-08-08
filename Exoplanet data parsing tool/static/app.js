@@ -11,6 +11,7 @@ const warningsEl = document.getElementById('warnings');
 const periodCandidatesEl = document.getElementById('periodCandidates');
 const chartTitleEl = document.getElementById('chartTitle');
 const subtitleEl = document.getElementById('subtitle');
+const sessionIndicatorEl = document.getElementById('sessionIndicator');
 const emptyEl = document.getElementById('empty');
 const rowsEl = document.getElementById('transitRows');
 const canvas = document.getElementById('chart');
@@ -56,6 +57,10 @@ const JOB_POLL_INTERVAL_MS = 750;
 const DEFAULT_SIDEBAR_WIDTH = 390;
 const MIN_SIDEBAR_WIDTH = 320;
 const MAX_SIDEBAR_WIDTH = 560;
+const SESSION_QUERY_KEY = 'session';
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]{8,80}$/;
+const SESSION_SAVE_DELAY_MS = 350;
+const SESSION_VIEWS = new Set(['zoom', 'clean', 'raw', 'phase', 'stack', 'periodogram', 'audit']);
 let selectedFiles = [];
 let selectedFile = null;
 let batchResults = [];
@@ -71,6 +76,12 @@ let currentView = 'zoom';
 let currentViewport = null;
 let dragState = null;
 let lastPointer = null;
+let sessionId = null;
+let sessionInitialized = false;
+let restoringSession = false;
+let sessionSaveTimer = null;
+let sessionSaveChain = Promise.resolve();
+let sessionReadyPromise = null;
 const chartPad = { left: 72, right: 48, top: 42, bottom: 66 };
 
 const fmt = (value, digits = 6) => {
@@ -348,6 +359,192 @@ function setStatus(message, isError = false) {
   statusEl.className = isError ? 'status error' : 'status';
 }
 
+function generateSessionId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  const random = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return `session_${Date.now().toString(36)}_${random}`;
+}
+
+function ensureSessionId() {
+  const url = new URL(window.location.href);
+  const requested = url.searchParams.get(SESSION_QUERY_KEY);
+  sessionId = requested && SESSION_ID_PATTERN.test(requested) ? requested : generateSessionId();
+  if (requested !== sessionId) {
+    url.searchParams.set(SESSION_QUERY_KEY, sessionId);
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+  }
+  return sessionId;
+}
+
+function shortSessionId() {
+  return sessionId ? sessionId.slice(0, 8) : '--------';
+}
+
+function setSessionIndicator(message, state = '', title = '') {
+  if (!sessionIndicatorEl) return;
+  sessionIndicatorEl.textContent = message;
+  sessionIndicatorEl.className = `session-indicator${state ? ` ${state}` : ''}`;
+  sessionIndicatorEl.title = title;
+}
+
+function sessionStateSnapshot() {
+  return {
+    current_batch_index: currentBatchIndex,
+    current_view: currentView,
+    detection_options: detectionOptions(),
+    results: batchResults.map(item => ({
+      file_name: String(item.file?.name || item.result?.source_file || 'unknown'),
+      file_size: Number(item.file?.size) || 0,
+      file_last_modified: Number(item.file?.lastModified) || null,
+      result: item.result || null,
+      error: item.error || null,
+    })),
+  };
+}
+
+function persistSessionNow() {
+  if (!sessionInitialized || restoringSession || !sessionId) return Promise.resolve(false);
+  if (sessionSaveTimer !== null) {
+    window.clearTimeout(sessionSaveTimer);
+    sessionSaveTimer = null;
+  }
+  const snapshot = sessionStateSnapshot();
+  setSessionIndicator(`Session ${shortSessionId()} · saving to Desktop…`, 'saving');
+  sessionSaveChain = sessionSaveChain.catch(() => false).then(async () => {
+    try {
+      const response = await fetch(`/analysis-sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(snapshot),
+      });
+      const payload = await readJsonResponse(response);
+      if (!response.ok) throw new Error(payload.error || 'Could not save this analysis session.');
+      setSessionIndicator(
+        `Session ${shortSessionId()} · saved on Desktop`,
+        '',
+        payload.cache_file || payload.cache_directory || ''
+      );
+      return true;
+    } catch (error) {
+      console.error('[session cache] save failed', error);
+      setSessionIndicator(`Session ${shortSessionId()} · cache save failed`, 'error', error.message);
+      return false;
+    }
+  });
+  return sessionSaveChain;
+}
+
+function queueSessionSave() {
+  if (!sessionInitialized || restoringSession) return;
+  if (sessionSaveTimer !== null) window.clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = window.setTimeout(() => {
+    sessionSaveTimer = null;
+    persistSessionNow();
+  }, SESSION_SAVE_DELAY_MS);
+}
+
+function applySavedDetectionOptions(options) {
+  if (!options || typeof options !== 'object') return;
+  const setValue = (input, value, fallback = '') => {
+    input.value = value === null || value === undefined ? fallback : String(value);
+  };
+  setValue(strictnessInput, options.strictness, '1');
+  setValue(smoothingInput, options.smoothing, '1');
+  setValue(searchModeInput, options.searchMode, 'tls');
+  setValue(tlsTemplateInput, options.tlsTemplate, 'default');
+  setValue(stellarRadiusInput, options.stellarRadius);
+  setValue(stellarMassInput, options.stellarMass);
+  setValue(limbDarkeningU1Input, options.limbDarkeningU1);
+  setValue(limbDarkeningU2Input, options.limbDarkeningU2);
+  setValue(tlsOversamplingInput, options.tlsOversampling, '3');
+  setValue(tlsMinTransitsInput, options.tlsMinTransits, '3');
+  setValue(tlsMinDepthPpmInput, options.tlsMinDepthPpm, '10');
+  setValue(tlsThreadsInput, options.tlsThreads, '4');
+  setValue(tlsDurationGridStepInput, options.tlsDurationGridStep, '1.1');
+  setValue(minDepthInput, options.minDepth);
+  setValue(minDurationInput, options.minDuration);
+  setValue(maxDurationInput, options.maxDuration);
+  setValue(minPeriodInput, options.minPeriod);
+  setValue(maxPeriodInput, options.maxPeriod);
+  updateDetectionReadouts();
+}
+
+function restoreSessionState(state) {
+  if (!state || typeof state !== 'object' || !Array.isArray(state.results)) return 0;
+  restoringSession = true;
+  try {
+    selectedFiles = [];
+    selectedFile = null;
+    batchResults = state.results.slice(0, MAX_BATCH_FILES).map(item => ({
+      file: {
+        name: String(item.file_name || item.result?.source_file || 'restored-analysis'),
+        size: Number(item.file_size) || 0,
+        lastModified: Number(item.file_last_modified) || 0,
+        restored: true,
+      },
+      result: item.result && typeof item.result === 'object' ? item.result : null,
+      error: item.error ? String(item.error) : null,
+    }));
+    applySavedDetectionOptions(state.detection_options);
+    currentView = SESSION_VIEWS.has(state.current_view) ? state.current_view : 'zoom';
+    viewButtons.forEach(button => button.classList.toggle('active', button.dataset.view === currentView));
+    currentBatchIndex = Number.isInteger(state.current_batch_index) ? state.current_batch_index : -1;
+    if (!batchResults[currentBatchIndex]?.result) {
+      currentBatchIndex = batchResults.findIndex(item => item.result);
+    }
+    updateSidebarWidth(batchResults.map(item => item.file));
+    resetAnalysisProgress();
+    renderBatchSelect();
+    if (currentBatchIndex >= 0) {
+      const item = batchResults[currentBatchIndex];
+      selectedFile = item.file;
+      currentResult = item.result;
+      currentViewport = null;
+      renderResult(currentResult);
+    } else {
+      clearResultView();
+    }
+    analyzeButton.disabled = true;
+    return batchResults.length;
+  } finally {
+    restoringSession = false;
+  }
+}
+
+async function initializeSession() {
+  ensureSessionId();
+  setSessionIndicator(`Session ${shortSessionId()} · checking Desktop cache…`, 'saving');
+  try {
+    const response = await fetch(`/analysis-sessions/${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+    const payload = await readJsonResponse(response);
+    if (!response.ok) throw new Error(payload.error || 'Could not load this analysis session.');
+    sessionInitialized = true;
+    if (payload.exists) {
+      const restoredCount = restoreSessionState(payload.state);
+      setSessionIndicator(
+        `Session ${shortSessionId()} · restored from Desktop`,
+        '',
+        payload.cache_directory || ''
+      );
+      setStatus(
+        restoredCount
+          ? `Restored ${restoredCount} processed file${restoredCount === 1 ? '' : 's'} from this session.`
+          : 'This session is ready. No files have been processed yet.'
+      );
+      return;
+    }
+    await persistSessionNow();
+  } catch (error) {
+    sessionInitialized = true;
+    console.error('[session cache] load failed', error);
+    setSessionIndicator(`Session ${shortSessionId()} · cache unavailable`, 'error', error.message);
+  }
+}
+
 function clampProgress(value) {
   if (!Number.isFinite(Number(value))) return 0;
   return Math.max(0, Math.min(100, Number(value)));
@@ -611,6 +808,7 @@ function setFiles(fileList) {
       ? selectedFiles[0].name
       : `${selectedFiles.length} files selected.`);
   }
+  queueSessionSave();
 }
 
 function optionalNumber(input) {
@@ -678,6 +876,7 @@ function markDetectionControlsChanged() {
   if (currentResult && selectedFiles.length) {
     setStatus('Detection controls changed. Run Analyze files to apply.');
   }
+  queueSessionSave();
 }
 
 function syncExportButtons() {
@@ -874,6 +1073,7 @@ function selectBatchResult(index) {
   renderBatchSelect();
   renderResult(currentResult);
   setStatus(`Showing ${item.file.name}.`);
+  queueSessionSave();
 }
 
 fileInput.addEventListener('change', () => setFiles(fileInput.files));
@@ -944,6 +1144,7 @@ cancelAnalysisButton.addEventListener('click', async () => {
 
 analyzeButton.addEventListener('click', async () => {
   if (!selectedFiles.length) return;
+  await sessionReadyPromise;
   const filesToAnalyze = selectedFiles.slice(0, MAX_BATCH_FILES);
   const options = detectionOptions();
   setStatus(`Analyzing 1/${filesToAnalyze.length}: ${filesToAnalyze[0].name}`);
@@ -958,6 +1159,7 @@ analyzeButton.addEventListener('click', async () => {
   currentBatchIndex = -1;
   renderBatchSelect();
   clearResultView();
+  await persistSessionNow();
   try {
     let batchWasCancelled = false;
     for (let index = 0; index < filesToAnalyze.length; index++) {
@@ -986,12 +1188,14 @@ analyzeButton.addEventListener('click', async () => {
             setFileProgress(pendingIndex, 0, 'Not started', 'cancelled');
           }
           batchWasCancelled = true;
+          await persistSessionNow();
           break;
         }
         batchResults.push({ file, result: null, error: error.message });
         renderBatchSelect();
       }
       finishFileProgress(index, fileSucceeded ? 'complete' : 'failed');
+      await persistSessionNow();
     }
 
     if (batchWasCancelled) {
@@ -1030,6 +1234,7 @@ analyzeButton.addEventListener('click', async () => {
     cancelAnalysisButton.disabled = false;
     analyzeButton.disabled = !selectedFiles.length;
     renderBatchSelect();
+    await persistSessionNow();
   }
 });
 
@@ -1066,6 +1271,7 @@ viewButtons.forEach(button => {
     viewButtons.forEach(item => item.classList.toggle('active', item === button));
     updateChartHeading();
     drawChart();
+    queueSessionSave();
   });
 });
 
@@ -3681,3 +3887,5 @@ window.addEventListener('resize', () => {
   updateSidebarWidth();
   drawChart();
 });
+
+sessionReadyPromise = initializeSession();
