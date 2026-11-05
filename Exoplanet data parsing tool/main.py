@@ -244,6 +244,8 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         options["_cleaning_report"] = parsed["cleaning"]
         if parsed["flux_uncertainty"] is not None:
             options["_flux_uncertainty"] = [float(v) if v == v else None for v in parsed["flux_uncertainty"]]
+        if parsed.get("exposure_seconds") is not None:
+            options["_exposure_seconds"] = [float(v) if v == v else None for v in parsed["exposure_seconds"]]
         for field, key in (("batchId", "_batch_id"), ("analysisRequestId", "_request_id")):
             value = str(form.getfirst(field) or "").strip()
             if value:

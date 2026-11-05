@@ -77,6 +77,18 @@ run('getViewport=savedGetViewport;pointerPosition=savedPointerPosition;dragState
 get('perFileSettings').value='{"a.csv":{"inventedSetting":1}}';
 assert.throws(()=>run('readPerFileSettings()'),/Unknown per-file setting/);
 console.log('Frontend review: 11 behavior groups passed (including arrow shortcuts and chart focus).');
+
+get('exposureSecondsInput').value='0';
+assert.equal(run('detectionOptions().exposureSeconds'),0,'instantaneous exposure override remains a numeric zero');
+get('exposureSecondsInput').value='';
+assert.equal(run('detectionOptions().exposureSeconds'),null,'blank exposure stays unknown');
+assert.match(run('exposureSummary({known_rows:0,unknown_rows:10})'),/Unknown; template evaluated as instantaneous/);
+assert.match(run("exposureSummary({known_rows:10,unknown_rows:0,minimum_seconds:0,maximum_seconds:0,source:'explicit per-file override'})"),/0.* s; 10 declared samples/);
+assert.match(run("searchEtaText({eta_state:'available',estimated_remaining_seconds:1020,eta_lower_seconds:840,eta_upper_seconds:1260},{stage:'tls_search'})"),/about 17 min/);
+assert.match(run("searchEtaText({eta_state:'available',estimated_remaining_seconds:1020,eta_lower_seconds:540,eta_upper_seconds:3120},{stage:'tls_search'})"),/estimating/,'a 9–52min range is withheld, not made artificially precise');
+assert.match(run("searchEtaText({eta_state:'estimating',estimated_remaining_seconds:1020,eta_lower_seconds:840,eta_upper_seconds:1260},{stage:'tls_search'})"),/estimating/);
+assert.match(run("searchEtaText({eta_state:'available',estimated_remaining_seconds:1020,eta_lower_seconds:840,eta_upper_seconds:1260},{stage:'tls_finalizing'})"),/Finalizing/);
+console.log('Exposure controls and uncertainty-aware ETA labels passed.');
 module.exports = {context,run,elements,calls};
 
 async function checkRequestRecovery() {

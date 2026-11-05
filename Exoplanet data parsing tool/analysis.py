@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 
-from tls_search import run_tls_search
+from tls_search import run_tls_search, exposure_array_seconds, exposure_integrated_template
 
 try:
     from scipy.signal import find_peaks, peak_widths
@@ -43,6 +43,7 @@ DEFAULT_DETECTION_OPTIONS = {
     "tls_min_depth_ppm": 10.0,
     "tls_duration_grid_step": 1.1,
     "tls_max_signals": 1,
+    "exposure_seconds": None,
 }
 
 
@@ -141,6 +142,7 @@ def parse_detection_options(form):
     )
     options["tls_min_depth_ppm"] = parse_optional_float(form, "tlsMinDepthPpm", 0.1, 500000.0) or 10.0
     options["tls_duration_grid_step"] = parse_optional_float(form, "tlsDurationGridStep", 1.01, 2.0) or 1.1
+    options["exposure_seconds"] = parse_optional_float(form, "exposureSeconds", 0.0, 86400.0)
     limb_u1 = options["limb_darkening_u1"]
     limb_u2 = options["limb_darkening_u2"]
     if (limb_u1 is None) != (limb_u2 is None):
@@ -2217,7 +2219,10 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
     minimum = finite_number(search_bounds.get("min_period"))
     maximum = finite_number(search_bounds.get("max_period"))
     if selected_period is not None and minimum is not None and maximum is not None:
-        edge_margin = max((maximum - minimum) * 0.01, selected_period * 0.002)
+        # A remote upper bound must not make an interior short-period peak
+        # appear to lie on the lower edge of a very broad search.
+        period_uncertainty = finite_number(detection.get("period_uncertainty")) or 0.0
+        edge_margin = max(selected_period * 0.002, period_uncertainty * 3.0)
         if min(abs(selected_period - minimum), abs(maximum - selected_period)) < edge_margin:
             warnings.append({"severity": "caution", "title": "Period peak near search edge",
                              "detail": "The selected period is close to a search bound. Widen the bounds when baseline and minimum-transit constraints permit."})
@@ -2736,7 +2741,7 @@ def downsample_for_plot(time, flux, smooth_flux, max_points=MAX_PLOT_POINTS):
     return time[keep], flux[keep], smooth_flux[keep]
 
 
-def model_flux_at_observations(time, period, epoch, transit_model):
+def model_flux_at_observations(time, period, epoch, transit_model, exposure_seconds=None):
     if (
         transit_model is None
         or period is None
@@ -2770,7 +2775,7 @@ def model_flux_at_observations(time, period, epoch, transit_model):
 
     period = float(period)
     phase = ((np.asarray(time, dtype=float) - float(epoch) + period / 2.0) % period) - period / 2.0
-    return np.interp(phase, model_phase, model_flux, left=1.0, right=1.0)
+    return exposure_integrated_template(phase, model_phase, model_flux, period, exposure_seconds)
 
 
 def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration, max_points=MAX_PLOT_POINTS):
@@ -3049,7 +3054,7 @@ def tag_exploratory_assignments(result, signals):
         dip["assignment"] = "overlaps_predicted_window" if matches else "unassigned"
 
 
-def joint_template_amplitudes(time, search_flux, signals, uncertainty=None):
+def joint_template_amplitudes(time, search_flux, signals, uncertainty=None, exposure_seconds=None):
     """Fit simultaneous depths and one baseline with orbital templates fixed.
 
     This handles additive small-planet flux deficits at overlapping timestamps.
@@ -3072,7 +3077,7 @@ def joint_template_amplitudes(time, search_flux, signals, uncertainty=None):
         depth = float(baseline - np.min(folded_flux))
         if depth <= 0:
             return None
-        aligned = model_flux_at_observations(time, signal["period"], signal["period_epoch"], model)
+        aligned = model_flux_at_observations(time, signal["period"], signal["period_epoch"], model, exposure_seconds)
         if aligned is None:
             return None
         shapes.append(np.maximum(0.0, (baseline - aligned) / depth))
@@ -3159,6 +3164,20 @@ def analyze(time, flux, options=None, progress_callback=None):
         raise ValueError("Analysis requires matching finite time/flux samples.")
     if np.any(np.diff(time) <= 0):
         raise ValueError("Analysis timestamps must be sorted, unique, and span more than zero days.")
+    explicit_exposure = options.get("exposure_seconds")
+    if explicit_exposure is not None and (not math.isfinite(float(explicit_exposure)) or not 0 <= float(explicit_exposure) <= 86400):
+        raise ValueError("Exposure override must be between zero and 86400 seconds; leave blank when unknown.")
+    exposures = exposure_array_seconds(explicit_exposure if explicit_exposure is not None else options.get("_exposure_seconds"), len(time))
+    options["_exposure_seconds"] = exposures
+    known_exposures = exposures[np.isfinite(exposures)]
+    exposure_metadata = {"source": "explicit per-file override" if explicit_exposure is not None else
+        ((options.get("_input_metadata") or {}).get("exposure") or {}).get("source", "supplied array" if known_exposures.size else "unknown"),
+        "unit": "seconds", "known_rows": int(known_exposures.size), "unknown_rows": int(len(time) - known_exposures.size),
+        "minimum_seconds": float(np.min(known_exposures)) if known_exposures.size else None,
+        "maximum_seconds": float(np.max(known_exposures)) if known_exposures.size else None,
+        "cadence_is_exposure": False, "timestamps_assumed": "exposure midpoints",
+        "unknown_policy": "instantaneous template approximation; unknown exposure smearing uncertainty is not included",
+        "scope": "conditional duration/depth refit and observation-aligned model; reference TLS search is unchanged"}
     report_progress("preparing", "Preparing light curve")
     normalization_plan = flux_normalization_plan(flux)
     analysis_flux, segments = normalize_flux_by_segments(time, flux)
@@ -3209,6 +3228,7 @@ def analyze(time, flux, options=None, progress_callback=None):
         detection.get("period"),
         detection.get("period_epoch"),
         transit_model,
+        exposures,
     )
     display_model_flux = None
     if observed_model_flux is not None:
@@ -3298,6 +3318,9 @@ def analyze(time, flux, options=None, progress_callback=None):
     ]
     report_progress("vetting", "Calculating diagnostics")
     diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference, observed_ranges)
+    if search_mode == "tls" and exposure_metadata["unknown_rows"]:
+        warnings.append({"severity": "info", "title": "Unknown exposure duration",
+                         "detail": "Some or all sample exposure durations are unknown. Template refinement uses an instantaneous approximation for those rows; cadence is not treated as exposure, and duration uncertainty excludes this systematic. Supply an exposure in seconds when known."})
     if normalized_uncertainty is not None and not uncertainty_complete:
         warnings.append({"severity": "info", "title": "Partial measurement uncertainties",
                          "detail": "Some flux errors are missing or invalid. They remain null in plots/exports; TLS uses its unweighted fallback for this file and local checks use empirical noise."})
@@ -3393,11 +3416,13 @@ def analyze(time, flux, options=None, progress_callback=None):
         "exploratory_dips_metadata": exploratory_metadata,
         "cleaning_report": options.get("_cleaning_report"),
         "input_metadata": options.get("_input_metadata", {"time_format": "unspecified", "time_standard": "unspecified"}),
+        "exposure_metadata": exposure_metadata,
         "preprocessing": {"normalized": "per-observing-segment median", "search": "segment-local trend removal; downward samples retained", "display": "segment-local moving average", "stack": "per-event linear baseline, no automatic recentering"},
         "significance_metadata": {"p_value": "Approximate fixed-model-versus-flat chi-squared comparison after selecting the period; not search-wide false alarm or planet probability.",
                                   "tls_fap": "Reference TLS white-noise lookup; correlated noise and selection effects can make it optimistic.",
                                   "candidate_score": "Heuristic review score, not a calibrated probability."},
         "effective_settings": {**public_options, "stellar_priors": (detection.get("tls") or {}).get("effective_stellar_priors"),
+                               "exposure": exposure_metadata,
                                "local_dip_settings": {key: public_options.get(key) for key in ("strictness", "smoothing", "min_depth", "min_duration", "max_duration")},
                                "search_bounds": {**(detection.get("period_search") or {}), "min_transits": options.get("tls_min_transits"),
                                                  "duration_policy": "Physical TLS stellar-prior/template grid; explicit local dip duration bounds are not applied to TLS." if search_mode == "tls" else "Explicit or cadence-derived BLS duration bounds.",
@@ -3411,6 +3436,8 @@ def analyze(time, flux, options=None, progress_callback=None):
         result["plot"]["flux_uncertainty"] = [float(value) if np.isfinite(value) and value > 0 else None for value in normalized_uncertainty[plot_keep]]
         result["uncertainty_usage"] = ("Normalized input uncertainties supplied to TLS; local event estimates additionally use empirical correlated-noise errors." if uncertainty_complete
                                        else "Incomplete errors retained as null; TLS uses unweighted fallback and local checks use empirical correlated-noise errors.")
+    if known_exposures.size:
+        result["plot"]["exposure_seconds"] = [float(value) if np.isfinite(value) else None for value in exposures[plot_keep]]
     max_signals = int(options.get("tls_max_signals", options.get("max_signals", 1)))
     if search_mode == "tls" and max_signals > 1:
         signals = [{"signal_id": "signal-1", "label": "Signal 1", **result}]
@@ -3436,6 +3463,7 @@ def analyze(time, flux, options=None, progress_callback=None):
             if options.get("_flux_uncertainty") is not None:
                 next_options["_flux_uncertainty"] = np.asarray(options["_flux_uncertainty"])[retained]
                 next_options.pop("_normalized_flux_uncertainty", None)
+            next_options["_exposure_seconds"] = exposures[retained]
             candidate = analyze(time[retained], flux[retained], next_options, progress_callback)
             # Do not present another optimizer noise pattern as a recovered planet.
             if candidate["planet_assessment"]["status"] not in ("strong_candidate", "possible_candidate"):
@@ -3453,7 +3481,7 @@ def analyze(time, flux, options=None, progress_callback=None):
         if len(signals) >= 2 and search_flux is not None:
             report_progress("building", "Refining overlapping transit amplitudes together")
             joint = joint_template_amplitudes(time, search_flux, signals,
-                                               normalized_uncertainty if uncertainty_complete else None)
+                                               normalized_uncertainty if uncertainty_complete else None, exposures)
             if joint is not None:
                 for signal, depth, depth_error in zip(signals, joint["depths"], joint["depth_uncertainties"]):
                     update_signal_joint_depth(signal, depth, depth_error)

@@ -9,6 +9,7 @@ import math
 import multiprocessing
 import os
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -21,12 +22,111 @@ from analysis import analyze
 
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 RESULT_SCHEMA_VERSION = 2
-ANALYSIS_VERSION = "2026.11.05.1"
-APP_VERSION = "64"
+ANALYSIS_VERSION = "2026.11.05.2"
+APP_VERSION = "65"
 PROGRESS_FIELDS = ("completed_trials", "total_trials", "estimated_remaining_seconds",
                    "eta_lower_seconds", "eta_upper_seconds", "eta_scope", "work_completed",
                    "work_total", "remaining_seconds_range", "eta_state", "search_elapsed_seconds",
-                   "throughput_elapsed_seconds", "search_complete")
+                   "throughput_elapsed_seconds", "search_complete", "eta_method",
+                   "eta_sample_seconds", "eta_variation")
+
+
+class ExecutionTelemetry:
+    """Bounded evidence for auditing a completed job without retaining its inputs."""
+
+    def __init__(self, history_limit=256):
+        self.history_limit = max(8, int(history_limit))
+        self.history = []
+        self.sample_interval = 5.0
+        self.sampled = False
+        self.stages = []
+        self.searches = []
+        self.current_stage = None
+        self.last_search_elapsed = None
+
+    def update(self, stage, label, details, elapsed):
+        elapsed = max(0.0, float(elapsed))
+        changed = self.current_stage is None or stage != self.current_stage["stage"]
+        if changed:
+            self._close_stage(elapsed)
+            self.current_stage = {"stage": str(stage), "stage_label": str(label),
+                                  "started_elapsed_seconds": elapsed}
+        progress = cleaned_progress_details(details)
+        search_id = None
+        if progress.get("total_trials") is not None and progress.get("completed_trials") is not None:
+            search_elapsed = progress.get("search_elapsed_seconds")
+            new_search = (not self.searches or self.searches[-1].get("finished_elapsed_seconds") is not None
+                          or (search_elapsed is not None and self.last_search_elapsed is not None
+                              and search_elapsed < self.last_search_elapsed))
+            # A repeated final notification must not create an empty search.
+            if new_search and not progress.get("search_complete"):
+                self.searches.append({"search_id": len(self.searches) + 1,
+                    "started_elapsed_seconds": max(0.0, elapsed - (search_elapsed or 0.0)),
+                    "total_trials": progress["total_trials"]})
+            if self.searches:
+                search = self.searches[-1]
+                search_id = search["search_id"]
+                search["completed_trials"] = progress["completed_trials"]
+                if progress.get("search_complete"):
+                    search["finished_elapsed_seconds"] = elapsed
+                    search["duration_seconds"] = max(0.0, elapsed - search["started_elapsed_seconds"])
+            self.last_search_elapsed = search_elapsed
+        snapshot = {"elapsed_seconds": elapsed, "stage": str(stage), **progress}
+        if search_id is not None:
+            snapshot["search_id"] = search_id
+        previous = self.history[-1] if self.history else {}
+        eta_changed = progress.get("eta_state") != previous.get("eta_state")
+        if (not self.history or changed or eta_changed or progress.get("search_complete")
+                or elapsed - previous.get("elapsed_seconds", 0.0) >= self.sample_interval):
+            self.history.append(snapshot)
+            if len(self.history) > self.history_limit:
+                # Preserve first/latest samples and thin older observations.
+                latest = self.history[-1]
+                self.history = self.history[::2]
+                if self.history[-1] is not latest:
+                    self.history.append(latest)
+                self.sample_interval *= 2.0
+                self.sampled = True
+
+    def _close_stage(self, elapsed):
+        if self.current_stage is not None:
+            stage = {**self.current_stage, "finished_elapsed_seconds": elapsed,
+                     "duration_seconds": max(0.0, elapsed - self.current_stage["started_elapsed_seconds"])}
+            self.stages.append(stage)
+            self.stages = self.stages[-64:]
+            self.current_stage = None
+
+    def finish(self, stage, label, elapsed, queue_wait=0.0):
+        self.update(stage, label, {}, elapsed)
+        self._close_stage(elapsed)
+        searches = {search["search_id"]: search for search in self.searches}
+        history = [dict(snapshot) for snapshot in self.history]
+        errors, coverage = [], []
+        for snapshot in history:
+            forecast = snapshot.get("estimated_remaining_seconds")
+            search_end = searches.get(snapshot.get("search_id"), {}).get("finished_elapsed_seconds")
+            if forecast is None or search_end is None:
+                continue
+            actual = max(0.0, search_end - snapshot["elapsed_seconds"])
+            error = forecast - actual
+            snapshot.update({"actual_remaining_seconds": actual, "eta_error_seconds": error})
+            errors.append(abs(error))
+            low, high = snapshot.get("eta_lower_seconds"), snapshot.get("eta_upper_seconds")
+            if low is not None and high is not None:
+                covered = low <= actual <= high
+                snapshot["range_contains_actual"] = covered
+                coverage.append(covered)
+        return {"schema_version": 1, "elapsed_seconds": max(0.0, float(elapsed)),
+                "queue_wait_seconds": max(0.0, float(queue_wait)), "stage_durations": self.stages,
+                "searches": self.searches, "progress_history": history,
+                "progress_history_limit": self.history_limit,
+                "progress_history_sampled": self.sampled,
+                "eta_audit": {"scope": "search", "retained_forecasts_audited": len(errors),
+                    "mean_absolute_error_seconds": statistics.mean(errors) if errors else None,
+                    "median_absolute_error_seconds": statistics.median(errors) if errors else None,
+                    "ranges_audited": len(coverage),
+                    "observed_range_coverage_fraction": statistics.mean(coverage) if coverage else None,
+                    "note": "Audit uses retained forecasts only; observed throughput ranges are not confidence intervals."}}
 
 
 def annotate_analysis_result(result, options=None, source_file=None):
@@ -86,7 +186,7 @@ def cleaned_progress_details(details):
         if key == "search_complete":
             if isinstance(value, bool):
                 output[key] = value
-        elif key in {"eta_scope", "eta_state"}:
+        elif key in {"eta_scope", "eta_state", "eta_method"}:
             if isinstance(value, str):
                 output[key] = value[:40]
         elif key == "remaining_seconds_range":
@@ -190,6 +290,8 @@ class AnalysisJobManager:
             "batch_id": options.get("_batch_id"),
             "request_id": options.get("_request_id"),
             "progress": {},
+            "telemetry": None,
+            "execution": None,
         }
         with self.lock:
             if self.closed:
@@ -325,6 +427,8 @@ class AnalysisJobManager:
         process.daemon = False
         record["status"] = "running"
         record["started_at"] = time.time()
+        record["telemetry"] = ExecutionTelemetry()
+        record["telemetry"].update("starting", "Starting analysis", {}, 0.0)
         record["stage"] = "starting"
         record["stage_label"] = "Starting analysis"
         record["process"] = process
@@ -369,6 +473,8 @@ class AnalysisJobManager:
                     )
                     record["progress"] = cleaned_progress_details(incoming)
                     record["progress_updated_at"] = time.time()
+                    record["telemetry"].update(record["stage"], record["stage_label"],
+                        record["progress"], record["progress_updated_at"] - record["started_at"])
         except (EOFError, OSError):
             pass
         finally:
@@ -398,6 +504,14 @@ class AnalysisJobManager:
                 record["stage"] = "failed"
                 record["stage_label"] = "Analysis failed"
             record["finished_at"] = record.get("finished_at") or time.time()
+            telemetry = record.get("telemetry")
+            if telemetry is not None:
+                record["execution"] = telemetry.finish(record["stage"], record["stage_label"],
+                    record["finished_at"] - record["started_at"],
+                    record["started_at"] - record["submitted_at"])
+                if isinstance(record.get("result"), dict):
+                    record["result"]["execution"] = record["execution"]
+                record["telemetry"] = None
             record["process"] = None
             record["connection"] = None
             self._drop_inputs_locked(record)
@@ -442,6 +556,8 @@ class AnalysisJobManager:
             payload.update({key: None for key in PROGRESS_FIELDS})
         if record["status"] == "failed":
             payload["error"] = record.get("error") or "Analysis failed."
+        if record.get("execution") is not None:
+            payload["execution"] = record["execution"]
         if include_result and record["status"] == "completed":
             payload["result"] = record.get("result")
         return payload

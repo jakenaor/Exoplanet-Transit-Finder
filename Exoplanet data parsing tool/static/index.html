@@ -12,7 +12,7 @@
       <div>
         <div class="app-title-row">
           <h1>Transit Finder</h1>
-          <span class="version-indicator" aria-label="Application version 64">v64</span>
+          <span class="version-indicator" aria-label="Application version 65">v65</span>
         </div>
         <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
         <p id="sessionIndicator" class="session-indicator" aria-live="polite">Preparing session cache…</p>
@@ -205,6 +205,11 @@
               <output>auto</output>
             </label>
             <input id="maxPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
+          </div>
+          <div class="control-row">
+            <label class="control-label" for="exposureSecondsInput"><span>Exposure per sample (seconds)</span></label>
+            <input id="exposureSecondsInput" type="number" min="0" max="86400" step="any" placeholder="unknown / file metadata">
+            <p class="control-help">Used for duration fitting and model comparisons; the period search is unchanged. Blank uses an explicit exposure column when present; otherwise exposure stays unknown. Use 0 only for instantaneous samples. Cadence is not assumed to be exposure.</p>
           </div>
           <button id="resetDetectionButton" class="view-button" type="button">Reset detection</button>
           <details><summary>Per-file settings</summary><label for="perFileTarget">Apply settings to</label><select id="perFileTarget"><option value="">Choose source files first</option></select><button id="applyPerFileSettings" type="button">Use current controls for this file</button><button id="clearPerFileSettings" type="button">Use batch defaults for this file</button><p id="perFileSettingsStatus" class="control-help">Set priors and search controls above, then apply them to one selected file.</p><details><summary>Advanced JSON</summary><p class="control-help">Overrides keyed by exact filename. Names match exported detection options.</p><textarea id="perFileSettings" rows="5" spellcheck="false" placeholder='{"target.csv":{"stellarRadius":0.12,"stellarMass":0.09,"tlsMaxSignals":3}}'></textarea></details></details>

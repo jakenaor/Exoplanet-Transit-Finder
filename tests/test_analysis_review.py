@@ -11,6 +11,21 @@ import tls_search
 
 
 class EventEvidenceTests(unittest.TestCase):
+    def test_search_edge_warning_uses_local_period_scale(self):
+        for period, lower, upper, sigma, expected in [
+            (.81347, .5, 245, .000026, False),
+            (1.3382, .5, 253, .000074, False),
+            (.50001, .5, 245, .000001, True),
+            (244.99, .5, 245, .000001, True),
+            (2.18, 1, 2.2, .01, True),
+        ]:
+            with self.subTest(period=period, bounds=(lower, upper)):
+                _, warnings = analysis.build_candidate_diagnostics([], {
+                    "period": period, "period_method": "TLS", "period_uncertainty": sigma,
+                    "period_search": {"min_period": lower, "max_period": upper},
+                })
+                self.assertEqual(any(w["title"] == "Period peak near search edge" for w in warnings), expected)
+
     def windows(self, time, flux, centers=(1.0, 3.0, 5.0), duration=0.2):
         return analysis.transits_from_tls_result(time, flux, {
             "period": 2.0, "duration": duration, "transit_time": 1.0,

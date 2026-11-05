@@ -76,6 +76,7 @@ const stackRecenterInput = document.getElementById('stackRecenter');
 const csvTimeFormatInput = document.getElementById('csvTimeFormat');
 const csvTimeScaleInput = document.getElementById('csvTimeScale');
 const csvTimeUnitInput = document.getElementById('csvTimeUnit');
+const exposureSecondsInput = document.getElementById('exposureSecondsInput');
 const appShell = document.querySelector('main');
 const MAX_BATCH_FILES = 100;
 const JOB_POLL_INTERVAL_MS = 750;
@@ -639,6 +640,7 @@ function applySavedDetectionOptions(options) {
   setValue(csvTimeFormatInput, options.csvTimeFormat, 'unknown');
   setValue(csvTimeScaleInput, options.csvTimeScale, 'unknown');
   setValue(csvTimeUnitInput, options.csvTimeUnit, 'days');
+  setValue(exposureSecondsInput, options.exposureSeconds);
   setValue(minDepthInput, options.minDepth);
   setValue(minDurationInput, options.minDuration);
   setValue(maxDurationInput, options.maxDuration);
@@ -1124,6 +1126,7 @@ function detectionOptions() {
     csvTimeFormat: csvTimeFormatInput.value,
     csvTimeScale: csvTimeScaleInput.value,
     csvTimeUnit: csvTimeUnitInput.value,
+    exposureSeconds: optionalNumber(exposureSecondsInput),
     minDepth: optionalNumber(minDepthInput),
     minDuration: optionalNumber(minDurationInput),
     maxDuration: optionalNumber(maxDurationInput),
@@ -1158,6 +1161,7 @@ function resetDetectionControls() {
   csvTimeFormatInput.value = 'unknown';
   csvTimeScaleInput.value = 'unknown';
   csvTimeUnitInput.value = 'days';
+  exposureSecondsInput.value = '';
   minDepthInput.value = '';
   minDurationInput.value = '';
   maxDurationInput.value = '';
@@ -1298,15 +1302,25 @@ function updateProgressFromJob(index, job, searchMode) {
   const progress = { ...job, ...(job.progress_details || job.progress || {}) };
   const completed = nullableNumber(progress.completed_trials ?? progress.work_completed);
   const total = nullableNumber(progress.total_trials ?? progress.work_total);
-  const range = progress.remaining_seconds_range || [progress.eta_lower_seconds, progress.eta_upper_seconds];
-  const low = nullableNumber(range?.[0]); const high = nullableNumber(range?.[1]);
   const counts = completed !== null && total > 0 ? `${completed.toLocaleString()} / ${total.toLocaleString()} period trials. ` : '';
   if (!active || job.status === 'cancelling') setProgressEta(index, '');
   else if(job.stage==='tls_finalizing' || progress.search_complete) setProgressEta(index,'Finalizing the model and diagnostics; completion ETA unavailable.');
-  else if (low !== null && high !== null && high > 0 && job.status === 'running') {
-    const lower = Math.max(1, Math.floor(low / 60)); const upper = Math.max(lower + 1, Math.ceil(high / 60));
-    setProgressEta(index, `${counts}Search time remaining: about ${lower}–${upper} min.`);
-  } else if (job.status === 'running') setProgressEta(index, `${counts}${/search|TLS|period/i.test(job.stage_label || '') ? 'Search ETA: estimating…' : 'Finalization in progress; completion ETA unavailable.'}`);
+  else if (job.status === 'running') setProgressEta(index, `${counts}${searchEtaText(progress,job)}`);
+}
+
+function searchEtaText(progress, job) {
+  const estimate=nullableNumber(progress.estimated_remaining_seconds);
+  const range=progress.remaining_seconds_range || [progress.eta_lower_seconds,progress.eta_upper_seconds];
+  const low=nullableNumber(range?.[0]), high=nullableNumber(range?.[1]);
+  const isSearch=/search|TLS|period/i.test(job.stage_label || '') || job.stage==='tls_search';
+  if(job.stage==='tls_finalizing'||progress.search_complete)return 'Finalizing the model and diagnostics; completion ETA unavailable.';
+  if(progress.eta_state==='estimating'||estimate===null||estimate<0||low===null||high===null||high<low||high>Math.max(low*2,120)) {
+    return isSearch ? 'Search ETA: estimating…' : 'Finalization in progress; completion ETA unavailable.';
+  }
+  if(estimate<60)return 'Search time remaining: less than a minute.';
+  const minutes=Math.max(1,Math.round(estimate/60));
+  const lower=Math.max(1,Math.floor(low/60)), upper=Math.max(lower,Math.ceil(high/60));
+  return `Search time remaining: about ${minutes} min${lower<upper ? ` (range ${lower}–${upper} min)` : ''}.`;
 }
 
 function setProgressEta(index, label) {
@@ -1452,7 +1466,7 @@ fileInput.addEventListener('change', () => setFiles(fileInput.files));
   tlsThreadsInput,
   tlsDurationGridStepInput,
   tlsMaxSignalsInput,
-  csvTimeFormatInput,csvTimeScaleInput,csvTimeUnitInput,
+  csvTimeFormatInput,csvTimeScaleInput,csvTimeUnitInput,exposureSecondsInput,
 ].forEach(input => input.addEventListener('change', markDetectionControlsChanged));
 searchModeInput.addEventListener('change', () => {
   updateDetectionReadouts();
@@ -2284,6 +2298,17 @@ function eventSignedDepthFraction(event) {
   return nullableNumber(event.depth_fraction);
 }
 
+function exposureSummary(metadata) {
+  if (!metadata) return 'Not recorded; cadence is not a verified exposure duration';
+  const known=nullableNumber(metadata.known_rows) || 0;
+  const unknown=nullableNumber(metadata.unknown_rows) || 0;
+  if (!known) return 'Unknown; template evaluated as instantaneous. Exposure smearing uncertainty is not included.';
+  const low=nullableNumber(metadata.minimum_seconds), high=nullableNumber(metadata.maximum_seconds);
+  const duration=low===high ? `${fmt(low,2)} s` : `${fmt(low,2)}–${fmt(high,2)} s`;
+  return `${duration}; ${known.toLocaleString()} declared samples (${metadata.source || 'source unspecified'})`
+    + (unknown ? `; ${unknown.toLocaleString()} unknown samples use the instantaneous approximation` : '');
+}
+
 function renderMetadata() {
   if (!currentResult || !metadataEl) return;
   const result = currentResult;
@@ -2297,6 +2322,7 @@ function renderMetadata() {
     ['Analysis version', provenance.analysis_version || result.analysis_version || 'Unknown (legacy analysis)'],
     ['Result schema', result.result_schema_version ?? provenance.result_schema_version ?? 'Legacy'],
     ['Time format / scale', `${input.time_format || 'unknown'} / ${input.time_scale || 'unknown'}`],
+    ['Exposure', exposureSummary(result.exposure_metadata)],
     ['Normalization', result.normalization?.method || 'Unknown'],
     ['Local depth', 'Median measured event depth; signed depths and uncertainty are retained per event.'],
     ['Model depth', fmtDepthPercent(result.tls?.depth_fraction)],
@@ -2306,7 +2332,7 @@ function renderMetadata() {
   metadataEl.innerHTML = pairs.map(([key,value]) => `<div class="metric"><span>${escapeHtml(key)}</span><span>${escapeHtml(value)}</span></div>`).join('')
     + '<p class="metadata-note">The approximate model-vs-flat p-value is not a search-wide false-alarm probability. Candidate scores are not probabilities.</p>'
     + objectRows('Cleaning report',cleaning) + objectRows('Effective search settings',settings)
-    + objectRows('Input metadata',input) + objectRows('Search sample context',result.search_context || {}) + objectRows('Dependency versions',provenance.dependency_versions || {});
+    + objectRows('Input metadata',input) + objectRows('Exposure details',result.exposure_metadata || {}) + objectRows('Execution and ETA audit',result.execution || {}) + objectRows('Search sample context',result.search_context || {}) + objectRows('Dependency versions',provenance.dependency_versions || {});
 }
 
 function renderSignalPicker() {
@@ -2488,6 +2514,10 @@ function summaryForExport() {
     input_metadata: currentResult.input_metadata || {time_format:'unknown',time_scale:'unknown'},
     cleaning: currentResult.cleaning || currentResult.cleaning_report || null,
     effective_settings: currentResult.effective_settings || null,
+    exposure_metadata: currentResult.exposure_metadata || null,
+    execution: currentResult.execution || primaryResult?.execution || null,
+    template_resolution: currentResult.tls?.template_resolution || null,
+    actual_period_grid: currentResult.tls?.actual_period_grid || null,
     fit_quality: currentResult.fit_quality || null,
     model_comparison: currentResult.model_comparison || null,
     joint_model_comparison: primaryResult?.joint_model_comparison || null,
@@ -2804,6 +2834,7 @@ function pdfAnalysisDetails(row) {
   const dependencies=Object.entries(provenance.dependency_versions||{}).map(([key,value])=>`${key} ${value}`).join('; ');
   if(dependencies)add('Software: '+dependencies);
   section('INPUT AND CLEANING');
+  if(result.exposure_metadata)packed(pdfSettingPairs(result.exposure_metadata,'Exposure'));
   add(`Time reference: ${fmtReference(result.time_reference)} days. Format: ${result.input_metadata?.time_format||'unknown'}; scale: ${result.input_metadata?.time_scale||'unknown'}; flux unit: ${result.flux_unit||'not specified'}.`);
   packed(pdfSettingPairs(result.input_metadata||{}));
   const cleaning=result.cleaning||result.cleaning_report;

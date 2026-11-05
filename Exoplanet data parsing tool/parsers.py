@@ -24,10 +24,13 @@ FLUX_COLUMN_CANDIDATES = (
 )
 QUALITY_COLUMN_CANDIDATES = ("quality", "sap_quality", "data_quality")
 UNCERTAINTY_COLUMN_CANDIDATES = ("flux_err", "flux_error", "flux_uncertainty", "error", "sigma")
+EXPOSURE_SECONDS_COLUMNS = ("exposure_seconds", "exposure_s", "exptime_seconds", "exptime_s")
+EXPOSURE_DAYS_COLUMNS = ("exposure_days", "exposure_d", "exptime_days")
 
 
 def clean_light_curve_arrays(times, fluxes, uncertainties=None, quality=None,
-                             return_metadata=False, cleaning=None, input_metadata=None):
+                             return_metadata=False, cleaning=None, input_metadata=None,
+                             exposure_seconds=None):
     """Keep the first finite sample at each timestamp, retaining aligned errors.
 
     Exclusion counts are disjoint: invalid numeric rows, nonfinite rows,
@@ -53,6 +56,16 @@ def clean_light_curve_arrays(times, fluxes, uncertainties=None, quality=None,
     else:
         report["quality_excluded_rows"] = 0
     error = None
+    exposure = None
+    if exposure_seconds is not None:
+        exposure = np.asarray(exposure_seconds, dtype=float)
+        if exposure.ndim == 0:
+            exposure = np.full(len(time), float(exposure))
+        if exposure.ndim != 1 or len(exposure) != len(time):
+            raise ValueError("Exposure durations must align with time and flux.")
+        invalid_exposure = ~np.isfinite(exposure) | (exposure < 0)
+        report["invalid_exposure_rows"] = int(np.count_nonzero(invalid_exposure & finite_mask))
+        exposure = np.where(invalid_exposure, np.nan, exposure)[finite_mask]
     if uncertainties is not None:
         error = np.asarray(uncertainties, dtype=float)
         if error.ndim != 1 or len(error) != len(time):
@@ -66,12 +79,16 @@ def clean_light_curve_arrays(times, fluxes, uncertainties=None, quality=None,
     time, flux = time[order], flux[order]
     if error is not None:
         error = error[order]
+    if exposure is not None:
+        exposure = exposure[order]
     unique = np.r_[True, np.diff(time) > 0] if len(time) else np.asarray([], dtype=bool)
     report["duplicate_rows"] = int(len(time) - np.count_nonzero(unique))
     report["duplicate_policy"] = "keep first finite quality-approved row at each exact timestamp"
     time, flux = time[unique], flux[unique]
     if error is not None:
         error = error[unique]
+    if exposure is not None:
+        exposure = exposure[unique]
     if len(time) < 2 or time[-1] <= time[0]:
         raise ValueError("The light curve has zero time span; provide distinct observation times.")
     if len(time) < 20:
@@ -84,9 +101,16 @@ def clean_light_curve_arrays(times, fluxes, uncertainties=None, quality=None,
         raise ValueError("Input cleaning counts do not reconcile.")
     report["median_cadence_days"] = float(np.median(np.diff(time)))
     report["uncertainty_retained_rows"] = int(np.count_nonzero(np.isfinite(error))) if error is not None else 0
+    metadata = dict(input_metadata or {})
+    known_exposure = np.isfinite(exposure) if exposure is not None else np.zeros(len(time), dtype=bool)
+    metadata["exposure"] = {**metadata.get("exposure", {}), "unit": "seconds",
+        "known_rows": int(np.count_nonzero(known_exposure)),
+        "unknown_rows": int(len(time) - np.count_nonzero(known_exposure)),
+        "source": metadata.get("exposure", {}).get("source", "unknown"),
+        "cadence_is_exposure": False}
     if return_metadata:
         return {"time": time, "flux": flux, "flux_uncertainty": error,
-                "cleaning": report, "input_metadata": dict(input_metadata or {})}
+                "exposure_seconds": exposure, "cleaning": report, "input_metadata": metadata}
     return time, flux
 
 
@@ -132,10 +156,13 @@ def parse_csv_bytes(raw, return_metadata=False, time_format=None, time_scale=Non
         raise ValueError('The CSV must contain Time and Flux columns (or supported mission column names).')
     error_column = find_column(reader.fieldnames, (str(flux_column).lower() + "_err",) + UNCERTAINTY_COLUMN_CANDIDATES)
     quality_column = find_column(reader.fieldnames, QUALITY_COLUMN_CANDIDATES)
+    exposure_column = find_column(reader.fieldnames, EXPOSURE_SECONDS_COLUMNS + EXPOSURE_DAYS_COLUMNS)
+    exposure_factor = 86400.0 if str(exposure_column).strip().lower() in EXPOSURE_DAYS_COLUMNS else 1.0
     times = []
     fluxes = []
     errors = [] if error_column else None
     quality = [] if quality_column else None
+    exposures = [] if exposure_column else None
     input_rows = invalid_rows = 0
     for row in reader:
         input_rows += 1
@@ -147,6 +174,11 @@ def parse_csv_bytes(raw, return_metadata=False, time_format=None, time_scale=Non
             continue
         times.append(t)
         fluxes.append(f)
+        if exposures is not None:
+            try:
+                exposures.append(float(row[exposure_column]) * exposure_factor)
+            except (TypeError, ValueError):
+                exposures.append(float("nan"))
         if errors is not None:
             try:
                 errors.append(float(row[error_column]))
@@ -174,8 +206,11 @@ def parse_csv_bytes(raw, return_metadata=False, time_format=None, time_scale=Non
                 "time_reference_offset_days": offset,
                 "time_convention_ambiguous": format_name in {"unknown", "UNKNOWN"} or str(time_scale or "unknown").lower() == "unknown",
                 "time_unit_assumed": not bool(time_unit), "flux_representation": "as supplied; normalized by analysis"}
+    metadata["exposure"] = {"source": "CSV column" if exposure_column else "unknown",
+        "column": exposure_column, "original_unit": "days" if exposure_factor == 86400.0 else "seconds"}
     return clean_light_curve_arrays(converted_time, fluxes, errors, quality, return_metadata,
-                {"input_rows": input_rows, "invalid_numeric_rows": invalid_rows}, metadata)
+                {"input_rows": input_rows, "invalid_numeric_rows": invalid_rows}, metadata,
+                exposure_seconds=exposures)
 
 
 def normalized_column_map(names):
@@ -282,8 +317,36 @@ def parse_fits_bytes(raw, return_metadata=False):
                         "mission": combined.get("MISSION", combined.get("TELESCOP")),
                         "target_identifier": combined.get("OBJECT", combined.get("TICID")),
                         "flux_representation": "as supplied; normalized by analysis"}
+            exposure_column = find_column(names, EXPOSURE_SECONDS_COLUMNS + EXPOSURE_DAYS_COLUMNS + ("exptime", "exposure"))
+            exposures = None
+            exposure_unit = None
+            if exposure_column:
+                normalized_name = str(exposure_column).strip().lower()
+                exposure_unit = (getattr(columns[exposure_column], "unit", None)
+                    or ("s" if normalized_name in EXPOSURE_SECONDS_COLUMNS else
+                        "d" if normalized_name in EXPOSURE_DAYS_COLUMNS else None))
+                if exposure_unit:
+                    exposures = vector_column(data, exposure_column) * time_unit_in_days(exposure_unit) * 86400.0
+            # TIMEDEL may describe timestamp precision, and a header EXPTIME
+            # may be total exposure over a whole table. Neither establishes
+            # the physical integration time of each sample without provenance.
+            candidates = {}
+            for key in ("TIMEDEL", "EXPTIME", "XPOSURE", "EXPOSURE"):
+                try:
+                    value = float(combined[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value >= 0:
+                    candidates[key] = {"value": value,
+                        "unit": "seconds" if key in {"EXPTIME", "EXPOSURE"} else combined.get("TIMEUNIT", "unknown"),
+                        "used_as_sample_exposure": False}
+            metadata["exposure"] = {"source": "FITS per-row column" if exposures is not None else "unknown",
+                "column": exposure_column, "original_unit": exposure_unit,
+                "header_candidates": candidates,
+                "note": "Header duration/resolution values require a verified per-sample meaning; use an explicit exposure override when known."}
             return clean_light_curve_arrays(time, flux, errors, quality, return_metadata,
-                                           {"input_rows": len(time), "invalid_numeric_rows": 0}, metadata)
+                                           {"input_rows": len(time), "invalid_numeric_rows": 0}, metadata,
+                                           exposure_seconds=exposures)
 
     raise ValueError(
         "The FITS file must contain a table with TIME and a flux column "

@@ -121,7 +121,7 @@ class SessionCacheTests(unittest.TestCase):
         index_html = (APP_DIR / "static" / "index.html").read_text()
         app_js = (APP_DIR / "static" / "app.js").read_text()
 
-        self.assertIn('aria-label="Application version 64">v64</span>', index_html)
+        self.assertIn('aria-label="Application version 65">v65</span>', index_html)
         self.assertIn('id="sessionIndicator"', index_html)
         self.assertIn('id="saveLocationHeading">Save File Location</h2>', index_html)
         self.assertIn('id="saveLocationInput"', index_html)

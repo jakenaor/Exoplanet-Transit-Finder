@@ -73,7 +73,7 @@ class HTTPIntegrationTests(unittest.TestCase):
     def test_upload_job_reconnect_and_cache_round_trip(self):
         fields = dict(searchMode='bls', minPeriod='1.8', maxPeriod='2.2',
                       analysisRequestId='http-review-623', batchId='http-batch-623',
-                      csvTimeFormat='jd', csvTimeScale='tdb')
+                      csvTimeFormat='jd', csvTimeScale='tdb', exposureSeconds='0')
         body, mime = multipart(fields)
         status, raw, _ = self.request('/analysis-jobs','POST',body,mime)
         self.assertEqual(status,202,raw)
@@ -97,6 +97,11 @@ class HTTPIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(result['provenance']['analyzed_at'])
         self.assertEqual(result['cleaning']['retained_rows'],1000)
         self.assertEqual(result['input_metadata']['time_scale'],'TDB')
+        self.assertEqual(result['exposure_metadata']['source'],'explicit per-file override')
+        self.assertEqual(result['exposure_metadata']['known_rows'],1000)
+        self.assertEqual(result['exposure_metadata']['minimum_seconds'],0)
+        self.assertEqual(result['execution'],job['execution'])
+        self.assertGreater(result['execution']['elapsed_seconds'],0)
         state=dict(results=[dict(file_name='injected.csv',result=result,error=None)],
                    current_batch_index=0,current_view='phase',active_job_id=None)
         status, raw, _=self.request('/analysis-sessions/http_review_623','POST',json.dumps(state).encode())
@@ -106,6 +111,8 @@ class HTTPIntegrationTests(unittest.TestCase):
         restored=json.loads(raw)['state']['results'][0]['result']
         self.assertEqual(restored['provenance'],result['provenance'])
         self.assertEqual(restored['planet_assessment'],result['planet_assessment'])
+        self.assertEqual(restored['exposure_metadata'],result['exposure_metadata'])
+        self.assertEqual(restored['execution'],result['execution'])
 
     def test_invalid_cache_returns_recoverable_error_without_overwriting(self):
         path=Path(self.directory.name)/'session-bad_cache_623.json'

@@ -26,7 +26,12 @@ _PROGRESS_LOCK = threading.RLock()
 
 
 class SearchProgress:
-    """Adapter for TLS 1.32's actual per-period tqdm updates, without terminal I/O."""
+    """Count real TLS trials; forecast only from stable observed throughput.
+
+    TLS 1.32 shuffles its trial grid and reports unordered worker completions.
+    These counts do not expose the cost of the remaining trials. The displayed
+    range is the spread of observed throughput, not a confidence interval.
+    """
 
     def __init__(self, callback, total=0, **kwargs):
         self.callback = callback
@@ -36,7 +41,9 @@ class SearchProgress:
         self.last_sent = -math.inf
         self.first_completion_time = None
         self.first_completion_count = 0
-        self.samples = deque(maxlen=32)
+        self.windows = deque(maxlen=12)
+        self.window_started = None
+        self.window_completed = 0
         self.emit(force=True)
 
     def emit(self, force=False, finished=False):
@@ -45,23 +52,25 @@ class SearchProgress:
             return
         elapsed = now - self.started
         active_elapsed = now - self.first_completion_time if self.first_completion_time is not None else 0.0
-        remaining = low = high = None
-        # First completion excludes interpreter/JIT/worker startup. Several
-        # subsequent observations are needed before throughput is representative.
+        remaining = low = high = variation = None
+        sample_seconds = sum(duration for _, duration in self.windows)
+        # Exclude JIT/worker startup. Use independent windows rather than heavily
+        # overlapping instantaneous rates, which created unhelpfully wide ranges.
         enough = (self.completed >= max(12, int(self.total * 0.05))
-                  and active_elapsed >= 4.0 and len(self.samples) >= 5)
+                  and len(self.windows) >= 4)
         if enough and self.completed < self.total and not finished:
             overall_rate = (self.completed - self.first_completion_count) / max(active_elapsed, 1e-9)
-            first_time, first_count = list(self.samples)[-6:][0]
-            recent_rate = (self.completed - first_count) / max(now - first_time, 1e-9)
+            recent_rate = sum(count for count, _ in self.windows) / max(sample_seconds, 1e-9)
             if recent_rate > 0 and overall_rate > 0:
                 work_left = self.total - self.completed
-                estimates = [work_left / overall_rate, work_left / recent_rate]
-                rate_ratio = max(overall_rate, recent_rate) / min(overall_rate, recent_rate)
-                if rate_ratio <= 2.5:
-                    remaining = estimates[0] * 0.3 + estimates[1] * 0.7
-                    low = max(1.0, min(estimates) * 0.5)
-                    high = max(estimates) * (3.0 if rate_ratio > 1.8 else 2.0)
+                rates = [count / duration for count, duration in self.windows] + [overall_rate]
+                if min(rates) > 0:
+                    variation = max(rates) / min(rates)
+                    trend = max(overall_rate, recent_rate) / min(overall_rate, recent_rate)
+                    if variation <= 1.75 and trend <= 1.5:
+                        remaining = work_left / recent_rate
+                        low = work_left / max(rates)
+                        high = work_left / min(rates)
         details = {
             "completed_trials": self.completed, "total_trials": self.total,
             "work_completed": self.completed, "work_total": self.total,
@@ -71,19 +80,28 @@ class SearchProgress:
             "eta_scope": "search", "search_elapsed_seconds": elapsed,
             "throughput_elapsed_seconds": active_elapsed,
             "search_complete": bool(finished),
+            "eta_state": "available" if remaining is not None else "estimating",
+            "eta_method": "observed_trial_throughput",
+            "eta_sample_seconds": sample_seconds,
+            "eta_variation": variation,
         }
         self.callback(details)
         self.last_sent = now
-        if self.completed > 0:
-            self.samples.append((now, self.completed))
 
     def update(self, count=1):
         self.completed = min(self.total, self.completed + int(count))
         if self.first_completion_time is None and self.completed > 0:
             self.first_completion_time = monotonic_time.monotonic()
             self.first_completion_count = self.completed
+            self.window_started = self.first_completion_time
+            self.window_completed = self.completed
             self.emit(force=True)
             return
+        now = monotonic_time.monotonic()
+        if self.window_started is not None and now - self.window_started >= 5.0:
+            self.windows.append((self.completed - self.window_completed, now - self.window_started))
+            self.window_started = now
+            self.window_completed = self.completed
         self.emit()
 
     def close(self):
@@ -268,6 +286,42 @@ def duration_from_folded_model(phase_days, model_flux, period=None):
     return duration
 
 
+def model_contact_sample_count(model_flux):
+    values = np.asarray(model_flux, dtype=float).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size < 3:
+        return 0
+    baseline, bottom = float(np.max(values)), float(np.min(values))
+    depth = baseline - bottom
+    return int(np.count_nonzero(values < baseline - depth * .001)) if depth > 0 else 0
+
+
+def compact_folded_transit_model(phase_days, model_flux, max_points=MAX_MODEL_POINTS):
+    """Spend the transport point budget on real template contact detail."""
+    phase, values = np.asarray(phase_days, dtype=float), np.asarray(model_flux, dtype=float)
+    size = min(phase.size, values.size)
+    if size <= max_points:
+        return compact_model(phase, values, max_points=max_points)
+    phase, values = phase[:size], values[:size]
+    valid = np.isfinite(phase) & np.isfinite(values)
+    phase, values = phase[valid], values[valid]
+    if len(phase) < 3:
+        return phase.tolist(), values.tolist()
+    baseline = float(np.max(values))
+    depth = baseline - float(np.min(values))
+    contact = np.flatnonzero(values < baseline - depth * 1e-10)
+    if not contact.size:
+        return compact_model(phase, values, max_points=max_points)
+    left, right = max(0, int(contact[0]) - 1), min(len(phase), int(contact[-1]) + 2)
+    contact_phase, contact_flux = compact_model(phase[left:right], values[left:right], max_points=max_points - 2)
+    phases = np.r_[phase[0], contact_phase, phase[-1]]
+    fluxes = np.r_[values[0], contact_flux, values[-1]]
+    order = np.argsort(phases)
+    phases, fluxes = phases[order], fluxes[order]
+    phases, unique = np.unique(phases, return_index=True)
+    return phases.tolist(), fluxes[unique].tolist()
+
+
 def representative_unfolded_transit(model_time, model_flux, transit_times, period):
     model_time = np.asarray(model_time, dtype=float).reshape(-1)
     model_flux = np.asarray(model_flux, dtype=float).reshape(-1)
@@ -361,7 +415,10 @@ def rescale_folded_model_duration(phase_days, model_flux, target_duration, perio
     in_transit = model_flux < baseline - depth * 0.001
     if np.count_nonzero(in_transit) < 2:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    transit_indices = np.flatnonzero(in_transit)
+    # The material-depth threshold measures a diagnostic width. Rescaling
+    # contacts instead needs the full nonbaseline support so that its nearest
+    # outside anchors really have zero deficit, including fine limb tails.
+    transit_indices = np.flatnonzero(model_flux < baseline - depth * 1e-10)
     left_index = max(0, int(transit_indices[0]) - 1)
     right_index = min(len(phase_days) - 1, int(transit_indices[-1]) + 1)
     source_left = float(phase_days[left_index])
@@ -518,11 +575,81 @@ def tls_engine_version():
     return version.replace("Transit Least Squares ", "").strip()
 
 
-def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase, model_flux):
+def exposure_array_seconds(exposure_seconds, size):
+    """Return aligned durations; NaN means unknown, zero means instantaneous."""
+    if exposure_seconds is None:
+        return np.full(size, np.nan)
+    values = np.asarray(exposure_seconds, dtype=float)
+    if values.ndim == 0:
+        values = np.full(size, float(values))
+    if values.ndim != 1 or len(values) != size:
+        raise ValueError("Exposure durations must align with observations.")
+    if np.any(np.isinf(values)) or np.any(values[np.isfinite(values)] < 0):
+        raise ValueError("Exposure durations must be nonnegative finite seconds or null when unknown.")
+    return values
+
+
+def exposure_integrated_template(phase_days, template_phase, template_flux, period,
+                                 exposure_seconds=None, baseline=1.0):
+    """Evaluate a periodic template at the actual exposure midpoints.
+
+    Unknown durations use an explicitly reported instantaneous approximation.
+    The periodic piecewise-linear model is integrated exactly, including whole
+    orbital cycles. Cadence and plotting-bin widths are never exposures. The
+    caller supplies midpoint timestamps.
+    """
+    phases = np.asarray(phase_days, dtype=float)
+    exposures = exposure_array_seconds(exposure_seconds, len(phases))
+    period = float(period)
+    if not math.isfinite(period) or period <= 0:
+        raise ValueError("Exposure integration requires a positive finite period.")
+    template_phase, template_flux = np.asarray(template_phase, dtype=float), np.asarray(template_flux, dtype=float)
+    wrapped = (phases + period / 2.0) % period - period / 2.0
+    result = np.interp(wrapped, template_phase, template_flux, left=baseline, right=baseline)
+    finite = np.flatnonzero(np.isfinite(exposures) & (exposures > 0))
+    if not finite.size:
+        return result
+    # Integrate deviations to avoid subtracting nearly equal baseline areas.
+    # Outside the supplied template the deviation is zero, matching np.interp.
+    deviation = template_flux - baseline
+    intervals = np.diff(template_phase)
+    if len(template_phase) < 2 or np.any(intervals <= 0):
+        raise ValueError("Exposure integration requires a sorted unique template with at least two points.")
+    slopes = np.diff(deviation) / intervals
+    cumulative = np.r_[0.0, np.cumsum(intervals * (deviation[:-1] + deviation[1:]) / 2.0)]
+
+    def primitive(position):
+        position = np.asarray(position, dtype=float)
+        indices = np.searchsorted(template_phase, position, side="right") - 1
+        clipped = np.clip(indices, 0, len(template_phase) - 2)
+        offset = position - template_phase[clipped]
+        area = cumulative[clipped] + deviation[clipped] * offset + slopes[clipped] * offset ** 2 / 2.0
+        return np.where(position <= template_phase[0], 0.0,
+                        np.where(position >= template_phase[-1], cumulative[-1], area))
+
+    left = -period / 2.0
+    origin_area = float(primitive(left))
+    cycle_area = float(primitive(period / 2.0)) - origin_area
+
+    def periodic_primitive(position):
+        cycles = np.floor((position - left) / period)
+        local = (position - left) % period + left
+        return cycles * cycle_area + primitive(local) - origin_area
+
+    width = exposures[finite] / 86400.0
+    centers = wrapped[finite]
+    result[finite] = baseline + (periodic_primitive(centers + width / 2.0)
+                                - periodic_primitive(centers - width / 2.0)) / width
+    return result
+
+
+def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase, model_flux,
+                                exposure_seconds=None, flux_uncertainty=None):
     """Refit the physical template's width/depth on matched search observations.
 
     Unlike threshold-based widening, this can shorten or lengthen a duration.
-    Exposure integration and binned uncertainties limit cadence/noise bias.
+    Known exposure durations are integrated at actual observation midpoints.
+    Unknown exposure is explicitly instantaneous; cadence is not exposure.
     This is a conditional template fit, not a new period search or a posterior.
     """
     try:
@@ -531,6 +658,10 @@ def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase,
         return None
     time = np.asarray(time, dtype=float)
     flux = np.asarray(flux, dtype=float)
+    exposures = exposure_array_seconds(exposure_seconds, len(time))
+    supplied_errors = np.asarray(flux_uncertainty, dtype=float) if flux_uncertainty is not None else None
+    if supplied_errors is not None and (supplied_errors.ndim != 1 or len(supplied_errors) != len(time)):
+        raise ValueError("Flux uncertainties must align with observations.")
     phase = np.asarray(phase, dtype=float)
     model_flux = np.asarray(model_flux, dtype=float)
     if len(time) < 50 or len(phase) < 5 or seed_duration <= 0:
@@ -553,21 +684,31 @@ def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase,
     edges = np.linspace(-focus, focus, max(31, min(501, int(2 * focus / width))) + 1)
     bins = np.digitize(folded, edges) - 1
     global_sigma = max(1.4826 * np.median(np.abs(flux - np.median(flux))), 1e-8)
-    x, y, errors, widths = [], [], [], []
+    x, y, errors, sample_groups = [], [], [], []
     for index in range(len(edges) - 1):
-        values = flux[bins == index]
+        members = np.flatnonzero(bins == index)
+        values = flux[members]
         if len(values) < 3:
             continue
         center = float(np.median(values))
         sigma = max(1.4826 * np.median(np.abs(values - center)), global_sigma * 0.25)
-        x.append(float(np.median(folded[bins == index])))
+        x.append(float(np.median(folded[members])))
         y.append(center)
-        errors.append(max(1.253 * sigma / math.sqrt(len(values)), 1e-8))
-        widths.append(float(edges[index + 1] - edges[index]))
+        empirical_error = 1.253 * sigma / math.sqrt(len(values))
+        measurement_error = 0.0
+        if supplied_errors is not None:
+            local_errors = supplied_errors[members]
+            if np.all(np.isfinite(local_errors)) and np.all(local_errors > 0):
+                measurement_error = 1.253 * float(np.sqrt(np.sum(local_errors ** 2))) / len(values)
+        errors.append(max(empirical_error, measurement_error, 1e-8))
+        # Bound fit cost while sampling actual phases and exposures across the
+        # observing baseline. No artificial boxcar is assigned to phase bins.
+        if len(members) > 32:
+            members = members[np.linspace(0, len(members) - 1, 32, dtype=int)]
+        sample_groups.append(members)
     if len(x) < 20:
         return None
     x, y, errors = np.asarray(x), np.asarray(y), np.asarray(errors)
-    widths = np.asarray(widths)
     shoulders = np.abs(x) > seed_duration
     core = np.abs(x) < seed_duration * 0.35
     if np.count_nonzero(shoulders) < 6 or np.count_nonzero(core) < 4:
@@ -576,14 +717,18 @@ def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase,
     measured_depth = baseline - float(np.percentile(y[core], 20))
     if measured_depth <= max(float(np.median(errors[core])) * 5.0, 1e-8):
         return None
-    exposure_offsets = np.linspace(-0.5, 0.5, 7)
+    sample_indices = np.concatenate(sample_groups)
+    sample_starts = np.r_[0, np.cumsum([len(group) for group in sample_groups])]
+    sample_phase = folded[sample_indices]
+    sample_exposure = exposures[sample_indices]
 
     def evaluate(parameters):
         scale, shift, depth, level = parameters
-        # Integrate both finite exposures and the finite phase bins.
-        exposure = np.sqrt(cadence ** 2 + widths ** 2)
-        sample_phase = (x[:, None] - shift + exposure[:, None] * exposure_offsets) / scale
-        shape = np.interp(sample_phase.ravel(), phase, unit_depth, left=0, right=0).reshape(sample_phase.shape).mean(axis=1)
+        shape_at_samples = exposure_integrated_template(
+            (sample_phase - shift) / scale, phase, unit_depth, period / scale,
+            sample_exposure / scale, baseline=0.0)
+        shape = np.asarray([np.median(shape_at_samples[left:right])
+                            for left, right in zip(sample_starts[:-1], sample_starts[1:])])
         return level - depth * shape
 
     initial = [1.0, 0.0, measured_depth, baseline]
@@ -605,11 +750,16 @@ def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase,
     fitted_duration = float(seed_duration * scale)
     if duration_error is None or duration_error > fitted_duration * 0.3:
         return None
+    known_count = int(np.count_nonzero(np.isfinite(exposures)))
     return {"duration": fitted_duration, "duration_uncertainty": max(duration_error, cadence / math.sqrt(max(np.count_nonzero(core), 1))),
             "epoch_shift": float(shift), "depth": float(depth), "baseline": float(level),
-            "bin_count": len(x), "reduced_chi_squared": variance,
-            "method": "robust exposure-integrated conditional template fit",
-            "uncertainty_basis": "local Jacobian and cadence floor; conditional on period and template"}
+            "bin_count": len(x), "representative_sample_count": len(sample_indices), "reduced_chi_squared": variance,
+            "method": "robust conditional template fit at observed exposure midpoints",
+            "exposure": {"known_rows": known_count, "unknown_rows": len(time) - known_count,
+                "unit": "seconds", "cadence_is_exposure": False,
+                "integration": "exact periodic piecewise-linear template integral for declared finite durations; instantaneous for zero or unknown",
+                "unknown_policy": "instantaneous approximation; exposure smearing uncertainty is not included"},
+            "uncertainty_basis": "local Jacobian, empirical/input-error bin uncertainties and cadence floor; conditional on period, template, and declared exposure; excludes unknown exposure systematics"}
 
 
 def run_tls_search(time, flux, options, progress_callback=None):
@@ -681,6 +831,17 @@ def run_tls_search(time, flux, options, progress_callback=None):
         )
 
     periods = np.asarray(getattr(results, "periods", []), dtype=float)
+    lower, upper = float(options["period_min"]), float(options["period_max"])
+    tolerance = max(1e-10, max(abs(lower), abs(upper)) * 1e-10)
+    if (period < lower - tolerance or period > upper + tolerance
+            or np.any(~np.isfinite(periods))
+            or np.any(periods < lower - tolerance) or np.any(periods > upper + tolerance)):
+        # Reference TLS 1.32 can fall back to its default grid when a requested
+        # grid is too small, dropping the caller's bounds in the recursive call.
+        raise ValueError("TLS generated periods outside requested bounds; widen the period bounds or increase TLS oversampling and try again.")
+    actual_period_bounds = {"minimum": float(np.min(periods)) if periods.size else period,
+                            "maximum": float(np.max(periods)) if periods.size else period,
+                            "count": int(periods.size)}
     power = np.asarray(getattr(results, "power", []), dtype=float)
     power_raw = np.asarray(getattr(results, "power_raw", []), dtype=float)
     spectrum_size = min(periods.size, power.size)
@@ -710,12 +871,26 @@ def run_tls_search(time, flux, options, progress_callback=None):
         unfolded_model,
         period,
     )
-    if unfolded_model_duration is not None:
+    folded_contact_samples = model_contact_sample_count(folded_model)
+    unfolded_contact_samples = model_contact_sample_count(unfolded_model)
+    # TLS's unfolded single cycle uses N / all predicted epochs samples.
+    # Long observing gaps can leave only a handful of contact points there,
+    # while the independently generated folded physical template is dense.
+    # Retain the representation with real contact detail before any rescaling;
+    # interpolating a coarse cycle cannot reconstruct its missing shape.
+    if folded_engine_duration is not None and (unfolded_model_duration is None
+                                               or folded_contact_samples >= unfolded_contact_samples):
+        payload_phase = folded_phase_days
+        payload_flux = folded_model
+        template_source = "engine folded template"
+    elif unfolded_model_duration is not None:
         payload_phase = unfolded_phase_days
         payload_flux = unfolded_model
+        template_source = "engine unfolded cycle"
     else:
         payload_phase = folded_phase_days
         payload_flux = folded_model
+        template_source = "engine folded fallback"
 
     fill_factor = sampling_fill_factor(relative_time)
     uncompressed_duration = (
@@ -751,6 +926,11 @@ def run_tls_search(time, flux, options, progress_callback=None):
         duration_source = "TLS duration with sampling-gap compression removed"
     elif unfolded_model_duration is not None:
         duration = unfolded_model_duration
+        # The unfolded model remains a duration diagnostic even when its
+        # sparse shape is replaced by the independently dense folded template.
+        if template_source == "engine folded template":
+            payload_phase, payload_flux = rescale_folded_model_duration(
+                payload_phase, payload_flux, duration, period)
         duration_source = "unfolded TLS model"
     else:
         if folded_engine_duration is not None:
@@ -773,7 +953,10 @@ def run_tls_search(time, flux, options, progress_callback=None):
     # expansion. Its smoothed-bin padding systematically broadened contacts.
     observed_fit = (
         fit_observed_model_duration(relative_time, flux, period, transit_time_relative,
-                                    duration, payload_phase, payload_flux)
+                                    duration, payload_phase, payload_flux,
+                                    exposure_seconds=(options.get("exposure_seconds") if options.get("exposure_seconds") is not None
+                                                      else options.get("_exposure_seconds")),
+                                    flux_uncertainty=uncertainty)
         if search_sde is not None and search_sde >= 7.0 else None
     )
     observed_model_duration = None
@@ -788,8 +971,10 @@ def run_tls_search(time, flux, options, progress_callback=None):
         transit_time_relative += observed_fit["epoch_shift"]
         transit_times_relative = [value + observed_fit["epoch_shift"] for value in transit_times_relative]
         observed_model_duration = duration_from_folded_model(payload_phase, payload_flux, period)
-        duration_source = "observed exposure-integrated physical template fit"
-    model_folded_phase, model_folded_flux = compact_model(payload_phase, payload_flux)
+        duration_source = ("observed exposure-integrated physical template fit"
+                           if observed_fit["exposure"]["unknown_rows"] == 0
+                           else "observed physical template fit; unknown exposures approximated as instantaneous")
+    model_folded_phase, model_folded_flux = compact_folded_transit_model(payload_phase, payload_flux)
 
     transit_times = [time_origin + value for value in transit_times_relative]
     transit_flux_levels = finite_list(getattr(results, "transit_depths", []))
@@ -821,6 +1006,12 @@ def run_tls_search(time, flux, options, progress_callback=None):
         ),
         "observed_model_duration": observed_model_duration,
         "duration_source": duration_source,
+        "template_source": template_source,
+        "template_resolution": {"engine_folded_contact_samples": folded_contact_samples,
+                                "engine_unfolded_contact_samples": unfolded_contact_samples,
+                                "retained_contact_samples": model_contact_sample_count(payload_flux),
+                                "transported_contact_samples": model_contact_sample_count(model_folded_flux),
+                                "policy": "retain the independently generated engine template with more real in-transit samples before rescaling"},
         "transit_time": time_origin + transit_time_relative,
         "power": finite_number(getattr(results, "SDE_raw", None)),
         "sde": finite_number(getattr(results, "SDE", None)),
@@ -860,9 +1051,11 @@ def run_tls_search(time, flux, options, progress_callback=None):
             "folded_phase_days": model_folded_phase,
             "folded_flux": model_folded_flux,
             "duration_source": duration_source,
+            "template_source": template_source,
         },
         "engine": tls_engine_version(),
         "parameters": kwargs,
+        "actual_period_grid": actual_period_bounds,
         "effective_stellar_priors": {
             "radius": {"value": kwargs.get("R_star", 1.0), "min": kwargs.get("R_star_min", 0.13), "max": kwargs.get("R_star_max", 3.5), "source": "explicit" if stellar_radius is not None else "TLS default"},
             "mass": {"value": kwargs.get("M_star", 1.0), "min": kwargs.get("M_star_min", 0.1), "max": kwargs.get("M_star_max", 1.0), "source": "explicit" if stellar_mass is not None else "TLS default"},
