@@ -6,11 +6,11 @@ import os
 from pathlib import Path
 import threading
 import time
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import webbrowser
 
 from analysis import analyze, parse_detection_options
-from analysis_jobs import AnalysisJobManager
+from analysis_jobs import AnalysisJobManager, annotate_analysis_result
 from parsers import parse_light_curve_upload
 from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCacheManager, validate_session_id
 
@@ -78,6 +78,11 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/analysis-jobs":
+            request_id = parse_qs(urlparse(self.path).query).get("request_id", [""])[0]
+            job = self.server.analysis_jobs.find_by_request_id(request_id)
+            self.write_json(job if job else {"error": "Analysis submission not found."}, status=200 if job else 404)
+            return
         if path == "/analysis-sessions":
             try:
                 self.write_json({
@@ -197,6 +202,7 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
             else:
                 # Preserve the original synchronous endpoint for API compatibility.
                 payload = analyze(time_values, flux_values, options)
+                payload = annotate_analysis_result(payload, options, source_file)
                 self.write_json(payload, status=200)
         except CLIENT_DISCONNECT_ERRORS:
             self.log_client_disconnect()
@@ -228,8 +234,22 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
         file_item = form["datafile"] if "datafile" in form else (form["csv"] if "csv" in form else None)
         if file_item is None or not getattr(file_item, "file", None):
             raise ValueError("No CSV or FITS file was uploaded.")
-        time_values, flux_values = parse_light_curve_upload(file_item)
+        parsed = parse_light_curve_upload(file_item, return_metadata=True,
+            time_format=form.getfirst("csvTimeFormat") or None,
+            time_scale=form.getfirst("csvTimeScale") or None,
+            time_unit=form.getfirst("csvTimeUnit") or None)
+        time_values, flux_values = parsed["time"], parsed["flux"]
         options = parse_detection_options(form)
+        options["_input_metadata"] = parsed["input_metadata"]
+        options["_cleaning_report"] = parsed["cleaning"]
+        if parsed["flux_uncertainty"] is not None:
+            options["_flux_uncertainty"] = [float(v) if v == v else None for v in parsed["flux_uncertainty"]]
+        for field, key in (("batchId", "_batch_id"), ("analysisRequestId", "_request_id")):
+            value = str(form.getfirst(field) or "").strip()
+            if value:
+                if len(value) > 160 or not all(c.isalnum() or c in "_:-." for c in value):
+                    raise ValueError(f"Invalid {field}.")
+                options[key] = value
         source_file = getattr(file_item, "filename", None)
         return time_values, flux_values, options, source_file
 
@@ -301,7 +321,7 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
             return False
 
     def write_json(self, payload, status=200):
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")

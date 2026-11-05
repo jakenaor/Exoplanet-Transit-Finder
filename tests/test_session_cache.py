@@ -20,7 +20,11 @@ class SessionCacheTests(unittest.TestCase):
             state = {
                 "current_batch_index": 0,
                 "current_view": "stack",
-                "results": [{"file_name": "wasp43.csv", "result": {"transits": [1, 2]}}],
+                "results": [{"file_name": "wasp43.csv", "result": {
+                    "period": 0.81347,
+                    "transits": [{"start": 1.0, "center": 1.05, "end": 1.1}],
+                    "plot": {"time": [0, 1, 2], "raw_flux": [1, .99, 1], "smooth_flux": [1, .99, 1]},
+                }}],
             }
 
             saved = cache.save("session_12345678", state)
@@ -29,7 +33,14 @@ class SessionCacheTests(unittest.TestCase):
             cache_path = Path(saved["cache_file"])
             self.assertEqual(cache_path.parent, Path(directory).resolve())
             self.assertEqual(cache_path.name, "session-session_12345678.json")
-            self.assertEqual(loaded["state"], state)
+            restored = loaded["state"]
+            self.assertEqual(restored["current_view"], state["current_view"])
+            result = restored["results"][0]["result"]
+            self.assertEqual(result["plot"], state["results"][0]["result"]["plot"])
+            self.assertEqual(result["transits"], state["results"][0]["result"]["transits"])
+            self.assertIsNone(result["provenance"]["analyzed_at"])
+            self.assertEqual(result["provenance"]["analysis_version"], "unknown")
+            self.assertNotIn("provenance", state["results"][0]["result"])
             self.assertEqual(loaded["schema_version"], 1)
             json.dumps(loaded)
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
@@ -110,7 +121,7 @@ class SessionCacheTests(unittest.TestCase):
         index_html = (APP_DIR / "static" / "index.html").read_text()
         app_js = (APP_DIR / "static" / "app.js").read_text()
 
-        self.assertIn('aria-label="Application version 62">v62</span>', index_html)
+        self.assertIn('aria-label="Application version 64">v64</span>', index_html)
         self.assertIn('id="sessionIndicator"', index_html)
         self.assertIn('id="saveLocationHeading">Save File Location</h2>', index_html)
         self.assertIn('id="saveLocationInput"', index_html)

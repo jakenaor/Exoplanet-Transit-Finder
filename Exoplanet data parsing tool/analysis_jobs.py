@@ -1,27 +1,115 @@
 """Background process management for long-running light-curve analyses."""
 
 import inspect
+from datetime import datetime, timezone
+from importlib import metadata as package_metadata
+import json
+import hashlib
+import math
 import multiprocessing
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
+
+import numpy as np
 
 from analysis import analyze
 
 
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
+RESULT_SCHEMA_VERSION = 2
+ANALYSIS_VERSION = "2026.11.05.1"
+APP_VERSION = "64"
+PROGRESS_FIELDS = ("completed_trials", "total_trials", "estimated_remaining_seconds",
+                   "eta_lower_seconds", "eta_upper_seconds", "eta_scope", "work_completed",
+                   "work_total", "remaining_seconds_range", "eta_state", "search_elapsed_seconds",
+                   "throughput_elapsed_seconds", "search_complete")
 
 
-def _analysis_worker(send_connection, time_values, flux_values, options, runner):
+def annotate_analysis_result(result, options=None, source_file=None):
+    """Stamp analysis provenance once; cache saves must never refresh this date."""
+    if not isinstance(result, dict):
+        raise ValueError("The analysis worker did not return a result object.")
+    options = options or {}
+    previous_provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+    source_file = (source_file or (options.get("_input_metadata") or {}).get("source_file")
+                   or result.get("source_file") or previous_provenance.get("source_file"))
+    dependencies = {}
+    for name in ("numpy", "scipy", "astropy", "transitleastsquares", "batman-package", "numba"):
+        try:
+            dependencies[name] = package_metadata.version(name)
+        except package_metadata.PackageNotFoundError:
+            dependencies[name] = "unavailable"
+    analyzed_at = datetime.now(timezone.utc).isoformat()
+    effective = result.get("effective_settings") or {k: v for k, v in options.items() if not k.startswith("_")}
+    result["result_schema_version"] = RESULT_SCHEMA_VERSION
+    result["analyzed_at"] = analyzed_at
+    result["provenance"] = {"app_version": APP_VERSION, "analysis_version": ANALYSIS_VERSION,
+        "result_schema_version": RESULT_SCHEMA_VERSION, "analyzed_at": analyzed_at,
+        "dependency_versions": dependencies, "python_version": sys.version.split()[0], "effective_settings": effective,
+        "source_file": source_file, "legacy": False}
+    if options.get("_input_metadata") is not None:
+        result.setdefault("input_metadata", options["_input_metadata"])
+    if options.get("_cleaning_report") is not None:
+        result.setdefault("cleaning", options["_cleaning_report"])
+    for signal_result in result.get("signals", []):
+        if isinstance(signal_result, dict):
+            signal_analyzed_at = signal_result.get("analyzed_at") or analyzed_at
+            signal_result["result_schema_version"] = RESULT_SCHEMA_VERSION
+            signal_result["analyzed_at"] = signal_analyzed_at
+            signal_result["provenance"] = {**result["provenance"],
+                "analyzed_at": signal_analyzed_at,
+                "effective_settings": signal_result.get("effective_settings") or effective}
+            if result.get("input_metadata") is not None:
+                signal_result.setdefault("input_metadata", result["input_metadata"])
+            if signal_result.get("cleaning_report") is not None:
+                signal_result.setdefault("cleaning", signal_result["cleaning_report"])
+            elif result.get("cleaning") is not None:
+                signal_result.setdefault("cleaning", result["cleaning"])
+    # Fail the job explicitly rather than send NaN/Infinity that browser JSON
+    # parsers reject, or discover an unsupported scalar only while polling.
+    try:
+        json.dumps(result, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Analysis returned nonfinite or unsupported result values; no invalid JSON result was saved.") from exc
+    return result
+
+
+def cleaned_progress_details(details):
+    """Only carry finite, bounded progress values across the worker boundary."""
+    output = {}
+    for key in PROGRESS_FIELDS:
+        value = details.get(key)
+        if key == "search_complete":
+            if isinstance(value, bool):
+                output[key] = value
+        elif key in {"eta_scope", "eta_state"}:
+            if isinstance(value, str):
+                output[key] = value[:40]
+        elif key == "remaining_seconds_range":
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                numbers = [float(v) for v in value if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0]
+                if len(numbers) == 2:
+                    output[key] = sorted(numbers)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            output[key] = value
+        elif value is None:
+            output[key] = None
+    return output
+
+
+def _analysis_worker(send_connection, time_values, flux_values, options, runner, source_file=None):
     """Run one analysis in an isolated process and return one terminal message."""
-    def publish_progress(stage, stage_label):
+    def publish_progress(stage, stage_label, details=None, **extra):
         try:
             send_connection.send({
                 "status": "progress",
                 "stage": str(stage),
                 "stage_label": str(stage_label),
+                **cleaned_progress_details({**(details or {}), **extra}),
             })
         except (BrokenPipeError, EOFError, OSError):
             pass
@@ -50,7 +138,7 @@ def _analysis_worker(send_connection, time_values, flux_values, options, runner)
             )
         else:
             result = runner(time_values, flux_values, options)
-        message = {"status": "completed", "result": result}
+        message = {"status": "completed", "result": annotate_analysis_result(result, options, source_file)}
     except BaseException as exc:  # The parent must hear about worker-level failures.
         message = {"status": "failed", "error": str(exc) or exc.__class__.__name__}
 
@@ -99,11 +187,27 @@ class AnalysisJobManager:
             "error": None,
             "stage": "queued",
             "stage_label": "Waiting for analysis worker",
+            "batch_id": options.get("_batch_id"),
+            "request_id": options.get("_request_id"),
+            "progress": {},
         }
         with self.lock:
             if self.closed:
                 raise RuntimeError("Analysis job manager is shutting down.")
             self._cleanup_locked(now)
+            if record["request_id"]:
+                digest = hashlib.sha256(json.dumps({
+                    "source_file": source_file, "settings": options,
+                }, sort_keys=True, default=str).encode())
+                digest.update(np.asarray(time_values, dtype=float).tobytes())
+                digest.update(np.asarray(flux_values, dtype=float).tobytes())
+                fingerprint = digest.hexdigest()
+                record["request_fingerprint"] = fingerprint
+                for existing in self.jobs.values():
+                    if existing.get("request_id") == record["request_id"]:
+                        if existing.get("request_fingerprint") != fingerprint:
+                            raise ValueError("This submission ID was already used for different analysis inputs.")
+                        return self._public_record_locked(existing, include_result=True)
             self.jobs[job_id] = record
             self._schedule_locked()
             return self._public_record_locked(record, include_result=False)
@@ -115,6 +219,17 @@ class AnalysisJobManager:
             if record is None:
                 return None
             return self._public_record_locked(record, include_result=include_result)
+
+    def find_by_request_id(self, request_id, include_result=True):
+        """Reconnect after an accepted submission whose response was lost."""
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 160:
+            return None
+        with self.lock:
+            self._cleanup_locked(time.time())
+            for record in self.jobs.values():
+                if record.get("request_id") == request_id:
+                    return self._public_record_locked(record, include_result=include_result)
+        return None
 
     def cancel(self, job_id):
         process = None
@@ -203,6 +318,7 @@ class AnalysisJobManager:
                 record["flux_values"],
                 record["options"],
                 self.runner,
+                record.get("source_file"),
             ),
             name=f"transit-analysis-{record['job_id'][:8]}",
         )
@@ -251,6 +367,8 @@ class AnalysisJobManager:
                         incoming.get("stage_label")
                         or record.get("stage_label")
                     )
+                    record["progress"] = cleaned_progress_details(incoming)
+                    record["progress_updated_at"] = time.time()
         except (EOFError, OSError):
             pass
         finally:
@@ -303,11 +421,25 @@ class AnalysisJobManager:
             "submitted_at": record["submitted_at"],
             "started_at": record.get("started_at"),
             "finished_at": record.get("finished_at"),
-            "elapsed_seconds": max(0.0, end - start),
+            "elapsed_seconds": max(0.0, end - start) if record.get("started_at") else 0.0,
             "queue_position": queued_before + 1 if record["status"] == "queued" else None,
             "stage": record.get("stage"),
             "stage_label": record.get("stage_label"),
+            "batch_id": record.get("batch_id"),
+            "request_id": record.get("request_id"),
+            "queue_wait_seconds": max(0.0, (record.get("started_at") or end) - record["submitted_at"]),
+            "progress_updated_at": record.get("progress_updated_at"),
         }
+        if record["status"] == "running":
+            payload.update(record.get("progress") or {})
+            if not payload.get("eta_state"):
+                payload["eta_state"] = "available" if payload.get("estimated_remaining_seconds") is not None else "estimating"
+            # An estimate based on old throughput is withdrawn after progress stalls.
+            if record.get("progress_updated_at") and now - record["progress_updated_at"] > 45:
+                payload.update({key: None for key in ("estimated_remaining_seconds", "eta_lower_seconds", "eta_upper_seconds", "remaining_seconds_range")})
+                payload["eta_state"] = "estimating"
+        else:
+            payload.update({key: None for key in PROGRESS_FIELDS})
         if record["status"] == "failed":
             payload["error"] = record.get("error") or "Analysis failed."
         if include_result and record["status"] == "completed":

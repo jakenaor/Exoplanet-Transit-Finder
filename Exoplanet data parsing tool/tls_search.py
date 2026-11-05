@@ -1,6 +1,11 @@
 """Thin, JSON-friendly integration around the reference TLS implementation."""
 
 import math
+import importlib
+import threading
+import time as monotonic_time
+from collections import deque
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -17,10 +22,104 @@ else:
 
 MAX_MODEL_POINTS = 12000
 MAX_SPECTRUM_POINTS = 1600
+_PROGRESS_LOCK = threading.RLock()
+
+
+class SearchProgress:
+    """Adapter for TLS 1.32's actual per-period tqdm updates, without terminal I/O."""
+
+    def __init__(self, callback, total=0, **kwargs):
+        self.callback = callback
+        self.total = int(total)
+        self.completed = 0
+        self.started = monotonic_time.monotonic()
+        self.last_sent = -math.inf
+        self.first_completion_time = None
+        self.first_completion_count = 0
+        self.samples = deque(maxlen=32)
+        self.emit(force=True)
+
+    def emit(self, force=False, finished=False):
+        now = monotonic_time.monotonic()
+        if not force and now - self.last_sent < 0.75:
+            return
+        elapsed = now - self.started
+        active_elapsed = now - self.first_completion_time if self.first_completion_time is not None else 0.0
+        remaining = low = high = None
+        # First completion excludes interpreter/JIT/worker startup. Several
+        # subsequent observations are needed before throughput is representative.
+        enough = (self.completed >= max(12, int(self.total * 0.05))
+                  and active_elapsed >= 4.0 and len(self.samples) >= 5)
+        if enough and self.completed < self.total and not finished:
+            overall_rate = (self.completed - self.first_completion_count) / max(active_elapsed, 1e-9)
+            first_time, first_count = list(self.samples)[-6:][0]
+            recent_rate = (self.completed - first_count) / max(now - first_time, 1e-9)
+            if recent_rate > 0 and overall_rate > 0:
+                work_left = self.total - self.completed
+                estimates = [work_left / overall_rate, work_left / recent_rate]
+                rate_ratio = max(overall_rate, recent_rate) / min(overall_rate, recent_rate)
+                if rate_ratio <= 2.5:
+                    remaining = estimates[0] * 0.3 + estimates[1] * 0.7
+                    low = max(1.0, min(estimates) * 0.5)
+                    high = max(estimates) * (3.0 if rate_ratio > 1.8 else 2.0)
+        details = {
+            "completed_trials": self.completed, "total_trials": self.total,
+            "work_completed": self.completed, "work_total": self.total,
+            "estimated_remaining_seconds": remaining,
+            "eta_lower_seconds": low, "eta_upper_seconds": high,
+            "remaining_seconds_range": [low, high] if low is not None else None,
+            "eta_scope": "search", "search_elapsed_seconds": elapsed,
+            "throughput_elapsed_seconds": active_elapsed,
+            "search_complete": bool(finished),
+        }
+        self.callback(details)
+        self.last_sent = now
+        if self.completed > 0:
+            self.samples.append((now, self.completed))
+
+    def update(self, count=1):
+        self.completed = min(self.total, self.completed + int(count))
+        if self.first_completion_time is None and self.completed > 0:
+            self.first_completion_time = monotonic_time.monotonic()
+            self.first_completion_count = self.completed
+            self.emit(force=True)
+            return
+        self.emit()
+
+    def close(self):
+        self.emit(force=True, finished=True)
+
+
+@contextmanager
+def measured_tls_progress(callback):
+    # power() calls a module-local tqdm after constructing its real trial grid.
+    # Jobs run in isolated processes; serialize direct threaded callers too.
+    with _PROGRESS_LOCK:
+        if not callable(callback):
+            yield False
+            return
+        module = importlib.import_module("transitleastsquares.main")
+        stats = importlib.import_module("transitleastsquares.stats")
+        original = module.tqdm
+        original_stats = stats.tqdm
+        module.tqdm = lambda *args, **kwargs: SearchProgress(callback, *args, **kwargs)
+        class QuietFinalization:
+            def __init__(self, *args, **kwargs):
+                pass
+            def update(self, *args, **kwargs):
+                pass
+            def close(self):
+                pass
+        stats.tqdm = QuietFinalization
+        try:
+            yield True
+        finally:
+            module.tqdm = original
+            stats.tqdm = original_stats
 
 
 def finite_number(value):
-    if value is None:
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
     try:
         number = float(value)
@@ -419,7 +518,101 @@ def tls_engine_version():
     return version.replace("Transit Least Squares ", "").strip()
 
 
-def run_tls_search(time, flux, options):
+def fit_observed_model_duration(time, flux, period, epoch, seed_duration, phase, model_flux):
+    """Refit the physical template's width/depth on matched search observations.
+
+    Unlike threshold-based widening, this can shorten or lengthen a duration.
+    Exposure integration and binned uncertainties limit cadence/noise bias.
+    This is a conditional template fit, not a new period search or a posterior.
+    """
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None
+    time = np.asarray(time, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    phase = np.asarray(phase, dtype=float)
+    model_flux = np.asarray(model_flux, dtype=float)
+    if len(time) < 50 or len(phase) < 5 or seed_duration <= 0:
+        return None
+    order = np.argsort(phase)
+    phase, model_flux = phase[order], model_flux[order]
+    phase, unique = np.unique(phase, return_index=True)
+    model_flux = model_flux[unique]
+    template_depth = float(np.max(model_flux) - np.min(model_flux))
+    if template_depth <= 1e-9:
+        return None
+    unit_depth = (np.max(model_flux) - model_flux) / template_depth
+    cadence_steps = np.diff(np.unique(time))
+    cadence_steps = cadence_steps[cadence_steps > 0]
+    cadence = float(np.median(cadence_steps)) if cadence_steps.size else seed_duration / 20
+    focus = min(period * 0.35, seed_duration * 2.5)
+    folded = ((time - epoch + period / 2) % period) - period / 2
+    # A median bin estimates location robustly; its standard error includes n.
+    width = max(seed_duration / 45.0, cadence / 3.0)
+    edges = np.linspace(-focus, focus, max(31, min(501, int(2 * focus / width))) + 1)
+    bins = np.digitize(folded, edges) - 1
+    global_sigma = max(1.4826 * np.median(np.abs(flux - np.median(flux))), 1e-8)
+    x, y, errors, widths = [], [], [], []
+    for index in range(len(edges) - 1):
+        values = flux[bins == index]
+        if len(values) < 3:
+            continue
+        center = float(np.median(values))
+        sigma = max(1.4826 * np.median(np.abs(values - center)), global_sigma * 0.25)
+        x.append(float(np.median(folded[bins == index])))
+        y.append(center)
+        errors.append(max(1.253 * sigma / math.sqrt(len(values)), 1e-8))
+        widths.append(float(edges[index + 1] - edges[index]))
+    if len(x) < 20:
+        return None
+    x, y, errors = np.asarray(x), np.asarray(y), np.asarray(errors)
+    widths = np.asarray(widths)
+    shoulders = np.abs(x) > seed_duration
+    core = np.abs(x) < seed_duration * 0.35
+    if np.count_nonzero(shoulders) < 6 or np.count_nonzero(core) < 4:
+        return None
+    baseline = float(np.median(y[shoulders]))
+    measured_depth = baseline - float(np.percentile(y[core], 20))
+    if measured_depth <= max(float(np.median(errors[core])) * 5.0, 1e-8):
+        return None
+    exposure_offsets = np.linspace(-0.5, 0.5, 7)
+
+    def evaluate(parameters):
+        scale, shift, depth, level = parameters
+        # Integrate both finite exposures and the finite phase bins.
+        exposure = np.sqrt(cadence ** 2 + widths ** 2)
+        sample_phase = (x[:, None] - shift + exposure[:, None] * exposure_offsets) / scale
+        shape = np.interp(sample_phase.ravel(), phase, unit_depth, left=0, right=0).reshape(sample_phase.shape).mean(axis=1)
+        return level - depth * shape
+
+    initial = [1.0, 0.0, measured_depth, baseline]
+    fit = least_squares(lambda pars: (evaluate(pars) - y) / errors, initial,
+                        bounds=([0.55, -seed_duration * 0.2, 0, baseline - measured_depth],
+                                [1.8, seed_duration * 0.2, measured_depth * 3, baseline + measured_depth]),
+                        loss="soft_l1", max_nfev=120)
+    if not fit.success or not np.all(np.isfinite(fit.x)):
+        return None
+    scale, shift, depth, level = fit.x
+    if scale <= 0.56 or scale >= 1.79 or depth <= 0:
+        return None
+    variance = float(np.sum(fit.fun ** 2) / max(len(x) - 4, 1))
+    try:
+        covariance = np.linalg.pinv(fit.jac.T @ fit.jac) * max(1.0, variance)
+        duration_error = float(math.sqrt(max(0.0, covariance[0, 0])) * seed_duration)
+    except np.linalg.LinAlgError:
+        duration_error = None
+    fitted_duration = float(seed_duration * scale)
+    if duration_error is None or duration_error > fitted_duration * 0.3:
+        return None
+    return {"duration": fitted_duration, "duration_uncertainty": max(duration_error, cadence / math.sqrt(max(np.count_nonzero(core), 1))),
+            "epoch_shift": float(shift), "depth": float(depth), "baseline": float(level),
+            "bin_count": len(x), "reduced_chi_squared": variance,
+            "method": "robust exposure-integrated conditional template fit",
+            "uncertainty_basis": "local Jacobian and cadence floor; conditional on period and template"}
+
+
+def run_tls_search(time, flux, options, progress_callback=None):
     if transitleastsquares is None:
         detail = f" ({TLS_IMPORT_ERROR})" if TLS_IMPORT_ERROR else ""
         raise ValueError(
@@ -434,7 +627,12 @@ def run_tls_search(time, flux, options):
 
     time_origin = float(time[0])
     relative_time = time - time_origin
-    model = transitleastsquares(relative_time, flux, verbose=False)
+    supplied_uncertainty = options.get("_normalized_flux_uncertainty")
+    uncertainty = np.asarray(supplied_uncertainty, dtype=float) if supplied_uncertainty is not None else None
+    if uncertainty is not None and uncertainty.size == time.size and np.all(np.isfinite(uncertainty)) and np.all(uncertainty > 0):
+        model = transitleastsquares(relative_time, flux, dy=uncertainty, verbose=False)
+    else:
+        model = transitleastsquares(relative_time, flux, verbose=False)
 
     kwargs = {
         "period_min": float(options["period_min"]),
@@ -470,7 +668,9 @@ def run_tls_search(time, flux, options):
         kwargs["u"] = [limb_u1, limb_u2]
         kwargs["limb_dark"] = "quadratic"
 
-    results = model.power(**kwargs)
+    with measured_tls_progress(progress_callback) as reports_trials:
+        kwargs["show_progress_bar"] = reports_trials
+        results = model.power(**kwargs)
     period = finite_number(getattr(results, "period", None))
     duration = finite_number(getattr(results, "duration", None))
     transit_time_relative = finite_number(getattr(results, "T0", None))
@@ -569,28 +769,26 @@ def run_tls_search(time, flux, options):
         if search_sde is not None and search_sde >= 5.0
         else None
     )
-    if observed_refinement is not None:
-        observed_phase, observed_flux = rescale_folded_model_duration(
-            payload_phase,
-            payload_flux,
-            observed_refinement["duration"],
-            period,
-        )
-        observed_model_duration = duration_from_folded_model(
-            observed_phase,
-            observed_flux,
-            period,
-        )
-        if (
-            observed_model_duration is not None
-            and observed_refinement["duration"] > duration
-        ):
-            duration = observed_refinement["duration"]
-            payload_phase = observed_phase
-            payload_flux = observed_flux
-            duration_source = "TLS model widened to observed phase-folded ingress/egress"
-    else:
-        observed_model_duration = None
+    # Retain the threshold width as a diagnostic, not an automatic one-way
+    # expansion. Its smoothed-bin padding systematically broadened contacts.
+    observed_fit = (
+        fit_observed_model_duration(relative_time, flux, period, transit_time_relative,
+                                    duration, payload_phase, payload_flux)
+        if search_sde is not None and search_sde >= 7.0 else None
+    )
+    observed_model_duration = None
+    if observed_fit is not None:
+        fitted_phase, fitted_flux = rescale_folded_model_duration(
+            payload_phase, payload_flux, observed_fit["duration"], period)
+        old_depth = float(np.max(fitted_flux) - np.min(fitted_flux))
+        if old_depth > 0:
+            fitted_flux = observed_fit["baseline"] - (np.max(fitted_flux) - fitted_flux) * observed_fit["depth"] / old_depth
+        duration = observed_fit["duration"]
+        payload_phase, payload_flux = fitted_phase, fitted_flux
+        transit_time_relative += observed_fit["epoch_shift"]
+        transit_times_relative = [value + observed_fit["epoch_shift"] for value in transit_times_relative]
+        observed_model_duration = duration_from_folded_model(payload_phase, payload_flux, period)
+        duration_source = "observed exposure-integrated physical template fit"
     model_folded_phase, model_folded_flux = compact_model(payload_phase, payload_flux)
 
     transit_times = [time_origin + value for value in transit_times_relative]
@@ -614,6 +812,13 @@ def run_tls_search(time, flux, options):
         "sampling_fill_factor": fill_factor,
         "uncompressed_duration": uncompressed_duration,
         "observed_duration_refinement": observed_refinement,
+        "duration_fit": observed_fit,
+        "duration_uncertainty": observed_fit.get("duration_uncertainty") if observed_fit else None,
+        "duration_quality": "conditional_fit" if observed_fit else "template_estimate",
+        "duration_disagreement_fraction": (
+            abs(observed_refinement["duration"] - duration) / duration
+            if observed_refinement is not None else None
+        ),
         "observed_model_duration": observed_model_duration,
         "duration_source": duration_source,
         "transit_time": time_origin + transit_time_relative,
@@ -635,7 +840,7 @@ def run_tls_search(time, flux, options):
         "transit_depth_uncertainties": finite_list(getattr(results, "transit_depths_uncertainties", [])),
         "snr_per_transit": finite_list(getattr(results, "snr_per_transit", [])),
         "snr_pink_per_transit": finite_list(getattr(results, "snr_pink_per_transit", [])),
-        "depth_fraction": None if bottom_flux is None else max(0.0, 1.0 - bottom_flux),
+        "depth_fraction": observed_fit["depth"] if observed_fit else (None if bottom_flux is None else max(0.0, 1.0 - bottom_flux)),
         "depth_mean_fraction": None if depth_mean_flux is None else max(0.0, 1.0 - depth_mean_flux),
         "depth_mean_uncertainty": depth_mean_uncertainty,
         "candidates": distinct_period_candidates(periods, power, power_raw),
@@ -658,4 +863,11 @@ def run_tls_search(time, flux, options):
         },
         "engine": tls_engine_version(),
         "parameters": kwargs,
+        "effective_stellar_priors": {
+            "radius": {"value": kwargs.get("R_star", 1.0), "min": kwargs.get("R_star_min", 0.13), "max": kwargs.get("R_star_max", 3.5), "source": "explicit" if stellar_radius is not None else "TLS default"},
+            "mass": {"value": kwargs.get("M_star", 1.0), "min": kwargs.get("M_star_min", 0.1), "max": kwargs.get("M_star_max", 1.0), "source": "explicit" if stellar_mass is not None else "TLS default"},
+            "limb_darkening": {"coefficients": [0.0] if kwargs["transit_template"] == "box" else kwargs.get("u", [0.4804, 0.1867]),
+                               "law": "linear" if kwargs["transit_template"] == "box" else "quadratic",
+                               "source": "box template override" if kwargs["transit_template"] == "box" else ("explicit" if limb_u1 is not None else "TLS default")},
+        },
     }

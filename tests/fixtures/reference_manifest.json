@@ -1,0 +1,114 @@
+{
+  "description": "User-supplied reference cases from the completed 2026-11-05 batch. Filenames imply target identity; original mission/download provenance and time convention remain unverified. These are literature benchmarks, not injection truth. Large source files remain outside Git.",
+  "checked_date": "2026-11-05",
+  "cases": [
+    {
+      "file_name": "hd209458_time_flux.csv",
+      "sha256": "5352dd402319d69f853fe491de823d871f97a5864dbe27431d35f53af4bffec0",
+      "finite_samples": 6878,
+      "expected_interpretation": "recover expected periodic signal",
+      "reference": {
+        "name": "HD 209458 b",
+        "period_days": 3.52474859,
+        "duration_hours": 3.0816,
+        "depth_percent": 1.4822,
+        "period_sigma_days": 3.8e-07,
+        "duration_sigma_hours": 0.02304,
+        "depth_sigma_percent": 0.0028,
+        "source": "Brandeker et al. 2022, Table A.1, adopted/calculated literature parameters; period uncertainty from NASA/Stassun 2017",
+        "url": "https://elib.dlr.de/185756/1/aa43082-22.pdf"
+      }
+    },
+    {
+      "file_name": "no_exoplanet_just_pure_noiselightcurve.csv",
+      "sha256": "a2021eb3a52c96596511552933c3a9997cdf462a83996927f1a884b7feef2eee",
+      "finite_samples": 5600,
+      "expected_interpretation": "noise-labelled control; reject",
+      "reference": null
+    },
+    {
+      "file_name": "trappist1_time_flux.csv",
+      "sha256": "a75cdaf8bb82cb265f1dbd4c11573bf413b3913f27133060b4c74c3cff7c1ab4",
+      "finite_samples": 80108,
+      "expected_interpretation": "reject this optimizer fit",
+      "reference": {
+        "name": "TRAPPIST-1 (nearest period: e)",
+        "period_days": 6.101013,
+        "duration_hours": 0.9293,
+        "depth_percent": 0.5012,
+        "period_sigma_days": 3.5e-05,
+        "duration_sigma_hours": 0.0043,
+        "depth_sigma_percent": 0.0078,
+        "source": "NASA Archive, Agol et al. 2021 solution for e; diagnostic comparison only, not identification",
+        "url": "https://exoplanetarchive.ipac.caltech.edu/overview/TRAPPIST-1%20e"
+      }
+    },
+    {
+      "file_name": "wasp4_time_flux.csv",
+      "sha256": "ee679a5ef3d0a72e541d3898de3170ca2903c7d0ed5abcb62db65716e67f9df6",
+      "finite_samples": 47763,
+      "expected_interpretation": "recover expected periodic signal",
+      "reference": {
+        "name": "WASP-4 b",
+        "period_days": 1.338230994,
+        "duration_hours": 2.16648,
+        "depth_percent": 2.312,
+        "period_sigma_days": 8.4e-08,
+        "duration_sigma_hours": 0.00576,
+        "source": "NASA Archive, Basturk et al. 2025 solution",
+        "url": "https://exoplanetarchive.ipac.caltech.edu/overview/TIC402026209"
+      }
+    },
+    {
+      "file_name": "wasp18_time_flux.csv",
+      "sha256": "b8e3f104a3cdc2ea0fad30a91a8ecb3365142c577b3f2f8693f8dce523e40371",
+      "finite_samples": 31761,
+      "expected_interpretation": "recover expected periodic signal",
+      "reference": {
+        "name": "WASP-18 b",
+        "period_days": 0.94145223,
+        "duration_hours": 2.21,
+        "depth_percent": 1.041,
+        "period_sigma_days": 2.4e-07,
+        "duration_sigma_hours": 0.03,
+        "depth_sigma_percent": 0.022,
+        "source": "NASA Archive, Cortes-Zuleta et al. 2020 solution",
+        "url": "https://exoplanetarchive.ipac.caltech.edu/overview/WASP-18"
+      }
+    },
+    {
+      "file_name": "wasp19_time_flux.csv",
+      "sha256": "762794a1ef9d77051e0cab3f2e209e6d0cc701a8aa8f68d075266018a08e52f1",
+      "finite_samples": 30816,
+      "expected_interpretation": "recover expected periodic signal",
+      "reference": {
+        "name": "WASP-19 b",
+        "period_days": 0.78883951,
+        "duration_hours": 1.5717600000000003,
+        "depth_percent": 2.05,
+        "period_sigma_days": 3.2e-07,
+        "duration_sigma_hours": 0.0084,
+        "depth_sigma_percent": 0.024,
+        "source": "Anderson et al. 2013, Table 3; depth is planet-to-star area ratio",
+        "url": "https://academic.oup.com/mnras/article/430/4/3422/1121292"
+      }
+    },
+    {
+      "file_name": "wasp43_time_flux.csv",
+      "sha256": "1db5e854acfd49113324cf49e26e667dfa1cbc66372d20223b97fc0c852ddbdb",
+      "finite_samples": 28558,
+      "expected_interpretation": "recover expected periodic signal",
+      "reference": {
+        "name": "WASP-43 b",
+        "period_days": 0.81347407,
+        "duration_hours": 1.1592,
+        "depth_percent": 2.55,
+        "period_sigma_days": 2e-08,
+        "duration_sigma_hours": 0.0264,
+        "depth_sigma_percent": 0.12,
+        "source": "NASA Archive: period Murphy et al. 2023; duration/depth Hellier et al. 2011",
+        "url": "https://exoplanetarchive.ipac.caltech.edu/overview/WASP-43b"
+      }
+    }
+  ]
+}

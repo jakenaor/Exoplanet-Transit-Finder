@@ -12,7 +12,7 @@
       <div>
         <div class="app-title-row">
           <h1>Transit Finder</h1>
-          <span class="version-indicator" aria-label="Application version 62">v62</span>
+          <span class="version-indicator" aria-label="Application version 64">v64</span>
         </div>
         <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
         <p id="sessionIndicator" class="session-indicator" aria-live="polite">Preparing session cache…</p>
@@ -62,6 +62,7 @@
         <div class="accordion-body run-status-body">
           <div id="status" class="status">No file selected.</div>
           <div id="analysisProgress" class="analysis-progress" hidden></div>
+          <button id="reconnectJobButton" type="button" hidden>Reconnect to running job</button>
         </div>
       </details>
 
@@ -85,6 +86,8 @@
               </button>
               <div id="batchPickerList" class="batch-picker-list" role="listbox" hidden></div>
             </div>
+            <label for="batchSort">Sort completed files</label>
+            <select id="batchSort"><option value="index">Batch order</option><option value="name">Filename</option><option value="score">Candidate score</option><option value="period">Period</option></select>
           </div>
         </div>
       </details>
@@ -94,7 +97,7 @@
         <div class="accordion-body controls">
           <div class="control-row">
             <label class="control-label" for="strictnessInput">
-              <span>Strictness</span>
+              <span>Local dip strictness (lower finds more)</span>
               <output id="strictnessValue">1.00x</output>
             </label>
             <input id="strictnessInput" type="range" min="0.5" max="2" step="0.05" value="1">
@@ -116,7 +119,7 @@
             </select>
           </div>
           <div id="tlsOptions" class="tls-options" hidden>
-            <p class="control-help">TLS fits limb-darkened transit shapes. Stellar priors narrow its physical duration grid; leave them blank to use the reference defaults. Strictness and local depth/duration controls are disabled because TLS replaces that detector.</p>
+            <p class="control-help">TLS fits limb-darkened transit shapes. Stellar priors narrow its physical duration grid; leave them blank to use the reference defaults. Local dip strictness, smoothing, and local depth/duration controls affect unvalidated dip markers. TLS uses its own minimum depth and physical duration grid.</p>
             <div class="control-row">
               <label class="control-label" for="tlsTemplateInput"><span>Transit template</span></label>
               <select id="tlsTemplateInput">
@@ -126,6 +129,10 @@
               </select>
             </div>
             <div class="tls-grid">
+              <div class="control-row">
+                <label class="control-label" for="tlsMaxSignalsInput"><span>Maximum signals</span></label>
+                <input id="tlsMaxSignalsInput" type="number" min="1" max="5" step="1" value="1">
+              </div>
               <div class="control-row">
                 <label class="control-label" for="stellarRadiusInput"><span>Star radius R☉</span></label>
                 <input id="stellarRadiusInput" type="number" min="0.1" max="100" step="0.01" placeholder="default 1.0">
@@ -166,21 +173,21 @@
           </div>
           <div class="control-row">
             <label class="control-label" for="minDepthInput">
-              <span>Min depth</span>
+              <span>Local min depth (flux)</span>
               <output>auto</output>
             </label>
             <input id="minDepthInput" type="number" min="0" step="0.001" placeholder="auto">
           </div>
           <div class="control-row">
             <label class="control-label" for="minDurationInput">
-              <span>Min duration days</span>
+              <span>Local min duration days</span>
               <output>auto</output>
             </label>
             <input id="minDurationInput" type="number" min="0" step="0.01" placeholder="auto">
           </div>
           <div class="control-row">
             <label class="control-label" for="maxDurationInput">
-              <span>Max duration days</span>
+              <span>Local max duration days</span>
               <output>auto</output>
             </label>
             <input id="maxDurationInput" type="number" min="0" step="0.01" placeholder="auto">
@@ -200,7 +207,14 @@
             <input id="maxPeriodInput" type="number" min="0" step="0.01" placeholder="auto">
           </div>
           <button id="resetDetectionButton" class="view-button" type="button">Reset detection</button>
+          <details><summary>Per-file settings</summary><label for="perFileTarget">Apply settings to</label><select id="perFileTarget"><option value="">Choose source files first</option></select><button id="applyPerFileSettings" type="button">Use current controls for this file</button><button id="clearPerFileSettings" type="button">Use batch defaults for this file</button><p id="perFileSettingsStatus" class="control-help">Set priors and search controls above, then apply them to one selected file.</p><details><summary>Advanced JSON</summary><p class="control-help">Overrides keyed by exact filename. Names match exported detection options.</p><textarea id="perFileSettings" rows="5" spellcheck="false" placeholder='{"target.csv":{"stellarRadius":0.12,"stellarMass":0.09,"tlsMaxSignals":3}}'></textarea></details></details>
+          <details><summary>CSV time metadata</summary><p class="control-help">Use the source documentation. Unknown conventions remain explicitly unverified; FITS metadata is read from the file.</p><label for="csvTimeFormat">Time format</label><select id="csvTimeFormat"><option value="unknown">Unknown</option><option value="jd">JD</option><option value="bjd">BJD</option><option value="mjd">MJD</option><option value="bkjd">BKJD</option><option value="btjd">BTJD</option><option value="relative">Relative time</option></select><label for="csvTimeScale">Time scale</label><select id="csvTimeScale"><option value="unknown">Unknown</option><option value="tdb">TDB</option><option value="utc">UTC</option></select><label for="csvTimeUnit">Input time unit</label><select id="csvTimeUnit"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option><option value="seconds">Seconds</option></select></details>
         </div>
+      </details>
+
+      <details class="accordion-section">
+        <summary><h2>Data and Search Settings</h2></summary>
+        <div id="analysisMetadata" class="accordion-body meta"><p>Input cleaning, effective search settings, and analysis provenance appear here.</p></div>
       </details>
 
       <details class="accordion-section" open>
@@ -278,22 +292,33 @@
         <div class="view-controls" aria-label="Chart view">
           <button class="view-button active" type="button" data-view="zoom">Transit zoom</button>
           <button class="view-button" type="button" data-view="clean">Full cleaned</button>
-          <button class="view-button" type="button" data-view="raw">Raw clipped</button>
+          <button class="view-button" type="button" data-view="raw">Raw series</button>
           <button class="view-button" type="button" data-view="phase">Phase folded</button>
           <button class="view-button" type="button" data-view="stack">Transit stack</button>
           <button class="view-button" type="button" data-view="periodogram">Periodogram</button>
           <button class="view-button" type="button" data-view="audit">Ephemeris audit</button>
+          <button class="view-button" type="button" data-view="comparison">Fit and residuals</button>
+          <button id="resetViewButton" class="view-button" type="button">Reset view</button>
         </div>
       </div>
+      <div class="inspector-controls" aria-label="Transit inspection controls">
+        <label id="signalControl" hidden>Signal <select id="signalSelect"></select></label>
+        <label><input id="showModel" type="checkbox" checked> Show fitted model</label>
+        <label id="localDipsControl" hidden><input id="showLocalDips" type="checkbox"> Local dips (unvalidated)</label>
+        <span id="fitQualityLabel"></span>
+        <label id="phaseScopeControl" hidden>Phase range <select id="phaseScope"><option value="focus">Focused transit</option><option value="orbit">Full orbit</option></select></label>
+        <span id="stackControls" hidden><label>Event <select id="stackEvent"><option value="all">All events</option></select></label><label>Cycles <select id="stackGroup"><option value="all">All</option><option value="odd">Odd</option><option value="even">Even</option></select></label><label><input id="stackIsolate" type="checkbox"> Isolate selected</label><label><input id="stackMedian" type="checkbox" checked> Median</label><label><input id="stackRecenter" type="checkbox"> Measured centers</label></span>
+      </div>
+      <p id="eventInspection" class="inspector-help" hidden></p>
       <div class="chart-wrap">
-        <canvas id="chart"></canvas>
+        <canvas id="chart" tabindex="0" aria-label="Transit chart. Up and down arrows zoom; left and right arrows adjust horizontal zoom. Drag to pan."></canvas>
         <div id="empty" class="empty">Waiting for a light curve.</div>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Transit</th>
+              <th>Window / evidence</th>
               <th>Start day</th>
               <th>Center day</th>
               <th>End day</th>

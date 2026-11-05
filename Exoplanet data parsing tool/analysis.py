@@ -42,6 +42,7 @@ DEFAULT_DETECTION_OPTIONS = {
     "tls_threads": 4,
     "tls_min_depth_ppm": 10.0,
     "tls_duration_grid_step": 1.1,
+    "tls_max_signals": 1,
 }
 
 
@@ -133,6 +134,7 @@ def parse_detection_options(form):
     options["limb_darkening_u2"] = parse_optional_float(form, "limbDarkeningU2", -1.0, 2.0)
     options["tls_oversampling"] = parse_optional_int(form, "tlsOversampling", 1, 9) or 3
     options["tls_min_transits"] = parse_optional_int(form, "tlsMinTransits", 2, 10) or 3
+    options["tls_max_signals"] = parse_optional_int(form, "tlsMaxSignals", 1, 5) or 1
     options["tls_threads"] = (
         parse_optional_int(form, "tlsThreads", 1, 8)
         or DEFAULT_DETECTION_OPTIONS["tls_threads"]
@@ -360,15 +362,26 @@ def flattened_flux_for_period_search(time, flux):
     if full_span <= 0:
         return None
 
-    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
-    clipped_flux = np.clip(flux, clipped_low, clipped_high)
-    trend_days = min(10.0, max(2.0, full_span / 6.0))
-    trend_width = max(5, int(trend_days / max(cadence, 1e-9)))
-    if trend_width % 2 == 0:
-        trend_width += 1
-    trend = moving_average(clipped_flux, trend_width)
-    flattened_flux = clipped_flux - trend
-    return flattened_flux - np.median(flattened_flux)
+    flattened_flux = np.empty_like(flux, dtype=float)
+    for start, end in observing_segments(time):
+        values = np.asarray(flux[start:end], dtype=float)
+        segment_steps = np.diff(time[start:end])
+        positive = segment_steps[segment_steps > 0]
+        local_cadence = float(np.median(positive)) if positive.size else cadence
+        # Clip only upward transients for the search. Clipping the low tail at
+        # a global MAD erased deep, short transits in otherwise quiet curves.
+        low, high = robust_flux_limits(values, sigma=5.0)
+        clipped = np.minimum(values, high)
+        trend_days = min(10.0, max(2.0, float(time[end - 1] - time[start]) / 6.0))
+        trend_width = min(len(values), max(5, int(trend_days / max(local_cadence, 1e-9))))
+        if trend_width % 2 == 0:
+            trend_width -= 1
+        # A clipped trend prevents transits from pulling the local continuum
+        # down while the un-clipped downward samples remain available to TLS.
+        trend = moving_average(np.clip(values, low, high), max(trend_width, 1))
+        segment_flat = clipped - trend
+        flattened_flux[start:end] = segment_flat - np.median(segment_flat)
+    return flattened_flux
 
 
 def chi_squared_transit_probability(time, flattened_flux, period, duration, transit_time):
@@ -410,7 +423,8 @@ def chi_squared_transit_probability(time, flattened_flux, period, duration, tran
 
 def period_search_bounds(cadence, full_span, options=None):
     auto_min_period = max(cadence * 20.0, 0.5)
-    auto_max_period = max(auto_min_period * 1.5, full_span / 3.0)
+    minimum_transits = int((options or {}).get("tls_min_transits", 3))
+    auto_max_period = max(auto_min_period * 1.5, full_span / max(minimum_transits, 2))
     min_period = auto_min_period
     max_period = auto_max_period
     if options:
@@ -750,7 +764,7 @@ def normalized_flux_for_tls(time, flux):
     return tls_flux, robust_noise
 
 
-def estimate_period_with_tls(time, flux, options=None):
+def estimate_period_with_tls(time, flux, options=None, progress_callback=None):
     if len(time) < 50:
         raise ValueError("TLS needs at least 50 finite light-curve samples.")
     if options is None:
@@ -776,7 +790,7 @@ def estimate_period_with_tls(time, flux, options=None):
         "period_min": float(min_period),
         "period_max": float(max_period),
     }
-    result = run_tls_search(time, tls_flux, tls_options)
+    result = run_tls_search(time, tls_flux, tls_options, progress_callback=progress_callback)
     flattened_flux = tls_flux - 1.0
     chi_squared = chi_squared_transit_probability(
         time,
@@ -807,8 +821,8 @@ def estimate_period_with_tls(time, flux, options=None):
         "periodogram": result.get("periodogram"),
         "search_min_period": float(min_period),
         "search_max_period": float(max_period),
-        "search_min_duration": options.get("min_duration"),
-        "search_max_duration": options.get("max_duration"),
+        "search_min_duration": None,
+        "search_max_duration": None,
         "method": "TLS",
         "tls_noise": tls_noise,
         "tls_result": result,
@@ -817,49 +831,96 @@ def estimate_period_with_tls(time, flux, options=None):
     }
 
 
+def robust_standard_error(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+    center = float(np.median(values))
+    sigma = max(1.4826 * float(np.median(np.abs(values - center))), 1e-9)
+    # Median standard error, with a short-block noise floor for correlations.
+    error = 1.253 * sigma / math.sqrt(values.size)
+    if values.size >= 12:
+        blocks = [np.mean(block) for block in np.array_split(values - center, min(8, values.size // 3))]
+        error = max(error, float(np.std(blocks, ddof=1)) / math.sqrt(len(blocks)))
+    return float(error)
+
+
 def transits_from_tls_result(time, flux, tls_period):
     if tls_period is None:
         return []
     result = tls_period.get("tls_result") or {}
     duration = finite_number(tls_period.get("duration"))
-    if duration is None or duration <= 0:
+    period = finite_number(tls_period.get("period"))
+    epoch = finite_number(tls_period.get("transit_time"))
+    if duration is None or duration <= 0 or period is None or epoch is None:
         return []
-
-    transit_times = finite_values(result.get("transit_times", []))
-    model_depths = finite_values(result.get("transit_depth_fractions", []))
-    model_counts = finite_values(result.get("per_transit_count", []))
+    time, flux = np.asarray(time, dtype=float), np.asarray(flux, dtype=float)
+    segments = observing_segments(time)
+    steps = np.diff(time)
+    positive = steps[steps > 0]
+    cadence = float(np.median(positive)) if positive.size else duration
     transits = []
-    for index, center in enumerate(transit_times):
-        start = center - duration / 2.0
-        end = center + duration / 2.0
+    for center in finite_values(result.get("transit_times", [])):
+        start, end = center - duration / 2.0, center + duration / 2.0
         left = int(np.searchsorted(time, start, side="left"))
         right = int(np.searchsorted(time, end, side="right"))
-        if right - left < 2:
-            continue
-
-        shoulder_start = int(np.searchsorted(time, center - duration * 2.5, side="left"))
-        shoulder_left = int(np.searchsorted(time, center - duration * 0.75, side="right"))
-        shoulder_right = int(np.searchsorted(time, center + duration * 0.75, side="left"))
-        shoulder_end = int(np.searchsorted(time, center + duration * 2.5, side="right"))
-        shoulders = np.r_[flux[shoulder_start:shoulder_left], flux[shoulder_right:shoulder_end]]
+        count = right - left
+        segment = next(((a, b) for a, b in segments if time[a] <= center <= time[b - 1]), None)
+        expected_points = max(1.0, duration / max(cadence, 1e-9))
+        coverage = min(1.0, count / expected_points)
+        shoulders = np.asarray([], dtype=float)
+        if segment is not None:
+            a, b = segment
+            shoulder_start = max(a, int(np.searchsorted(time, center - duration * 2.5)))
+            shoulder_left = max(a, min(b, int(np.searchsorted(time, center - duration * 0.75, side="right"))))
+            shoulder_right = max(a, min(b, int(np.searchsorted(time, center + duration * 0.75))))
+            shoulder_end = min(b, int(np.searchsorted(time, center + duration * 2.5, side="right")))
+            shoulders = np.r_[flux[shoulder_start:shoulder_left], flux[shoulder_right:shoulder_end]]
         in_flux = np.asarray(flux[left:right], dtype=float)
-        baseline = float(np.median(shoulders)) if shoulders.size >= 3 else float(np.median(flux))
-        depth = max(0.0, baseline - float(np.median(in_flux)))
-        if depth <= 0 and index < len(model_depths):
-            depth = max(0.0, float(model_depths[index]) * max(abs(baseline), 1.0))
-
+        core_flux = in_flux[np.abs(time[left:right] - center) <= duration * 0.25]
+        if core_flux.size < 3:
+            core_flux = in_flux
+        baseline = float(np.median(shoulders)) if shoulders.size >= 3 else None
+        depth = baseline - float(np.median(core_flux)) if baseline is not None and core_flux.size else None
+        in_error = robust_standard_error(core_flux)
+        out_error = robust_standard_error(shoulders)
+        error = math.hypot(in_error, out_error) if in_error is not None and out_error is not None else None
+        local_snr = depth / error if depth is not None and error and error > 0 else None
+        if count == 0:
+            state = "outside_observations"
+        elif segment is None or count < 3 or shoulders.size < 6 or coverage < 0.35:
+            state = "insufficient_coverage"
+        elif local_snr is not None and local_snr >= 3.0 and depth > 0:
+            state = "supported_dip"
+        else:
+            state = "unsupported_window"
+        measured_center = timing_error = None
+        if state == "supported_dip" and count >= 5:
+            # A flux-weighted local centroid is measured from observations,
+            # not copied from T0+nP. It is conditional on the selected window.
+            deficits = np.maximum(0.0, baseline - in_flux - (out_error or 0.0))
+            if deficits.sum() > 0:
+                measured_center = float(np.sum(time[left:right] * deficits) / deficits.sum())
+                timing_error = max(cadence / math.sqrt(12.0), duration / (2.0 * local_snr))
+        values = np.r_[in_flux, baseline] if baseline is not None else in_flux
+        raw_min, raw_max = (np.percentile(values, [5, 95]).tolist() if values.size else [None, None])
         transits.append({
-            "start": float(start),
-            "end": float(end),
-            "center": float(center),
-            "duration": float(duration),
-            "depth": float(depth),
-            "points": int(model_counts[index]) if index < len(model_counts) else int(right - left),
-            "flux_min": float(np.min(in_flux)),
-            "flux_max": float(max(np.max(in_flux), baseline)),
-            "source": "TLS model",
+            "start": float(start), "end": float(end), "center": float(center),
+            "predicted_center": float(center), "measured_center": measured_center,
+            "timing_uncertainty": timing_error, "timing_method": "conditional local flux centroid" if measured_center is not None else None,
+            "cycle_number": int(round((center - epoch) / period)),
+            "duration": float(duration), "depth": depth, "signed_depth": depth,
+            "depth_estimator": "median flux in central half of predicted window relative to local shoulders",
+            "full_window_depth": baseline - float(np.median(in_flux)) if baseline is not None and count else None,
+            "depth_uncertainty": error, "local_snr": local_snr,
+            "local_baseline": baseline, "points": int(count), "coverage_fraction": float(coverage),
+            "baseline_points": int(shoulders.size), "state": state,
+            "flux_min": float(raw_min) if raw_min is not None else None,
+            "flux_max": float(raw_max) if raw_max is not None else None,
+            "source": "TLS model", "evidence_source": "local observations",
         })
-    return prune_overlapping_transits(transits)
+    return transits
 
 
 def transit_regularity_tolerance(period, durations):
@@ -1346,7 +1407,7 @@ def detect_transits_by_prominence(time, flux, median_flux, options):
     smoothing = float(options["smoothing"])
     base_smooth_width = int(max(31, min(201, len(clipped_flux) // 360)))
     smooth_width = odd_window_width(base_smooth_width, smoothing, 7, 501)
-    smoothed = moving_average(clipped_flux, smooth_width)
+    smoothed = moving_average_by_segments(clipped_flux, smooth_width, observing_segments(time))
 
     baseline = float(np.median(smoothed))
     mad = float(np.median(np.abs(smoothed - baseline)))
@@ -1485,7 +1546,7 @@ def detect_transits_by_threshold(time, flux, median_flux, options):
     smoothing = float(options["smoothing"])
     base_smooth_width = int(max(31, min(101, len(clipped_flux) // 700)))
     smooth_width = odd_window_width(base_smooth_width, smoothing, 7, 501)
-    smoothed = moving_average(clipped_flux, smooth_width)
+    smoothed = moving_average_by_segments(clipped_flux, smooth_width, observing_segments(time))
 
     baseline = float(np.median(smoothed))
     mad = float(np.median(np.abs(smoothed - baseline)))
@@ -1566,7 +1627,7 @@ def detect_transits_by_threshold(time, flux, median_flux, options):
     }
 
 
-def detect_transits(time, flux, options=None):
+def detect_transits(time, flux, options=None, progress_callback=None):
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
     median_flux = float(np.median(flux))
@@ -1593,7 +1654,7 @@ def detect_transits(time, flux, options=None):
 
     transits = sorted(detection["transits"], key=lambda item: item["center"])
     full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    tls_period = estimate_period_with_tls(time, flux, options) if search_mode == "tls" else None
+    tls_period = estimate_period_with_tls(time, flux, options, progress_callback=progress_callback) if search_mode == "tls" else None
     if tls_period is not None:
         tls_transits = transits_from_tls_result(time, flux, tls_period)
         if tls_transits:
@@ -1804,7 +1865,7 @@ def finite_values(values):
 
 
 def finite_number(value):
-    if value is None:
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
     try:
         number = float(value)
@@ -1879,7 +1940,12 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observe
     epoch = finite_number(detection.get("period_epoch"))
     period_duration = finite_number(detection.get("period_duration"))
     expected_count = finite_number(detection.get("period_match_count"))
-    centers = finite_values([item.get("center") for item in transits])
+    independent_timing = detection.get("period_method") == "TLS"
+    centers = finite_values([
+        item.get("measured_center") if independent_timing else item.get("center")
+        for item in transits
+        if not independent_timing or item.get("state") == "supported_dip"
+    ])
     durations = finite_values([item.get("duration") for item in transits])
 
     empty = {
@@ -1895,6 +1961,10 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observe
         "timing_residual_max": None,
         "timing_residual_tolerance": None,
         "timing_residual_ratio": None,
+        "timing_basis": "independently measured local centroids" if independent_timing else "detected event centers",
+        "measured_timing_count": len(centers),
+        "predicted_window_count": len(transits),
+        "covered_window_count": sum(item.get("state") in ("supported_dip", "unsupported_window") for item in transits) if independent_timing else len(transits),
     }
     if not centers or period is None or epoch is None or period <= 0:
         return empty
@@ -1929,13 +1999,16 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observe
     off_count = transit_count - match_count
     median_residual = median_or_none(residuals)
     observed_cycles = ephemeris_cycles_in_observed_ranges(period, epoch_relative, tolerance, observed_ranges)
-    if observed_cycles:
+    if independent_timing:
+        expected_count = sum(item.get("state") in ("supported_dip", "unsupported_window") for item in transits)
+    elif observed_cycles:
         expected_count = len(observed_cycles)
     expected_coverage = None
     if expected_count is not None and expected_count > 0:
         expected_coverage = min(1.0, event_match_count / expected_count)
 
     return {
+        **empty,
         "ephemeris_match_count": int(match_count),
         "ephemeris_match_fraction": match_count / transit_count,
         "ephemeris_event_match_count": int(event_match_count),
@@ -1952,11 +2025,22 @@ def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observe
 
 
 def build_candidate_diagnostics(transits, detection, time_reference=0.0, observed_ranges=None):
-    depths = finite_values([item.get("depth") for item in transits])
-    radius_ratios = finite_values([item.get("radius_ratio") for item in transits])
-    point_counts = finite_values([item.get("points") for item in transits])
-    odd_depths = depths[0::2]
-    even_depths = depths[1::2]
+    has_window_states = any("state" in item for item in transits)
+    evidence_events = [item for item in transits if not has_window_states or item.get("state") == "supported_dip"]
+    depths = finite_values([item.get("depth") for item in evidence_events])
+    radius_ratios = finite_values([item.get("radius_ratio") for item in evidence_events])
+    point_counts = finite_values([item.get("points") for item in evidence_events])
+    # Absolute orbital cycle parity survives missing observations.
+    epoch = finite_number(detection.get("period_epoch"))
+    period = finite_number(detection.get("period"))
+    def parity(item, index):
+        if item.get("cycle_number") is not None:
+            return int(item["cycle_number"]) % 2
+        if epoch is not None and period and period > 0:
+            return int(round((item["center"] + time_reference - epoch) / period)) % 2
+        return index % 2
+    odd_depths = finite_values([item.get("depth") for i, item in enumerate(evidence_events) if parity(item, i) == 1])
+    even_depths = finite_values([item.get("depth") for i, item in enumerate(evidence_events) if parity(item, i) == 0])
     odd_depth = median_or_none(odd_depths)
     even_depth = median_or_none(even_depths)
     depth_center = median_or_none(depths)
@@ -1974,6 +2058,32 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
         odd_even_depth_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
 
     ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference, observed_ranges)
+    usable_windows = [item for item in transits
+                      if item.get("state") in ("supported_dip", "unsupported_window")
+                      and finite_number(item.get("depth")) is not None
+                      and finite_number(item.get("depth_uncertainty")) is not None
+                      and item["depth_uncertainty"] > 0]
+    combined_depth = combined_error = combined_snr = None
+    if usable_windows:
+        signed = np.asarray([item["depth"] for item in usable_windows])
+        errors = np.asarray([item["depth_uncertainty"] for item in usable_windows])
+        weights = 1.0 / errors ** 2
+        # Per-event errors estimated from very few samples can be spuriously
+        # small. Cap their relative precision rather than allowing one shallow
+        # window to dominate the collective signal.
+        weights = np.minimum(weights, np.median(weights) * 2.0)
+        combined_depth = float(np.average(signed, weights=weights))
+        formal_error = float(1.0 / math.sqrt(np.sum(weights)))
+        empirical_error = float(np.std(signed, ddof=1) / math.sqrt(len(signed))) if len(signed) > 1 else formal_error
+        combined_error = max(formal_error, empirical_error)
+        combined_snr = combined_depth / combined_error if combined_error > 0 else None
+    positive_windows = sum(item["depth"] > 0 for item in usable_windows)
+    combined_support = (len(usable_windows) >= 3 and positive_windows >= 3
+                        and positive_windows / len(usable_windows) >= 0.6
+                        and combined_snr is not None and combined_snr >= 3.0
+                        and detection.get("period_method") == "TLS"
+                        and (finite_number(detection.get("period_sde")) or 0) >= 7.0
+                        and (tls_snr or 0) >= 5.0)
     diagnostics = {
         "detection_snr": detection_snr,
         "local_depth_snr": local_depth_snr,
@@ -1986,6 +2096,18 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
         "even_depth": even_depth,
         "odd_even_depth_mismatch": odd_even_depth_mismatch,
         "max_radius_ratio": max(radius_ratios) if radius_ratios else None,
+        "supported_event_count": len(evidence_events),
+        "combined_window_count": len(usable_windows),
+        "positive_window_count": positive_windows,
+        "combined_signed_depth": combined_depth,
+        "combined_depth_uncertainty": combined_error,
+        "combined_depth_snr": combined_snr,
+        "combined_signal_supported": bool(combined_support),
+        "predicted_window_count": len(transits),
+        "unsupported_window_count": sum(item.get("state") == "unsupported_window" for item in transits),
+        "insufficient_coverage_count": sum(item.get("state") == "insufficient_coverage" for item in transits),
+        "outside_observations_count": sum(item.get("state") == "outside_observations" for item in transits),
+        "odd_event_count": len(odd_depths), "even_event_count": len(even_depths),
         **ephemeris,
     }
 
@@ -2070,12 +2192,44 @@ def build_candidate_diagnostics(transits, detection, time_reference=0.0, observe
             "title": "Odd/even depth mismatch",
             "detail": "Alternating transit depths can indicate an eclipsing binary or blended source.",
         })
-    if diagnostics["depth_scatter_ratio"] is not None and diagnostics["depth_scatter_ratio"] > 0.8 and len(depths) >= 4:
+    depth_uncertainties = finite_values([item.get("depth_uncertainty") for item in evidence_events])
+    inconsistent_three = (len(depths) >= 3 and len(depth_uncertainties) == len(depths)
+                          and max(depths) - min(depths) > 3 * math.hypot(max(depth_uncertainties), min(depth_uncertainties)))
+    if diagnostics["depth_scatter_ratio"] is not None and diagnostics["depth_scatter_ratio"] > 0.8 and (len(depths) >= 4 or inconsistent_three):
         warnings.append({
             "severity": "caution",
             "title": "Inconsistent transit depths",
-            "detail": "Detected depths vary substantially across events.",
+            "detail": "Measured event depths disagree beyond their local uncertainty estimates. Review stellar variability, overlap, and systematics.",
         })
+    if has_window_states and len(evidence_events) < min(3, len(transits)):
+        warnings.append({"severity": "caution", "title": "Predicted windows lack local support",
+                         "detail": f"Only {len(evidence_events)} of {len(transits)} predicted windows have a positive local dip above 3-sigma with usable coverage."})
+    if len(odd_depths) < 2 or len(even_depths) < 2:
+        diagnostics["odd_even_comparison_state"] = "insufficient_events"
+    else:
+        diagnostics["odd_even_comparison_state"] = "available"
+    duration_disagreement = finite_number(tls_details.get("duration_disagreement_fraction"))
+    if duration_disagreement is not None and duration_disagreement > 0.35:
+        warnings.append({"severity": "caution", "title": "Duration estimates disagree",
+                         "detail": "Threshold-based width and physical template contacts differ by more than 35%; inspect the conditional fit and cadence."})
+    search_bounds = detection.get("period_search") or {}
+    selected_period = finite_number(detection.get("period"))
+    minimum = finite_number(search_bounds.get("min_period"))
+    maximum = finite_number(search_bounds.get("max_period"))
+    if selected_period is not None and minimum is not None and maximum is not None:
+        edge_margin = max((maximum - minimum) * 0.01, selected_period * 0.002)
+        if min(abs(selected_period - minimum), abs(maximum - selected_period)) < edge_margin:
+            warnings.append({"severity": "caution", "title": "Period peak near search edge",
+                             "detail": "The selected period is close to a search bound. Widen the bounds when baseline and minimum-transit constraints permit."})
+    strong_alternatives = [candidate for candidate in detection.get("period_candidates", [])
+                           if selected_period and finite_number(candidate.get("period"))
+                           and abs(candidate["period"] - selected_period) / selected_period > 0.02
+                           and finite_number(candidate.get("sde")) is not None
+                           and candidate["sde"] >= max(7.0, (finite_number(detection.get("period_sde")) or 0) * 0.85)]
+    if strong_alternatives:
+        diagnostics["strong_alias_periods"] = [candidate["period"] for candidate in strong_alternatives[:4]]
+        warnings.append({"severity": "caution", "title": "Strong alternative periods",
+                         "detail": "Other distinct period peaks have comparable strength. Inspect harmonics, aliases, and additional planets before choosing an ephemeris."})
     if (
         len(transits) >= 3
         and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS")
@@ -2159,7 +2313,9 @@ def score_band(value, bands):
 
 
 def build_planet_assessment(transits, detection, diagnostics, warnings):
-    transit_count = len(transits)
+    local_event_count = int(diagnostics.get("supported_event_count", len(transits)))
+    combined_support = bool(diagnostics.get("combined_signal_supported"))
+    transit_count = max(local_event_count, int(diagnostics.get("positive_window_count", 0)) if combined_support else 0)
     period = finite_number(detection.get("period"))
     period_method = detection.get("period_method")
     period_sde = finite_number(detection.get("period_sde"))
@@ -2220,10 +2376,12 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
             "points": points,
         })
 
-    if transit_count >= 3:
-        support("Repeated transit-like events", f"{transit_count} candidate dips were boxed.", 20)
+    if combined_support and local_event_count < 3:
+        support("Coherent combined transit signal", f"{transit_count} windows have positive signed depth; combined local SNR is {diagnostics['combined_depth_snr']:.2f}. Individual windows remain tentative unless independently supported.", 20)
+    elif transit_count >= 3:
+        support("Repeated locally supported dips", f"{transit_count} windows contain positive measured dips with usable coverage.", 20)
     elif transit_count > 0:
-        support("Transit-like dip found", f"{transit_count} candidate dip{'s were' if transit_count != 1 else ' was'} boxed.", 6)
+        support("Locally supported dip", f"{transit_count} window{'s have' if transit_count != 1 else ' has'} local transit-like support.", 6)
         limit("Too few events", "Fewer than three events is weak evidence for an orbital period.", -8)
     else:
         limit("No boxed transit events", "The detector did not find statistically strong local dips.", -28)
@@ -2282,7 +2440,10 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         else:
             limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
 
-    if period_method in ephemeris_period_methods and transit_count >= 3 and ephemeris_match_fraction is not None:
+    # TLS windows are selected with an ephemeris, so their local centroids are
+    # conditional evidence. Report timing descriptively but award no circular
+    # timing bonus. Non-TLS dip searches can retain independent timing credit.
+    if period_method != "TLS" and period_method in ephemeris_period_methods and transit_count >= 3 and ephemeris_match_fraction is not None:
         if ephemeris_match_fraction >= 0.8:
             support("Detected dips follow the ephemeris", f"{int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", 16)
         elif well_covered_ephemeris:
@@ -2316,7 +2477,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
     if timing_residual_ratio is not None and timing_residual_ratio > 1.0 and transit_count >= 3 and not well_covered_ephemeris:
         limit("Large timing residuals", "Detected dip centers are not tightly clustered around the recovered ephemeris.", -10)
 
-    if depth_scatter_ratio is not None and transit_count >= 4:
+    if depth_scatter_ratio is not None and transit_count >= 3:
         if depth_scatter_ratio <= 0.35:
             support("Consistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", 7)
         elif depth_scatter_ratio > 0.8:
@@ -2324,7 +2485,7 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         elif depth_scatter_ratio > 0.5:
             limit("Moderately inconsistent depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", -6)
 
-    if odd_even_mismatch is not None and transit_count >= 4:
+    if odd_even_mismatch is not None and diagnostics.get("odd_even_comparison_state", "available") == "available" and transit_count >= 4:
         if odd_even_mismatch <= 0.25:
             support("Odd/even depths agree", f"Odd/even mismatch is {odd_even_mismatch:.2f}.", 6)
         elif odd_even_mismatch > 0.5:
@@ -2342,9 +2503,9 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
 
     if median_transit_points is not None:
         if median_transit_points >= 8:
-            support("Well-sampled events", f"Median transit has {median_transit_points:.0f} plotted points.", 4)
+            support("Well-sampled events", f"Median supported event has {median_transit_points:.0f} analysis samples.", 4)
         elif median_transit_points < 4:
-            limit("Sparse transit sampling", f"Median transit has only {median_transit_points:.0f} plotted points.", -6)
+            limit("Sparse transit sampling", f"Median supported event has only {median_transit_points:.0f} analysis samples.", -6)
 
     danger_count = sum(1 for warning in warnings if warning.get("severity") == "danger")
     caution_count = sum(1 for warning in warnings if warning.get("severity") == "caution")
@@ -2467,6 +2628,9 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         candidate_score = min(candidate_score, 44)
 
     return {
+        "assessment_version": 2,
+        "score_label": "Candidate score",
+        "score_is_probability": False,
         "status": status,
         "title": title,
         "short_label": short_label,
@@ -2477,6 +2641,9 @@ def build_planet_assessment(transits, detection, diagnostics, warnings):
         "limiting_evidence": limiting_evidence,
         "inputs": {
             "transit_count": transit_count,
+            "locally_supported_event_count": local_event_count,
+            "evidence_basis": "combined periodic signal" if combined_support and local_event_count < 3 else "locally supported events",
+            "predicted_window_count": len(transits),
             "period": period,
             "period_method": period_method,
             "period_sde": period_sde,
@@ -2653,12 +2820,21 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
     bin_ids = np.digitize(phase, edges) - 1
     binned_phase = []
     binned_flux = []
+    binned_count = []
+    binned_uncertainty = []
+    binned_break_indices = []
+    last_bin = None
     for bin_index in range(bin_count):
         mask = bin_ids == bin_index
         if not np.any(mask):
             continue
+        if last_bin is not None and bin_index > last_bin + 1:
+            binned_break_indices.append(len(binned_phase))
         binned_phase.append(float((edges[bin_index] + edges[bin_index + 1]) / 2.0))
         binned_flux.append(float(np.median(raw_flux[mask])))
+        binned_count.append(int(np.count_nonzero(mask)))
+        binned_uncertainty.append(robust_standard_error(raw_flux[mask]))
+        last_bin = bin_index
 
     binned_phase = np.asarray(binned_phase, dtype=float)
     binned_flux = np.asarray(binned_flux, dtype=float)
@@ -2682,6 +2858,10 @@ def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration
         "smooth_flux": point_smooth.tolist(),
         "binned_phase": binned_phase.tolist(),
         "binned_flux": binned_flux.tolist(),
+        "binned_count": binned_count,
+        "binned_uncertainty": binned_uncertainty,
+        "binned_break_indices": binned_break_indices,
+        "representation": "normalized observations (global phase check)",
         "period": float(period),
         "epoch": float(epoch),
         "duration": duration_value,
@@ -2729,6 +2909,7 @@ def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace
     traces = []
     combined_phase = []
     combined_flux = []
+    segments = observing_segments(time)
     for index, transit in enumerate(transits):
         center = finite_number(transit.get("center"))
         if center is None:
@@ -2739,6 +2920,12 @@ def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace
             & (time >= center - half_window)
             & (time <= center + half_window)
         )
+        segment = next(((a, b) for a, b in segments if time[a] <= center <= time[b - 1]), None)
+        if segment is None:
+            continue
+        segment_mask = np.zeros(len(time), dtype=bool)
+        segment_mask[segment[0]:segment[1]] = True
+        mask &= segment_mask
         if np.count_nonzero(mask) < 3:
             continue
 
@@ -2775,6 +2962,14 @@ def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace
             "flux": normalized[keep].tolist(),
             "point_count": int(offsets.size),
             "baseline": float(np.median(baseline_curve)),
+            "cycle_number": transit.get("cycle_number", index),
+            "state": transit.get("state", "legacy_event"),
+            "depth": transit.get("signed_depth", transit.get("depth")),
+            "depth_uncertainty": transit.get("depth_uncertainty"),
+            "local_snr": transit.get("local_snr"),
+            "coverage_fraction": transit.get("coverage_fraction"),
+            "timing_residual": None if transit.get("measured_center") is None else transit["measured_center"] - center,
+            "timing_uncertainty": transit.get("timing_uncertainty"),
         })
 
     if not traces:
@@ -2803,6 +2998,7 @@ def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace
         "median_flux": median_flux,
         "duration": float(duration_value),
         "window_half_width": float(half_window),
+        "representation": "locally detrended normalized observations (event consistency)",
         "domain": {
             "time_min": float(-half_window),
             "time_max": float(half_window),
@@ -2812,22 +3008,183 @@ def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace
     }
 
 
+def exploratory_local_dips(time, flux, options, time_reference, max_items=500):
+    """Reuse the local morphology detector as an explicitly unvalidated layer."""
+    candidates = []
+    for start, end in observing_segments(time):
+        if end - start < 10:
+            continue
+        segment_baseline = float(np.median(flux[start:end]))
+        prominence = detect_transits_by_prominence(time[start:end], flux[start:end], segment_baseline, options)
+        threshold = detect_transits_by_threshold(time[start:end], flux[start:end], segment_baseline, options)
+        local_events = prune_overlapping_transits((prominence or {}).get("transits", []) + (threshold or {}).get("transits", []))
+        for transit in local_events:
+            event = dict(transit)
+            add_depth_metrics(event, float(np.median(flux[start:end])))
+            for key in ("start", "end", "center"):
+                event[key] -= time_reference
+            event.update(role="exploratory", validated=False, source="local prominence/threshold detectors",
+                         matched_signal_ids=[], assignment="unassigned")
+            candidates.append(event)
+    total = len(candidates)
+    if total > max_items:
+        candidates = sorted(candidates, key=lambda item: item.get("depth", 0) * math.sqrt(item.get("points", 1)), reverse=True)[:max_items]
+    candidates.sort(key=lambda item: item["center"])
+    for index, candidate in enumerate(candidates):
+        candidate["dip_id"] = f"dip-{index + 1}"
+    return candidates, {"method": "existing local prominence/threshold detectors, applied within observing segments",
+                        "total_before_display_cap": total, "display_cap": max_items,
+                        "interpretation": "Unvalidated local features; not planets, not independent confirmations, and never added to the candidate score."}
+
+
+def tag_exploratory_assignments(result, signals):
+    for dip in result.get("exploratory_dips", []):
+        absolute_center = dip["center"] + result["time_reference"]
+        matches = []
+        for index, signal in enumerate(signals):
+            relative_center = absolute_center - signal["time_reference"]
+            if any(event["start"] <= relative_center <= event["end"] for event in signal.get("predicted_windows", signal.get("transits", []))):
+                matches.append(signal.get("signal_id", f"signal-{index + 1}"))
+        dip["matched_signal_ids"] = matches
+        dip["assignment"] = "overlaps_predicted_window" if matches else "unassigned"
+
+
+def joint_template_amplitudes(time, search_flux, signals, uncertainty=None):
+    """Fit simultaneous depths and one baseline with orbital templates fixed.
+
+    This handles additive small-planet flux deficits at overlapping timestamps.
+    It does not infer orbital parameters or model overlapping silhouettes.
+    """
+    if len(signals) < 2:
+        return None
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None
+    time, values = np.asarray(time, dtype=float), np.asarray(search_flux, dtype=float)
+    shapes, prior_depths = [], []
+    for signal in signals:
+        model = signal.get("transit_model") or {}
+        folded_flux = np.asarray(model.get("folded_flux", []), dtype=float)
+        if folded_flux.size < 3:
+            return None
+        baseline = float(np.max(folded_flux))
+        depth = float(baseline - np.min(folded_flux))
+        if depth <= 0:
+            return None
+        aligned = model_flux_at_observations(time, signal["period"], signal["period_epoch"], model)
+        if aligned is None:
+            return None
+        shapes.append(np.maximum(0.0, (baseline - aligned) / depth))
+        prior_depths.append(depth)
+    design = np.column_stack([np.ones(len(time))] + [-shape for shape in shapes])
+    sigma = max(1.4826 * float(np.median(np.abs(values - np.median(values)))), 1e-8)
+    errors = np.full(len(time), sigma)
+    if uncertainty is not None:
+        supplied = np.asarray(uncertainty, dtype=float)
+        if len(supplied) == len(time) and np.all(np.isfinite(supplied)) and np.all(supplied > 0):
+            errors = supplied
+    initial = [float(np.median(values)), *prior_depths]
+    fit = least_squares(lambda pars: (design @ pars - values) / errors, initial,
+                        jac=lambda pars: design / errors[:, None], loss="soft_l1",
+                        bounds=([0.5] + [0.0] * len(signals), [1.5] + [0.5] * len(signals)), max_nfev=60)
+    if not fit.success or not np.all(np.isfinite(fit.x)):
+        return None
+    degrees = max(len(values) - len(fit.x), 1)
+    residual_variance = float(np.sum(fit.fun ** 2) / degrees)
+    try:
+        covariance = np.linalg.pinv(fit.jac.T @ fit.jac) * max(1.0, residual_variance)
+        errors_on_parameters = np.sqrt(np.maximum(0.0, np.diag(covariance)))
+    except np.linalg.LinAlgError:
+        errors_on_parameters = np.full(len(fit.x), np.nan)
+    fitted = design @ fit.x
+    return {
+        "baseline": float(fit.x[0]), "depths": fit.x[1:].tolist(),
+        "depth_uncertainties": [float(value) if np.isfinite(value) else None for value in errors_on_parameters[1:]],
+        "model_flux": fitted, "residual_flux": values - fitted,
+        "components": [1.0 - depth * shape for depth, shape in zip(fit.x[1:], shapes)],
+        "metadata": {"method": "robust simultaneous additive template amplitude and baseline fit",
+                     "fixed_parameters": ["period", "epoch", "duration", "template shape"],
+                     "fitted_parameters": ["per-signal flux deficit", "shared baseline"],
+                     "overlap_model": "sum of flux deficits; overlapping planet silhouettes are not modeled geometrically",
+                     "uncertainty_basis": "conditional local Jacobian with residual-variance inflation; not an orbital posterior",
+                     "reduced_chi_squared": residual_variance,
+                     "overlapping_sample_count": int(np.count_nonzero(np.sum(np.asarray(shapes) > .001, axis=0) > 1))},
+    }
+
+
+def update_signal_joint_depth(signal, depth, uncertainty):
+    """Keep component model payloads consistent with a conditional joint depth."""
+    model = signal.get("transit_model") or {}
+    folded_flux = np.asarray(model.get("folded_flux", []), dtype=float)
+    if folded_flux.size < 3:
+        return
+    baseline = float(np.max(folded_flux))
+    previous_depth = float(baseline - np.min(folded_flux))
+    if previous_depth <= 0:
+        return
+    signal["transit_model"] = {**model,
+        "folded_flux": (1.0 - (baseline - folded_flux) * depth / previous_depth).tolist(),
+        "flux": (1.0 - (baseline - np.asarray(model.get("flux", []))) * depth / previous_depth).tolist(),
+        "depth_source": "conditional joint template amplitude", "component_baseline": 1.0,
+    }
+    if signal.get("tls"):
+        signal["tls"] = {**signal["tls"], "engine_depth_fraction": signal["tls"].get("engine_depth_fraction", signal["tls"].get("depth_fraction")),
+                         "depth_fraction": float(depth), "depth_uncertainty": uncertainty,
+                         "depth_source": "conditional joint template amplitude"}
+    comparison = signal.get("model_comparison")
+    if comparison:
+        old = np.asarray(comparison["model_flux"])
+        updated = 1.0 - (baseline - old) * depth / previous_depth
+        signal["model_comparison"] = {**comparison, "model_flux": updated.tolist(),
+                                      "residual_flux": (np.asarray(comparison["search_flux"]) - updated).tolist()}
+    signal["joint_depth_refinement"] = {"depth_fraction": float(depth), "uncertainty": uncertainty,
+                                        "parameters_held_fixed": ["period", "epoch", "duration", "template shape"]}
+
+
 def analyze(time, flux, options=None, progress_callback=None):
-    def report_progress(stage, stage_label):
+    def report_progress(stage, stage_label, details=None):
         if callable(progress_callback):
-            progress_callback(stage, stage_label)
+            if details is None:
+                progress_callback(stage, stage_label)
+            else:
+                progress_callback(stage, stage_label, details)
 
     if options is None:
         options = dict(DEFAULT_DETECTION_OPTIONS)
+    else:
+        options = {**DEFAULT_DETECTION_OPTIONS, **options}
+    time, flux = np.asarray(time, dtype=float), np.asarray(flux, dtype=float)
+    if len(time) < 3 or len(time) != len(flux) or not np.isfinite(time).all() or not np.isfinite(flux).all():
+        raise ValueError("Analysis requires matching finite time/flux samples.")
+    if np.any(np.diff(time) <= 0):
+        raise ValueError("Analysis timestamps must be sorted, unique, and span more than zero days.")
     report_progress("preparing", "Preparing light curve")
     normalization_plan = flux_normalization_plan(flux)
     analysis_flux, segments = normalize_flux_by_segments(time, flux)
+    normalized_uncertainty = None
+    uncertainty_complete = False
+    if options.get("_flux_uncertainty") is not None:
+        supplied_uncertainty = np.asarray(options["_flux_uncertainty"], dtype=float)
+        if len(supplied_uncertainty) == len(time):
+            normalized_uncertainty = supplied_uncertainty.copy()
+            for start, end in segments:
+                residual_scale = normalization_plan.get("residual_scale")
+                scale = abs(float(np.median(flux[start:end])) + (residual_scale or 0.0))
+                if scale > 0:
+                    normalized_uncertainty[start:end] /= scale
+            uncertainty_complete = bool(np.all(np.isfinite(normalized_uncertainty)) and np.all(normalized_uncertainty > 0))
+            if uncertainty_complete:
+                options = {**options, "_normalized_flux_uncertainty": normalized_uncertainty}
     search_mode = options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
     if search_mode == "tls":
         report_progress("tls_search", "Searching periods with TLS")
     else:
         report_progress("bls_search", "Searching periods with BLS")
-    detection = detect_transits(time, analysis_flux, options)
+    detection = detect_transits(time, analysis_flux, options,
+                                progress_callback=lambda details: report_progress(
+                                    "tls_finalizing" if details.get("search_complete") else "tls_search",
+                                    "Finalizing TLS model" if details.get("search_complete") else "Searching periods with TLS", details))
     report_progress("building", "Building transit model and plots")
     time_reference = float(time[0])
     display_time = time - time_reference
@@ -2858,11 +3215,12 @@ def analyze(time, flux, options=None, progress_callback=None):
         display_model_flux = moving_average_by_segments(observed_model_flux, smooth_width, segments)
 
     plot_keep = downsample_indices_for_series(
-        [smooth_flux, display_model_flux] if display_model_flux is not None else [smooth_flux],
+        [analysis_flux, smooth_flux, display_model_flux] if display_model_flux is not None else [analysis_flux, smooth_flux],
         MAX_PLOT_POINTS,
     )
+    plot_keep = np.unique(np.r_[plot_keep, [index for start, end in segments for index in (start, end - 1)]]).astype(int)
     plot_time = display_time[plot_keep]
-    plot_raw = raw_clipped[plot_keep]
+    plot_raw = analysis_flux[plot_keep]
     plot_smooth = smooth_flux[plot_keep]
     raw_flux_min, raw_flux_max = domain_for(raw_clipped, 0.5, 99.5)
     clean_domain_values = (
@@ -2881,8 +3239,8 @@ def analyze(time, flux, options=None, progress_callback=None):
     )
     transit_stack = build_transit_stack(
         time,
-        smooth_flux,
-        detection["transits"],
+        analysis_flux,
+        [event for event in detection["transits"] if event.get("points", 1) > 0],
         detection["period"],
         detection["period_duration"],
     )
@@ -2900,10 +3258,28 @@ def analyze(time, flux, options=None, progress_callback=None):
     display_transits = []
     for transit in detection["transits"]:
         display_transit = dict(transit)
-        add_depth_metrics(display_transit, detection["median_flux"])
+        add_depth_metrics(display_transit, transit.get("local_baseline", detection["median_flux"]))
+        for key in ("predicted_center", "measured_center"):
+            if transit.get(key) is not None:
+                display_transit[key] = float(transit[key] - time_reference)
         display_transit["start"] = float(transit["start"] - time_reference)
         display_transit["center"] = float(transit["center"] - time_reference)
         display_transit["end"] = float(transit["end"] - time_reference)
+        local = (time >= transit["start"]) & (time <= transit["end"])
+        display_extents = {}
+        for name, values in (("raw", analysis_flux), ("clean", smooth_flux)):
+            local_values = values[local]
+            if name == "clean" and display_model_flux is not None:
+                local_values = np.r_[local_values, display_model_flux[local]]
+            if local_values.size:
+                low, high = np.percentile(local_values, [5, 95])
+                baseline = transit.get("local_baseline")
+                if baseline is not None:
+                    high = max(high, baseline)
+                padding = max((high - low) * 0.12, 1e-6)
+                display_extents[name] = {"flux_min": float(low - padding), "flux_max": float(high + padding),
+                                         "low": float(low - padding), "high": float(high + padding)}
+        display_transit["display_extents"] = display_extents
         if transit_model is not None and display_model_flux is not None:
             display_start, display_end = smoothed_transit_display_bounds(
                 display_transit["start"],
@@ -2922,7 +3298,27 @@ def analyze(time, flux, options=None, progress_callback=None):
     ]
     report_progress("vetting", "Calculating diagnostics")
     diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference, observed_ranges)
+    if normalized_uncertainty is not None and not uncertainty_complete:
+        warnings.append({"severity": "info", "title": "Partial measurement uncertainties",
+                         "detail": "Some flux errors are missing or invalid. They remain null in plots/exports; TLS uses its unweighted fallback for this file and local checks use empirical noise."})
     planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
+    exploratory_dips, exploratory_metadata = ([], None)
+    if not options.get("_skip_local_inspection"):
+        exploratory_dips, exploratory_metadata = exploratory_local_dips(time, analysis_flux, options, time_reference)
+    fit_accepted = planet_assessment["status"] in ("strong_candidate", "possible_candidate")
+    fit_quality = {"state": "accepted" if fit_accepted else "tentative",
+                   "label": "Candidate model" if fit_accepted else "Tentative fit - below candidate threshold",
+                   "reason_codes": [warning["title"].lower().replace(" ", "_") for warning in warnings if warning.get("severity") in ("caution", "danger")]}
+    search_flux = None
+    if search_mode == "tls":
+        search_flux, _ = normalized_flux_for_tls(time, analysis_flux)
+    comparison = None
+    if search_flux is not None and observed_model_flux is not None:
+        comparison = {"time": plot_time.tolist(), "search_flux": search_flux[plot_keep].tolist(),
+                      "model_flux": observed_model_flux[plot_keep].tolist(),
+                      "residual_flux": (search_flux - observed_model_flux)[plot_keep].tolist(),
+                      "representation": "search-detrended observations and physical template on identical timestamps",
+                      "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]]}
 
     zoom_domain = None
     if display_transits:
@@ -2948,10 +3344,11 @@ def analyze(time, flux, options=None, progress_callback=None):
         }
 
     report_progress("finalizing", "Finalizing results")
-    return {
+    public_options = {key: value for key, value in options.items() if not key.startswith("_")}
+    result = {
         "total_points": int(len(time)),
         "time_reference": time_reference,
-        "time_unit": "Julian days since first observation",
+        "time_unit": "Days since first observation",
         "flux_unit": "relative flux",
         "normalization": {
             "method": normalization_plan["method"],
@@ -2971,6 +3368,9 @@ def analyze(time, flux, options=None, progress_callback=None):
             "time": plot_time.tolist(),
             "raw_flux": plot_raw.tolist(),
             "smooth_flux": plot_smooth.tolist(),
+            "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]],
+            "raw_representation": "unclipped segment-normalized flux at retained plot samples",
+            "clean_representation": "display-clipped, segment-smoothed observations",
         },
         "domain": {
             "time_min": 0.0,
@@ -2985,8 +3385,91 @@ def analyze(time, flux, options=None, progress_callback=None):
         "diagnostics": diagnostics,
         "warnings": warnings,
         "planet_assessment": planet_assessment,
+        "fit_quality": fit_quality,
+        "model_comparison": comparison,
+        "predicted_windows": display_transits,
+        "observed_events": [event for event in display_transits if event.get("state", "supported_dip") == "supported_dip"],
+        "exploratory_dips": exploratory_dips,
+        "exploratory_dips_metadata": exploratory_metadata,
+        "cleaning_report": options.get("_cleaning_report"),
+        "input_metadata": options.get("_input_metadata", {"time_format": "unspecified", "time_standard": "unspecified"}),
+        "preprocessing": {"normalized": "per-observing-segment median", "search": "segment-local trend removal; downward samples retained", "display": "segment-local moving average", "stack": "per-event linear baseline, no automatic recentering"},
+        "significance_metadata": {"p_value": "Approximate fixed-model-versus-flat chi-squared comparison after selecting the period; not search-wide false alarm or planet probability.",
+                                  "tls_fap": "Reference TLS white-noise lookup; correlated noise and selection effects can make it optimistic.",
+                                  "candidate_score": "Heuristic review score, not a calibrated probability."},
+        "effective_settings": {**public_options, "stellar_priors": (detection.get("tls") or {}).get("effective_stellar_priors"),
+                               "local_dip_settings": {key: public_options.get(key) for key in ("strictness", "smoothing", "min_depth", "min_duration", "max_duration")},
+                               "search_bounds": {**(detection.get("period_search") or {}), "min_transits": options.get("tls_min_transits"),
+                                                 "duration_policy": "Physical TLS stellar-prior/template grid; explicit local dip duration bounds are not applied to TLS." if search_mode == "tls" else "Explicit or cadence-derived BLS duration bounds.",
+                                                 "bounds_reason": ("Upper period limited by observed baseline / minimum transit count; explicit bounds also applied." if search_mode == "tls" else "Cadence, baseline and explicit period/duration bounds applied to BLS.")}},
         "detection_snr": diagnostics["detection_snr"],
         "odd_even_depth_mismatch": diagnostics["odd_even_depth_mismatch"],
         "depth_scatter_ratio": diagnostics["depth_scatter_ratio"],
-        **{**detection, "transits": display_transits},
+        **{**detection, "transits": [event for event in display_transits if event.get("points", 1) > 0], "detection_options": public_options},
     }
+    if normalized_uncertainty is not None:
+        result["plot"]["flux_uncertainty"] = [float(value) if np.isfinite(value) and value > 0 else None for value in normalized_uncertainty[plot_keep]]
+        result["uncertainty_usage"] = ("Normalized input uncertainties supplied to TLS; local event estimates additionally use empirical correlated-noise errors." if uncertainty_complete
+                                       else "Incomplete errors retained as null; TLS uses unweighted fallback and local checks use empirical correlated-noise errors.")
+    max_signals = int(options.get("tls_max_signals", options.get("max_signals", 1)))
+    if search_mode == "tls" and max_signals > 1:
+        signals = [{"signal_id": "signal-1", "label": "Signal 1", **result}]
+        retained = np.ones(len(time), dtype=bool)
+        stop_reason = "requested_signal_limit"
+        for signal_index in range(1, min(max_signals, 5)):
+            previous = signals[-1]
+            if previous["planet_assessment"]["status"] != "strong_candidate":
+                stop_reason = "Previous signal lacks strong support; no tentative model was masked."
+                break
+            supported = previous.get("observed_events", [])
+            if len(supported) < 3:
+                stop_reason = "Fewer than three locally supported events; residual search stopped."
+                break
+            for event in supported:
+                center = event["center"] + previous["time_reference"]
+                retained &= np.abs(time - center) > event["duration"] * 0.65
+            if np.count_nonzero(retained) < 50:
+                stop_reason = "Too few unmasked observations remain."
+                break
+            report_progress("tls_search", f"Searching residual observations for signal {signal_index + 1}")
+            next_options = {**options, "tls_max_signals": 1, "max_signals": 1, "_skip_local_inspection": True}
+            if options.get("_flux_uncertainty") is not None:
+                next_options["_flux_uncertainty"] = np.asarray(options["_flux_uncertainty"])[retained]
+                next_options.pop("_normalized_flux_uncertainty", None)
+            candidate = analyze(time[retained], flux[retained], next_options, progress_callback)
+            # Do not present another optimizer noise pattern as a recovered planet.
+            if candidate["planet_assessment"]["status"] not in ("strong_candidate", "possible_candidate"):
+                result["residual_search_attempt"] = {"period": candidate.get("period"), "sde": candidate.get("period_sde"), "fit_quality": candidate.get("fit_quality")}
+                stop_reason = "No additional credible periodic signal in the residual observations."
+                break
+            candidate.update(signal_id=f"signal-{signal_index + 1}", label=f"Signal {signal_index + 1}",
+                             search_context={"method": "iterative conservative transit masking", "masked_samples": int(np.count_nonzero(~retained)), "joint_refit": False})
+            signals.append(candidate)
+        result["signals"] = signals
+        result["multi_signal_search"] = {"requested": max_signals, "recovered": sum(signal["planet_assessment"]["status"] in ("strong_candidate", "possible_candidate") for signal in signals),
+                                         "attempted_signals": len(signals), "stop_reason": stop_reason,
+                                         "method": "conservative supported-event masking; conditional residual searches", "joint_refit": False,
+                                         "limitation": "Overlapping events and period aliases still require joint follow-up vetting."}
+        if len(signals) >= 2 and search_flux is not None:
+            report_progress("building", "Refining overlapping transit amplitudes together")
+            joint = joint_template_amplitudes(time, search_flux, signals,
+                                               normalized_uncertainty if uncertainty_complete else None)
+            if joint is not None:
+                for signal, depth, depth_error in zip(signals, joint["depths"], joint["depth_uncertainties"]):
+                    update_signal_joint_depth(signal, depth, depth_error)
+                    signal["search_context"] = {**signal.get("search_context", {}), "joint_refit": True,
+                                                 "joint_scope": "amplitudes and shared baseline; orbital parameters held fixed"}
+                for field in ("transit_model", "tls", "model_comparison", "joint_depth_refinement"):
+                    result[field] = signals[0][field]
+                result["joint_model_comparison"] = {
+                    "time": plot_time.tolist(), "search_flux": search_flux[plot_keep].tolist(),
+                    "model_flux": joint["model_flux"][plot_keep].tolist(), "residual_flux": joint["residual_flux"][plot_keep].tolist(),
+                    "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]],
+                    "representation": "original search-detrended observations with simultaneous fixed-template signal amplitudes",
+                    "components": [{"signal_id": signal["signal_id"], "label": signal["label"], "flux": component[plot_keep].tolist()}
+                                   for signal, component in zip(signals, joint["components"])],
+                }
+                result["multi_signal_search"].update(joint_refit=True, joint_fit=joint["metadata"],
+                                                      limitation="Joint amplitudes and baseline fitted; orbital parameters and transit shapes remain conditional and require follow-up vetting.")
+    tag_exploratory_assignments(result, result.get("signals") or [result])
+    return result
