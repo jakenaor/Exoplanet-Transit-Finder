@@ -1,3 +1,14 @@
+#------------------------------------------------------------------#
+# exoplanet transit finder                                         #
+# app by Jnaor                                                     #
+# discord: jake_5101 :D                                            #
+#                                                                  #
+# search: TLS by Michael Hippke + René Heller                      #
+# transit models: batman by Laura Kreidberg                        #
+# also uses NumPy, SciPy, Astropy, Numba + tqdm                    #
+# full credits + paper references: ../CREDITS.md                   #
+#------------------------------------------------------------------#
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi as Cgi
 import json as Json

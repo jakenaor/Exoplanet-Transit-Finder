@@ -1,4 +1,4 @@
-/*MARK: colors and sizing */
+/*MARK: colors and sizing*/
 :root {
   color-scheme: light;
   --ink: #202124;
@@ -24,7 +24,7 @@
 
 * { box-sizing: border-box; }
 
-/*MARK: chart controls */
+/*MARK: chart controls*/
 .InspectorControls { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; padding:8px 12px; background:var(--surface-soft); border-bottom:1px solid var(--line); font-size:12px; }
 .InspectorControls label,.InspectorControls #StackControls { display:inline-flex; flex-wrap:wrap; align-items:center; gap:6px; }
 .InspectorControls [hidden] { display:none!important; }
@@ -42,7 +42,7 @@
 .FileDropThing[aria-disabled=true] { opacity:.55; pointer-events:none; }
 .Workspace { min-height:0; }
 
-/*MARK: page layout */
+/*MARK: page layout*/
 html {
   height: 100%;
 }
@@ -287,7 +287,13 @@ p {
   align-content: start;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
+}
+
+/*MARK: stable scroll space */
+@supports (scrollbar-gutter: stable) {
+  .Sidebar {
+    scrollbar-gutter: stable;
+  }
 }
 
 .Sidebar > div:first-child {
@@ -308,6 +314,7 @@ p {
   gap: 12px;
   list-style: none;
   cursor: pointer;
+  -webkit-user-select: none;
   user-select: none;
   border-radius: 7px;
   padding: 6px 8px;
@@ -860,6 +867,7 @@ input[type="range"] {
   overflow: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .BatchPickerMeta,
@@ -943,6 +951,7 @@ input[type="range"] {
   overflow: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .BatchOptionMeta {
@@ -1024,6 +1033,7 @@ canvas {
   display: block;
   cursor: grab;
   touch-action: none;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -1070,6 +1080,11 @@ td {
 th:first-child,
 td:first-child {
   text-align: left;
+}
+
+.EmptyEventRow {
+  text-align: left;
+  color: #60656f;
 }
 
 th {
@@ -1143,6 +1158,7 @@ th {
   line-height: 1.25;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .ProgressHeader span:last-child {
