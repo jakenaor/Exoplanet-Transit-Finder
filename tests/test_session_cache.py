@@ -1,23 +1,24 @@
-import json
-import os
+import json as Json
+import os as Os
 from pathlib import Path
-import sys
-import tempfile
-import unittest
+import sys as Sys
+import tempfile as Tempfile
+import unittest as Unittest
 
 
 APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
-sys.path.insert(0, str(APP_DIR))
+Sys.path.insert(0, str(APP_DIR))
 
 from main import TransitRequestHandler  # noqa: E402
-from session_cache import SessionCache, SessionCacheManager, validate_session_id  # noqa: E402
+from session_cache import SessionCache, SessionCacheManager, ValidateSessionId  # noqa: E402
 
 
-class SessionCacheTests(unittest.TestCase):
-    def test_round_trip_uses_one_atomic_json_file_per_session(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cache = SessionCache(directory=directory, max_bytes=1024 * 1024)
-            state = {
+#MARK: cache files
+class SessionCacheTests(Unittest.TestCase):
+    def testRoundTripUsesOneAtomicJsonFilePerSession(self):
+        with Tempfile.TemporaryDirectory() as Directory:
+            Cache = SessionCache(Directory=Directory, MaxBytes=1024 * 1024)
+            State = {
                 "current_batch_index": 0,
                 "current_view": "stack",
                 "results": [{"file_name": "wasp43.csv", "result": {
@@ -27,118 +28,118 @@ class SessionCacheTests(unittest.TestCase):
                 }}],
             }
 
-            saved = cache.save("session_12345678", state)
-            loaded = cache.load("session_12345678")
+            Saved = Cache.save("session_12345678", State)
+            Loaded = Cache.load("session_12345678")
 
-            cache_path = Path(saved["cache_file"])
-            self.assertEqual(cache_path.parent, Path(directory).resolve())
-            self.assertEqual(cache_path.name, "session-session_12345678.json")
-            restored = loaded["state"]
-            self.assertEqual(restored["current_view"], state["current_view"])
-            result = restored["results"][0]["result"]
-            self.assertEqual(result["plot"], state["results"][0]["result"]["plot"])
-            self.assertEqual(result["transits"], state["results"][0]["result"]["transits"])
-            self.assertIsNone(result["provenance"]["analyzed_at"])
-            self.assertEqual(result["provenance"]["analysis_version"], "unknown")
-            self.assertNotIn("provenance", state["results"][0]["result"])
-            self.assertEqual(loaded["schema_version"], 1)
-            json.dumps(loaded)
-            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+            CachePath = Path(Saved["cache_file"])
+            self.assertEqual(CachePath.parent, Path(Directory).resolve())
+            self.assertEqual(CachePath.name, "session-session_12345678.json")
+            Restored = Loaded["state"]
+            self.assertEqual(Restored["current_view"], State["current_view"])
+            Result = Restored["results"][0]["result"]
+            self.assertEqual(Result["plot"], State["results"][0]["result"]["plot"])
+            self.assertEqual(Result["transits"], State["results"][0]["result"]["transits"])
+            self.assertIsNone(Result["provenance"]["analyzed_at"])
+            self.assertEqual(Result["provenance"]["analysis_version"], "unknown")
+            self.assertNotIn("provenance", State["results"][0]["result"])
+            self.assertEqual(Loaded["schema_version"], 1)
+            Json.dumps(Loaded)
+            self.assertEqual(list(Path(Directory).glob("*.tmp")), [])
 
-    def test_missing_session_returns_none(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cache = SessionCache(directory=directory)
-            self.assertIsNone(cache.load("missing_12345678"))
+    def testMissingSessionReturnsNone(self):
+        with Tempfile.TemporaryDirectory() as Directory:
+            Cache = SessionCache(Directory=Directory)
+            self.assertIsNone(Cache.load("missing_12345678"))
 
-    def test_invalid_ids_cannot_escape_cache_directory(self):
-        for value in ("../outside", "short", "abc/defgh", "contains space"):
-            with self.subTest(value=value):
+    def testInvalidIdsCannotEscapeCacheDirectory(self):
+        for Value in ("../outside", "short", "abc/defgh", "contains space"):
+            with self.subTest(value=Value):
                 with self.assertRaises(ValueError):
-                    validate_session_id(value)
+                    ValidateSessionId(Value)
 
-    def test_session_route_parser_accepts_only_safe_ids(self):
+    def testSessionRouteParserAcceptsOnlySafeIds(self):
         self.assertEqual(
-            TransitRequestHandler.analysis_session_id("/analysis-sessions/abc12345_def"),
+            TransitRequestHandler.AnalysisSessionId("/analysis-sessions/abc12345_def"),
             "abc12345_def",
         )
-        self.assertIsNone(TransitRequestHandler.analysis_session_id("/analysis-sessions/../secret"))
-        self.assertIsNone(TransitRequestHandler.analysis_session_id("/analysis-sessions/short"))
+        self.assertIsNone(TransitRequestHandler.AnalysisSessionId("/analysis-sessions/../secret"))
+        self.assertIsNone(TransitRequestHandler.AnalysisSessionId("/analysis-sessions/short"))
         self.assertEqual(
-            TransitRequestHandler.analysis_session_location_id(
+            TransitRequestHandler.AnalysisSessionLocationId(
                 "/analysis-sessions/abc12345_def/location"
             ),
             "abc12345_def",
         )
 
-    def test_custom_location_moves_cache_and_survives_manager_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            default_directory = root / "default"
-            custom_directory = root / "custom results"
-            session_id = "moveme_12345678"
-            state = {"current_view": "stack", "results": []}
-            manager = SessionCacheManager(default_directory=default_directory)
-            original = Path(manager.save(session_id, state)["cache_file"])
+    def testCustomLocationMovesCacheAndSurvivesManagerRestart(self):
+        with Tempfile.TemporaryDirectory() as Directory:
+            Root = Path(Directory)
+            DefaultDirectory = Root / "default"
+            CustomDirectory = Root / "custom results"
+            SessionId = "moveme_12345678"
+            State = {"current_view": "stack", "results": []}
+            Manager = SessionCacheManager(DefaultDirectory=DefaultDirectory)
+            Original = Path(Manager.save(SessionId, State)["cache_file"])
 
-            relocated = manager.relocate(session_id, str(custom_directory))
+            Relocated = Manager.relocate(SessionId, str(CustomDirectory))
 
-            relocated_path = Path(relocated["cache_file"])
-            self.assertTrue(relocated["moved"])
-            self.assertFalse(original.exists())
-            self.assertTrue(relocated_path.is_file())
-            restarted_manager = SessionCacheManager(default_directory=default_directory)
-            self.assertEqual(restarted_manager.directory_for(session_id), custom_directory.resolve())
-            self.assertEqual(restarted_manager.load(session_id)["state"], state)
+            RelocatedPath = Path(Relocated["cache_file"])
+            self.assertTrue(Relocated["moved"])
+            self.assertFalse(Original.exists())
+            self.assertTrue(RelocatedPath.is_file())
+            RestartedManager = SessionCacheManager(DefaultDirectory=DefaultDirectory)
+            self.assertEqual(RestartedManager.DirectoryFor(SessionId), CustomDirectory.resolve())
+            self.assertEqual(RestartedManager.load(SessionId)["state"], State)
 
-    def test_custom_location_rejects_relative_and_root_paths(self):
+    def testCustomLocationRejectsRelativeAndRootPaths(self):
         with self.assertRaisesRegex(ValueError, "absolute path"):
-            SessionCacheManager.validate_directory("relative/folder")
+            SessionCacheManager.ValidateDirectory("relative/folder")
         with self.assertRaisesRegex(ValueError, "filesystem root"):
-            SessionCacheManager.validate_directory("/")
+            SessionCacheManager.ValidateDirectory("/")
 
-    def test_manager_lists_default_and_custom_caches_newest_first(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manager = SessionCacheManager(default_directory=root / "default")
-            older_id = "older_12345678"
-            newer_id = "newer_12345678"
-            older_path = Path(manager.save(older_id, {"results": []})["cache_file"])
-            manager.save(newer_id, {"results": []})
-            newer_path = Path(
-                manager.relocate(newer_id, str(root / "custom"))["cache_file"]
+    def testManagerListsDefaultAndCustomCachesNewestFirst(self):
+        with Tempfile.TemporaryDirectory() as Directory:
+            Root = Path(Directory)
+            Manager = SessionCacheManager(DefaultDirectory=Root / "default")
+            OlderId = "older_12345678"
+            NewerId = "newer_12345678"
+            OlderPath = Path(Manager.save(OlderId, {"results": []})["cache_file"])
+            Manager.save(NewerId, {"results": []})
+            NewerPath = Path(
+                Manager.relocate(NewerId, str(Root / "custom"))["cache_file"]
             )
-            os.utime(older_path, (1_000, 1_000))
-            os.utime(newer_path, (2_000, 2_000))
+            Os.utime(OlderPath, (1_000, 1_000))
+            Os.utime(NewerPath, (2_000, 2_000))
 
-            sessions = manager.list_sessions()
+            Sessions = Manager.ListSessions()
 
-            self.assertEqual([item["session_id"] for item in sessions], [newer_id, older_id])
-            self.assertEqual(Path(sessions[0]["cache_file"]), newer_path)
-            self.assertEqual(Path(sessions[1]["cache_file"]), older_path)
-            self.assertTrue(all(item["loadable"] for item in sessions))
+            self.assertEqual([Item["session_id"] for Item in Sessions], [NewerId, OlderId])
+            self.assertEqual(Path(Sessions[0]["cache_file"]), NewerPath)
+            self.assertEqual(Path(Sessions[1]["cache_file"]), OlderPath)
+            self.assertTrue(all(Item["loadable"] for Item in Sessions))
 
-    def test_frontend_creates_restorable_url_sessions(self):
-        index_html = (APP_DIR / "static" / "index.html").read_text()
-        app_js = (APP_DIR / "static" / "app.js").read_text()
+    def testFrontendCreatesRestorableUrlSessions(self):
+        IndexHtml = (APP_DIR / "static" / "index.html").read_text()
+        AppJs = (APP_DIR / "static" / "app.js").read_text()
 
-        self.assertIn('aria-label="Application version 65">v65</span>', index_html)
-        self.assertIn('id="sessionIndicator"', index_html)
-        self.assertIn('id="saveLocationHeading">Save File Location</h2>', index_html)
-        self.assertIn('id="saveLocationInput"', index_html)
-        self.assertIn('id="saveLocationButton" type="submit">Apply</button>', index_html)
-        self.assertIn('id="loadCacheHeading">Load Cache</h2>', index_html)
-        self.assertIn('id="cacheSelect"', index_html)
-        self.assertIn('id="loadCacheButton"', index_html)
-        self.assertIn('id="refreshCachesButton"', index_html)
-        self.assertIn("function ensureSessionId()", app_js)
-        self.assertIn("function setSaveFileLocation(directory, cacheFile = '')", app_js)
-        self.assertIn("/location`,", app_js)
-        self.assertIn("function restoreSessionState(state)", app_js)
-        self.assertIn("async function refreshSessionCacheList()", app_js)
-        self.assertIn("window.location.assign", app_js)
-        self.assertIn("sessionReadyPromise = initializeSession();", app_js)
-        self.assertIn("/analysis-sessions/", app_js)
+        self.assertIn('aria-label="Application version 66">v66</span>', IndexHtml)
+        self.assertIn('id="SessionIndicator"', IndexHtml)
+        self.assertIn('id="SaveLocationHeading">Save File Location</h2>', IndexHtml)
+        self.assertIn('id="CacheFolderThing"', IndexHtml)
+        self.assertIn('id="SaveLocationButton" type="submit">Apply</button>', IndexHtml)
+        self.assertIn('id="LoadCacheHeading">Load Cache</h2>', IndexHtml)
+        self.assertIn('id="CachePickThing"', IndexHtml)
+        self.assertIn('id="LoadCacheButton"', IndexHtml)
+        self.assertIn('id="RefreshCachesButton"', IndexHtml)
+        self.assertIn("function EnsureSessionId()", AppJs)
+        self.assertIn("function SetSaveFileLocation(Directory, CacheFile = '')", AppJs)
+        self.assertIn("/location`,", AppJs)
+        self.assertIn("function RestoreSessionState(State)", AppJs)
+        self.assertIn("async function RefreshSessionCacheList()", AppJs)
+        self.assertIn("window.location.assign", AppJs)
+        self.assertIn("SessionReadyPromise = OpenRun();", AppJs)
+        self.assertIn("/analysis-sessions/", AppJs)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    Unittest.RunApp()

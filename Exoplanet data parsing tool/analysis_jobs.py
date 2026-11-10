@@ -1,29 +1,31 @@
-"""Background process management for long-running light-curve analyses."""
+"""Run light-curve analyses in cancellable background processes."""
 
-import inspect
-from datetime import datetime, timezone
-from importlib import metadata as package_metadata
-import json
-import hashlib
-import math
-import multiprocessing
-import os
-import signal
-import statistics
-import sys
-import threading
-import time
-import uuid
+#MARK: imports
+import inspect as Inspect
+from datetime import datetime as Datetime, timezone as Timezone
+from importlib import metadata as PackageMetadata
+import json as Json
+import hashlib as Hashlib
+import math as Math
+import multiprocessing as Multiprocessing
+import os as Os
+import signal as Signal
+import statistics as Statistics
+import sys as Sys
+import threading as Threading
+import time as Time
+import uuid as Uuid
 
-import numpy as np
+import numpy as Np
 
-from analysis import analyze
+from analysis import RunCurve
 
 
+#MARK: core stuffs
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 RESULT_SCHEMA_VERSION = 2
-ANALYSIS_VERSION = "2026.11.05.2"
-APP_VERSION = "65"
+ANALYSIS_VERSION = "2026.11.10.1"
+APP_VERSION = "66"
 PROGRESS_FIELDS = ("completed_trials", "total_trials", "estimated_remaining_seconds",
                    "eta_lower_seconds", "eta_upper_seconds", "eta_scope", "work_completed",
                    "work_total", "remaining_seconds_range", "eta_state", "search_elapsed_seconds",
@@ -31,575 +33,632 @@ PROGRESS_FIELDS = ("completed_trials", "total_trials", "estimated_remaining_seco
                    "eta_sample_seconds", "eta_variation")
 
 
+#MARK: run progress
 class ExecutionTelemetry:
-    """Bounded evidence for auditing a completed job without retaining its inputs."""
+    """Keep job timings and a bounded sample of progress updates."""
 
-    def __init__(self, history_limit=256):
-        self.history_limit = max(8, int(history_limit))
-        self.history = []
-        self.sample_interval = 5.0
-        self.sampled = False
-        self.stages = []
-        self.searches = []
-        self.current_stage = None
-        self.last_search_elapsed = None
+    #MARK: event timing
+    def __init__(self, HistoryLimit=256):
+        self.HistoryLimit = max(8, int(HistoryLimit))
+        self.History = []
+        self.SampleInterval = 5.0
+        self.Sampled = False
+        self.Stages = []
+        self.Searches = []
+        self.CurrStage = None
+        self.LastSearchElapsed = None
 
-    def update(self, stage, label, details, elapsed):
-        elapsed = max(0.0, float(elapsed))
-        changed = self.current_stage is None or stage != self.current_stage["stage"]
-        if changed:
-            self._close_stage(elapsed)
-            self.current_stage = {"stage": str(stage), "stage_label": str(label),
-                                  "started_elapsed_seconds": elapsed}
-        progress = cleaned_progress_details(details)
-        search_id = None
-        if progress.get("total_trials") is not None and progress.get("completed_trials") is not None:
-            search_elapsed = progress.get("search_elapsed_seconds")
-            new_search = (not self.searches or self.searches[-1].get("finished_elapsed_seconds") is not None
-                          or (search_elapsed is not None and self.last_search_elapsed is not None
-                              and search_elapsed < self.last_search_elapsed))
-            # A repeated final notification must not create an empty search.
-            if new_search and not progress.get("search_complete"):
-                self.searches.append({"search_id": len(self.searches) + 1,
-                    "started_elapsed_seconds": max(0.0, elapsed - (search_elapsed or 0.0)),
-                    "total_trials": progress["total_trials"]})
-            if self.searches:
-                search = self.searches[-1]
-                search_id = search["search_id"]
-                search["completed_trials"] = progress["completed_trials"]
-                if progress.get("search_complete"):
-                    search["finished_elapsed_seconds"] = elapsed
-                    search["duration_seconds"] = max(0.0, elapsed - search["started_elapsed_seconds"])
-            self.last_search_elapsed = search_elapsed
-        snapshot = {"elapsed_seconds": elapsed, "stage": str(stage), **progress}
-        if search_id is not None:
-            snapshot["search_id"] = search_id
-        previous = self.history[-1] if self.history else {}
-        eta_changed = progress.get("eta_state") != previous.get("eta_state")
-        if (not self.history or changed or eta_changed or progress.get("search_complete")
-                or elapsed - previous.get("elapsed_seconds", 0.0) >= self.sample_interval):
-            self.history.append(snapshot)
-            if len(self.history) > self.history_limit:
-                # Preserve first/latest samples and thin older observations.
-                latest = self.history[-1]
-                self.history = self.history[::2]
-                if self.history[-1] is not latest:
-                    self.history.append(latest)
-                self.sample_interval *= 2.0
-                self.sampled = True
+    #MARK: run progress
+    def update(self, Stage, Label, Details, Elapsed):
+        Elapsed = max(0.0, float(Elapsed))
+        Changed = self.CurrStage is None or Stage != self.CurrStage["stage"]
+        if Changed:
+            self._CloseStage(Elapsed)
+            self.CurrStage = {"stage": str(Stage), "stage_label": str(Label),
+                                  "started_elapsed_seconds": Elapsed}
+        Progress = CleanedProgressDetails(Details)
+        SearchId = self._UpdateSearch(Progress, Elapsed)
+        Snapshot = {"elapsed_seconds": Elapsed, "stage": str(Stage), **Progress}
+        if SearchId is not None:
+            Snapshot["search_id"] = SearchId
+        Prev = self.History[-1] if self.History else {}
+        EtaChanged = Progress.get("eta_state") != Prev.get("eta_state")
+        # keep stage changes even when the normal sampling interval has not passed.
+        if (not self.History or Changed or EtaChanged or Progress.get("search_complete")
+                or Elapsed - Prev.get("elapsed_seconds", 0.0) >= self.SampleInterval):
+            self.History.append(Snapshot)
+            if len(self.History) > self.HistoryLimit:
+                # keep the first and latest samples as older history is thinned.
+                Latest = self.History[-1]
+                self.History = self.History[::2]
+                if self.History[-1] is not Latest:
+                    self.History.append(Latest)
+                self.SampleInterval *= 2.0
+                self.Sampled = True
 
-    def _close_stage(self, elapsed):
-        if self.current_stage is not None:
-            stage = {**self.current_stage, "finished_elapsed_seconds": elapsed,
-                     "duration_seconds": max(0.0, elapsed - self.current_stage["started_elapsed_seconds"])}
-            self.stages.append(stage)
-            self.stages = self.stages[-64:]
-            self.current_stage = None
+    #MARK: separating search runs
+    def _UpdateSearch(self, Progress, Elapsed):
+        if Progress.get("total_trials") is None or Progress.get("completed_trials") is None:
+            return None
+        SearchElapsed = Progress.get("search_elapsed_seconds")
+        NewSearch = (
+            not self.Searches
+            or self.Searches[-1].get("finished_elapsed_seconds") is not None
+            or (SearchElapsed is not None and self.LastSearchElapsed is not None
+                and SearchElapsed < self.LastSearchElapsed)
+        )
+        # tls can send the final update twice. that is still one search.
+        if NewSearch and not Progress.get("search_complete"):
+            self.Searches.append({
+                "search_id": len(self.Searches) + 1,
+                "started_elapsed_seconds": max(0.0, Elapsed - (SearchElapsed or 0.0)),
+                "total_trials": Progress["total_trials"],
+            })
+        self.LastSearchElapsed = SearchElapsed
+        if not self.Searches:
+            return None
+        Search = self.Searches[-1]
+        Search["completed_trials"] = Progress["completed_trials"]
+        if Progress.get("search_complete"):
+            Search["finished_elapsed_seconds"] = Elapsed
+            Search["duration_seconds"] = max(0.0, Elapsed - Search["started_elapsed_seconds"])
+        return Search["search_id"]
 
-    def finish(self, stage, label, elapsed, queue_wait=0.0):
-        self.update(stage, label, {}, elapsed)
-        self._close_stage(elapsed)
-        searches = {search["search_id"]: search for search in self.searches}
-        history = [dict(snapshot) for snapshot in self.history]
-        errors, coverage = [], []
-        for snapshot in history:
-            forecast = snapshot.get("estimated_remaining_seconds")
-            search_end = searches.get(snapshot.get("search_id"), {}).get("finished_elapsed_seconds")
-            if forecast is None or search_end is None:
+    #MARK: event timing
+    def _CloseStage(self, Elapsed):
+        if self.CurrStage is not None:
+            Stage = {**self.CurrStage, "finished_elapsed_seconds": Elapsed,
+                     "duration_seconds": max(0.0, Elapsed - self.CurrStage["started_elapsed_seconds"])}
+            self.Stages.append(Stage)
+            self.Stages = self.Stages[-64:]
+            self.CurrStage = None
+
+    #MARK: run progress
+    def finish(self, Stage, Label, Elapsed, QueueWait=0.0):
+        self.update(Stage, Label, {}, Elapsed)
+        self._CloseStage(Elapsed)
+        Searches = {Search["search_id"]: Search for Search in self.Searches}
+        History = [dict(Snapshot) for Snapshot in self.History]
+        Errors, Coverage = [], []
+        # a cancelled search has no completion time to compare against.
+        for Snapshot in History:
+            Forecast = Snapshot.get("estimated_remaining_seconds")
+            SearchEnd = Searches.get(Snapshot.get("search_id"), {}).get("finished_elapsed_seconds")
+            if Forecast is None or SearchEnd is None:
                 continue
-            actual = max(0.0, search_end - snapshot["elapsed_seconds"])
-            error = forecast - actual
-            snapshot.update({"actual_remaining_seconds": actual, "eta_error_seconds": error})
-            errors.append(abs(error))
-            low, high = snapshot.get("eta_lower_seconds"), snapshot.get("eta_upper_seconds")
-            if low is not None and high is not None:
-                covered = low <= actual <= high
-                snapshot["range_contains_actual"] = covered
-                coverage.append(covered)
-        return {"schema_version": 1, "elapsed_seconds": max(0.0, float(elapsed)),
-                "queue_wait_seconds": max(0.0, float(queue_wait)), "stage_durations": self.stages,
-                "searches": self.searches, "progress_history": history,
-                "progress_history_limit": self.history_limit,
-                "progress_history_sampled": self.sampled,
-                "eta_audit": {"scope": "search", "retained_forecasts_audited": len(errors),
-                    "mean_absolute_error_seconds": statistics.mean(errors) if errors else None,
-                    "median_absolute_error_seconds": statistics.median(errors) if errors else None,
-                    "ranges_audited": len(coverage),
-                    "observed_range_coverage_fraction": statistics.mean(coverage) if coverage else None,
+            Actual = max(0.0, SearchEnd - Snapshot["elapsed_seconds"])
+            Error = Forecast - Actual
+            Snapshot.update({"actual_remaining_seconds": Actual, "eta_error_seconds": Error})
+            Errors.append(abs(Error))
+            Low, High = Snapshot.get("eta_lower_seconds"), Snapshot.get("eta_upper_seconds")
+            if Low is not None and High is not None:
+                Covered = Low <= Actual <= High
+                Snapshot["range_contains_actual"] = Covered
+                Coverage.append(Covered)
+        return {"schema_version": 1, "elapsed_seconds": max(0.0, float(Elapsed)),
+                "queue_wait_seconds": max(0.0, float(QueueWait)), "stage_durations": self.Stages,
+                "searches": self.Searches, "progress_history": History,
+                "progress_history_limit": self.HistoryLimit,
+                "progress_history_sampled": self.Sampled,
+                "eta_audit": {"scope": "search", "retained_forecasts_audited": len(Errors),
+                    "mean_absolute_error_seconds": Statistics.mean(Errors) if Errors else None,
+                    "median_absolute_error_seconds": Statistics.median(Errors) if Errors else None,
+                    "ranges_audited": len(Coverage),
+                    "observed_range_coverage_fraction": Statistics.mean(Coverage) if Coverage else None,
                     "note": "Audit uses retained forecasts only; observed throughput ranges are not confidence intervals."}}
 
 
-def annotate_analysis_result(result, options=None, source_file=None):
-    """Stamp analysis provenance once; cache saves must never refresh this date."""
-    if not isinstance(result, dict):
+#MARK: run progress
+def AnnotateAnalysisResult(Result, Options=None, SourceFile=None):
+    """Add version and source metadata to a newly computed result."""
+    if not isinstance(Result, dict):
         raise ValueError("The analysis worker did not return a result object.")
-    options = options or {}
-    previous_provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
-    source_file = (source_file or (options.get("_input_metadata") or {}).get("source_file")
-                   or result.get("source_file") or previous_provenance.get("source_file"))
-    dependencies = {}
-    for name in ("numpy", "scipy", "astropy", "transitleastsquares", "batman-package", "numba"):
+    Options = Options or {}
+    PrevProvenance = Result.get("provenance") if isinstance(Result.get("provenance"), dict) else {}
+    SourceFile = (SourceFile or (Options.get("_input_metadata") or {}).get("source_file")
+                   or Result.get("source_file") or PrevProvenance.get("source_file"))
+    #MARK: recording the environment
+    Dependencies = {}
+    for Name in ("numpy", "scipy", "astropy", "transitleastsquares", "batman-package", "numba"):
         try:
-            dependencies[name] = package_metadata.version(name)
-        except package_metadata.PackageNotFoundError:
-            dependencies[name] = "unavailable"
-    analyzed_at = datetime.now(timezone.utc).isoformat()
-    effective = result.get("effective_settings") or {k: v for k, v in options.items() if not k.startswith("_")}
-    result["result_schema_version"] = RESULT_SCHEMA_VERSION
-    result["analyzed_at"] = analyzed_at
-    result["provenance"] = {"app_version": APP_VERSION, "analysis_version": ANALYSIS_VERSION,
-        "result_schema_version": RESULT_SCHEMA_VERSION, "analyzed_at": analyzed_at,
-        "dependency_versions": dependencies, "python_version": sys.version.split()[0], "effective_settings": effective,
-        "source_file": source_file, "legacy": False}
-    if options.get("_input_metadata") is not None:
-        result.setdefault("input_metadata", options["_input_metadata"])
-    if options.get("_cleaning_report") is not None:
-        result.setdefault("cleaning", options["_cleaning_report"])
-    for signal_result in result.get("signals", []):
-        if isinstance(signal_result, dict):
-            signal_analyzed_at = signal_result.get("analyzed_at") or analyzed_at
-            signal_result["result_schema_version"] = RESULT_SCHEMA_VERSION
-            signal_result["analyzed_at"] = signal_analyzed_at
-            signal_result["provenance"] = {**result["provenance"],
-                "analyzed_at": signal_analyzed_at,
-                "effective_settings": signal_result.get("effective_settings") or effective}
-            if result.get("input_metadata") is not None:
-                signal_result.setdefault("input_metadata", result["input_metadata"])
-            if signal_result.get("cleaning_report") is not None:
-                signal_result.setdefault("cleaning", signal_result["cleaning_report"])
-            elif result.get("cleaning") is not None:
-                signal_result.setdefault("cleaning", result["cleaning"])
-    # Fail the job explicitly rather than send NaN/Infinity that browser JSON
-    # parsers reject, or discover an unsupported scalar only while polling.
+            Dependencies[Name] = PackageMetadata.version(Name)
+        except PackageMetadata.PackageNotFoundError:
+            Dependencies[Name] = "unavailable"
+    AnalyzedAt = Datetime.now(Timezone.utc).isoformat()
+    Effective = Result.get("effective_settings") or {K: V for K, V in Options.items() if not K.startswith("_")}
+    Result["result_schema_version"] = RESULT_SCHEMA_VERSION
+    Result["analyzed_at"] = AnalyzedAt
+    Result["provenance"] = {"app_version": APP_VERSION, "analysis_version": ANALYSIS_VERSION,
+        "result_schema_version": RESULT_SCHEMA_VERSION, "analyzed_at": AnalyzedAt,
+        "dependency_versions": Dependencies, "python_version": Sys.version.split()[0], "effective_settings": Effective,
+        "source_file": SourceFile, "legacy": False}
+    if Options.get("_input_metadata") is not None:
+        Result.setdefault("input_metadata", Options["_input_metadata"])
+    if Options.get("_cleaning_report") is not None:
+        Result.setdefault("cleaning", Options["_cleaning_report"])
+    #MARK: run progress
+    # a later signal can have different search settings from the first one.
+    for SignalResult in Result.get("signals", []):
+        if isinstance(SignalResult, dict):
+            SignalAnalyzedAt = SignalResult.get("analyzed_at") or AnalyzedAt
+            SignalResult["result_schema_version"] = RESULT_SCHEMA_VERSION
+            SignalResult["analyzed_at"] = SignalAnalyzedAt
+            SignalResult["provenance"] = {**Result["provenance"],
+                "analyzed_at": SignalAnalyzedAt,
+                "effective_settings": SignalResult.get("effective_settings") or Effective}
+            if Result.get("input_metadata") is not None:
+                SignalResult.setdefault("input_metadata", Result["input_metadata"])
+            if SignalResult.get("cleaning_report") is not None:
+                SignalResult.setdefault("cleaning", SignalResult["cleaning_report"])
+            elif Result.get("cleaning") is not None:
+                SignalResult.setdefault("cleaning", Result["cleaning"])
+    # catch invalid result values here, before a browser tries to read them.
     try:
-        json.dumps(result, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Analysis returned nonfinite or unsupported result values; no invalid JSON result was saved.") from exc
-    return result
+        Json.dumps(Result, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as Exc:
+        raise ValueError("Analysis returned nonfinite or unsupported result values; no invalid JSON result was saved.") from Exc
+    return Result
 
 
-def cleaned_progress_details(details):
-    """Only carry finite, bounded progress values across the worker boundary."""
-    output = {}
-    for key in PROGRESS_FIELDS:
-        value = details.get(key)
-        if key == "search_complete":
-            if isinstance(value, bool):
-                output[key] = value
-        elif key in {"eta_scope", "eta_state", "eta_method"}:
-            if isinstance(value, str):
-                output[key] = value[:40]
-        elif key == "remaining_seconds_range":
-            if isinstance(value, (list, tuple)) and len(value) == 2:
-                numbers = [float(v) for v in value if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0]
-                if len(numbers) == 2:
-                    output[key] = sorted(numbers)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
-            output[key] = value
-        elif value is None:
-            output[key] = None
-    return output
+#MARK: worker stuffs
+def CleanedProgressDetails(Details):
+    """Keep the progress fields we can safely send to the browser."""
+    Output = {}
+    for Key in PROGRESS_FIELDS:
+        Value = Details.get(Key)
+        if Key == "search_complete":
+            if isinstance(Value, bool):
+                Output[Key] = Value
+        elif Key in {"eta_scope", "eta_state", "eta_method"}:
+            if isinstance(Value, str):
+                Output[Key] = Value[:40]
+        elif Key == "remaining_seconds_range":
+            if isinstance(Value, (list, tuple)) and len(Value) == 2:
+                Numbers = [float(V) for V in Value if isinstance(V, (int, float)) and Math.isfinite(V) and V >= 0]
+                if len(Numbers) == 2:
+                    Output[Key] = sorted(Numbers)
+        elif isinstance(Value, (int, float)) and not isinstance(Value, bool) and Math.isfinite(Value) and Value >= 0:
+            Output[Key] = Value
+        elif Value is None:
+            Output[Key] = None
+    return Output
 
 
-def _analysis_worker(send_connection, time_values, flux_values, options, runner, source_file=None):
-    """Run one analysis in an isolated process and return one terminal message."""
-    def publish_progress(stage, stage_label, details=None, **extra):
+#MARK: worker stuffs
+def _AnalysisWorker(SendConnection, TimeValues, FluxValues, Options, Runner, SourceFile=None):
+    """Run an analysis and report either its result or its error."""
+    #MARK: run progress
+    def PublishProgress(Stage, StageLabel, Details=None, **Extra):
         try:
-            send_connection.send({
+            SendConnection.send({
                 "status": "progress",
-                "stage": str(stage),
-                "stage_label": str(stage_label),
-                **cleaned_progress_details({**(details or {}), **extra}),
+                "stage": str(Stage),
+                "stage_label": str(StageLabel),
+                **CleanedProgressDetails({**(Details or {}), **Extra}),
             })
         except (BrokenPipeError, EOFError, OSError):
             pass
 
     try:
-        if hasattr(os, "setsid"):
+        # give the job its own process group so cancellation reaches its workers.
+        if hasattr(Os, "setsid"):
             try:
-                os.setsid()
+                Os.setsid()
             except OSError:
                 pass
+        #MARK: callback compatibility
+        # older runners still use progress_callback.
         try:
-            parameters = inspect.signature(runner).parameters.values()
-            supports_progress = any(
-                parameter.name == "progress_callback"
-                or parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
+            Parameters = Inspect.signature(Runner).parameters.values()
+            Parameters = list(Parameters)
+            if any(Parameter.name == "ProgressCallback" for Parameter in Parameters):
+                ProgressKeyword = "ProgressCallback"
+            elif any(Parameter.name == "progress_callback" for Parameter in Parameters):
+                ProgressKeyword = "progress_callback"
+            elif any(Parameter.kind == Inspect.Parameter.VAR_KEYWORD for Parameter in Parameters):
+                ProgressKeyword = "ProgressCallback"
+            else:
+                ProgressKeyword = None
         except (TypeError, ValueError):
-            supports_progress = False
-        if supports_progress:
-            result = runner(
-                time_values,
-                flux_values,
-                options,
-                progress_callback=publish_progress,
+            ProgressKeyword = None
+        if ProgressKeyword:
+            Result = Runner(
+                TimeValues,
+                FluxValues,
+                Options,
+                **{ProgressKeyword: PublishProgress},
             )
         else:
-            result = runner(time_values, flux_values, options)
-        message = {"status": "completed", "result": annotate_analysis_result(result, options, source_file)}
-    except BaseException as exc:  # The parent must hear about worker-level failures.
-        message = {"status": "failed", "error": str(exc) or exc.__class__.__name__}
+            Result = Runner(TimeValues, FluxValues, Options)
+        Message = {"status": "completed", "result": AnnotateAnalysisResult(Result, Options, SourceFile)}
+    except BaseException as Exc:  # report worker exits as well as ordinary errors.
+        Message = {"status": "failed", "error": str(Exc) or Exc.__class__.__name__}
 
+    #MARK: core stuffs
     try:
-        send_connection.send(message)
+        SendConnection.send(Message)
     except (BrokenPipeError, EOFError, OSError):
         pass
     finally:
-        send_connection.close()
+        SendConnection.close()
 
 
+#MARK: worker stuffs
 class AnalysisJobManager:
-    """Queue analyses, isolate them from HTTP requests, and support cancellation."""
+    """Queue analyses and manage their worker processes."""
 
+    #MARK: queue settings
     def __init__(
         self,
-        max_running=1,
-        retention_seconds=3600,
-        start_method="spawn",
-        runner=analyze,
+        MaxRunning=1,
+        RetentionSeconds=3600,
+        StartMethod="spawn",
+        Runner=RunCurve,
+        **LegacyOptions,
     ):
-        self.max_running = max(1, int(max_running))
-        self.retention_seconds = max(60, int(retention_seconds))
-        self.context = multiprocessing.get_context(start_method)
-        self.runner = runner
-        self.jobs = {}
-        self.lock = threading.RLock()
-        self.closed = False
+        #MARK: old calls
+        # accept the old names, but do not silently accept other extra settings.
+        MaxRunning = LegacyOptions.pop("max_running", MaxRunning)
+        RetentionSeconds = LegacyOptions.pop("retention_seconds", RetentionSeconds)
+        StartMethod = LegacyOptions.pop("start_method", StartMethod)
+        if LegacyOptions:
+            raise TypeError(f"Unknown job options: {', '.join(LegacyOptions)}")
+        self.MaxRunning = max(1, int(MaxRunning))
+        self.RetentionSeconds = max(60, int(RetentionSeconds))
+        self.Context = Multiprocessing.get_context(StartMethod)
+        self.Runner = Runner
+        self.Jobs = {}
+        self.Lock = Threading.RLock()
+        self.Closed = False
 
-    def submit(self, time_values, flux_values, options, source_file=None):
-        job_id = uuid.uuid4().hex
-        now = time.time()
-        record = {
-            "job_id": job_id,
+    #MARK: worker stuffs
+    def submit(self, TimeValues, FluxValues, Options, SourceFile=None):
+        JobId = Uuid.uuid4().hex
+        Now = Time.time()
+        Record = {
+            "job_id": JobId,
             "status": "queued",
-            "source_file": source_file,
-            "submitted_at": now,
+            "source_file": SourceFile,
+            "submitted_at": Now,
             "started_at": None,
             "finished_at": None,
-            "time_values": time_values,
-            "flux_values": flux_values,
-            "options": options,
+            "time_values": TimeValues,
+            "flux_values": FluxValues,
+            "options": Options,
             "process": None,
             "connection": None,
             "result": None,
             "error": None,
             "stage": "queued",
             "stage_label": "Waiting for analysis worker",
-            "batch_id": options.get("_batch_id"),
-            "request_id": options.get("_request_id"),
+            "batch_id": Options.get("_batch_id"),
+            "request_id": Options.get("_request_id"),
             "progress": {},
             "telemetry": None,
             "execution": None,
         }
-        with self.lock:
-            if self.closed:
+        with self.Lock:
+            if self.Closed:
                 raise RuntimeError("Analysis job manager is shutting down.")
-            self._cleanup_locked(now)
-            if record["request_id"]:
-                digest = hashlib.sha256(json.dumps({
-                    "source_file": source_file, "settings": options,
+            self._CleanupLocked(Now)
+            #MARK: core stuffs
+            # a retry should reconnect to the same work, not start another search.
+            if Record["request_id"]:
+                Digest = Hashlib.sha256(Json.dumps({
+                    "source_file": SourceFile, "settings": Options,
                 }, sort_keys=True, default=str).encode())
-                digest.update(np.asarray(time_values, dtype=float).tobytes())
-                digest.update(np.asarray(flux_values, dtype=float).tobytes())
-                fingerprint = digest.hexdigest()
-                record["request_fingerprint"] = fingerprint
-                for existing in self.jobs.values():
-                    if existing.get("request_id") == record["request_id"]:
-                        if existing.get("request_fingerprint") != fingerprint:
+                Digest.update(Np.asarray(TimeValues, dtype=float).tobytes())
+                Digest.update(Np.asarray(FluxValues, dtype=float).tobytes())
+                Fingerprint = Digest.hexdigest()
+                Record["request_fingerprint"] = Fingerprint
+                for Existing in self.Jobs.values():
+                    if Existing.get("request_id") == Record["request_id"]:
+                        if Existing.get("request_fingerprint") != Fingerprint:
                             raise ValueError("This submission ID was already used for different analysis inputs.")
-                        return self._public_record_locked(existing, include_result=True)
-            self.jobs[job_id] = record
-            self._schedule_locked()
-            return self._public_record_locked(record, include_result=False)
+                        return self._PublicRecordLocked(Existing, IncludeResult=True)
+            self.Jobs[JobId] = Record
+            self._ScheduleLocked()
+            return self._PublicRecordLocked(Record, IncludeResult=False)
 
-    def get(self, job_id, include_result=True):
-        with self.lock:
-            self._cleanup_locked(time.time())
-            record = self.jobs.get(job_id)
-            if record is None:
+    #MARK: worker stuffs
+    def get(self, JobId, IncludeResult=True):
+        with self.Lock:
+            self._CleanupLocked(Time.time())
+            Record = self.Jobs.get(JobId)
+            if Record is None:
                 return None
-            return self._public_record_locked(record, include_result=include_result)
+            return self._PublicRecordLocked(Record, IncludeResult=IncludeResult)
 
-    def find_by_request_id(self, request_id, include_result=True):
-        """Reconnect after an accepted submission whose response was lost."""
-        if not isinstance(request_id, str) or not request_id or len(request_id) > 160:
+    def FindByRequestId(self, RequestId, IncludeResult=True):
+        """Find a job when its submission response never reached the browser."""
+        if not isinstance(RequestId, str) or not RequestId or len(RequestId) > 160:
             return None
-        with self.lock:
-            self._cleanup_locked(time.time())
-            for record in self.jobs.values():
-                if record.get("request_id") == request_id:
-                    return self._public_record_locked(record, include_result=include_result)
+        with self.Lock:
+            self._CleanupLocked(Time.time())
+            for Record in self.Jobs.values():
+                if Record.get("request_id") == RequestId:
+                    return self._PublicRecordLocked(Record, IncludeResult=IncludeResult)
         return None
 
-    def cancel(self, job_id):
-        process = None
-        with self.lock:
-            record = self.jobs.get(job_id)
-            if record is None:
+    #MARK: cancel runs
+    def cancel(self, JobId):
+        Process = None
+        with self.Lock:
+            Record = self.Jobs.get(JobId)
+            if Record is None:
                 return None
-            if record["status"] in TERMINAL_STATES:
-                return self._public_record_locked(record)
-            if record["status"] == "queued":
-                record["status"] = "cancelled"
-                record["finished_at"] = time.time()
-                record["stage"] = "cancelled"
-                record["stage_label"] = "Cancelled"
-                self._drop_inputs_locked(record)
-                self._schedule_locked()
-                return self._public_record_locked(record)
-            record["status"] = "cancelling"
-            record["stage"] = "cancelling"
-            record["stage_label"] = "Cancelling analysis"
-            process = record.get("process")
+            if Record["status"] in TERMINAL_STATES:
+                return self._PublicRecordLocked(Record)
+            if Record["status"] == "queued":
+                self._MarkCancelledLocked(Record)
+                self._ScheduleLocked()
+                return self._PublicRecordLocked(Record)
+            Record["status"] = "cancelling"
+            Record["stage"] = "cancelling"
+            Record["stage_label"] = "Cancelling analysis"
+            Process = Record.get("process")
 
-        self._terminate_process(process)
+        self._TerminateProcess(Process)
 
-        with self.lock:
-            record = self.jobs.get(job_id)
-            if record is None:
+        with self.Lock:
+            Record = self.Jobs.get(JobId)
+            if Record is None:
                 return None
-            if record["status"] not in TERMINAL_STATES:
-                record["status"] = "cancelled"
-                record["finished_at"] = time.time()
-                record["error"] = None
-                record["result"] = None
-                record["stage"] = "cancelled"
-                record["stage_label"] = "Cancelled"
-                self._drop_inputs_locked(record)
-            self._schedule_locked()
-            return self._public_record_locked(record)
+            if Record["status"] not in TERMINAL_STATES:
+                self._MarkCancelledLocked(Record)
+                Record["error"] = None
+                Record["result"] = None
+            self._ScheduleLocked()
+            return self._PublicRecordLocked(Record)
 
+    #MARK: core stuffs
     def shutdown(self):
-        with self.lock:
-            if self.closed:
+        with self.Lock:
+            if self.Closed:
                 return
-            self.closed = True
-            active = [
-                record.get("process")
-                for record in self.jobs.values()
-                if record["status"] in {"running", "cancelling"}
+            self.Closed = True
+            Active = [
+                Record.get("process")
+                for Record in self.Jobs.values()
+                if Record["status"] in {"running", "cancelling"}
             ]
-            for record in self.jobs.values():
-                if record["status"] == "queued":
-                    record["status"] = "cancelled"
-                    record["finished_at"] = time.time()
-                    record["stage"] = "cancelled"
-                    record["stage_label"] = "Cancelled"
-                    self._drop_inputs_locked(record)
+            for Record in self.Jobs.values():
+                if Record["status"] == "queued":
+                    self._MarkCancelledLocked(Record)
 
-        for process in active:
-            self._terminate_process(process)
+        for Process in Active:
+            self._TerminateProcess(Process)
 
-    def _running_count_locked(self):
+    #MARK: worker stuffs
+    def _RunningCountLocked(self):
         return sum(
-            record["status"] in {"running", "cancelling"}
-            for record in self.jobs.values()
+            Record["status"] in {"running", "cancelling"}
+            for Record in self.Jobs.values()
         )
 
-    def _schedule_locked(self):
-        if self.closed:
+    #MARK: worker stuffs
+    def _ScheduleLocked(self):
+        if self.Closed:
             return
-        while self._running_count_locked() < self.max_running:
-            queued = next(
-                (record for record in self.jobs.values() if record["status"] == "queued"),
+        while self._RunningCountLocked() < self.MaxRunning:
+            Queued = next(
+                (Record for Record in self.Jobs.values() if Record["status"] == "queued"),
                 None,
             )
-            if queued is None:
+            if Queued is None:
                 return
-            self._launch_locked(queued)
+            self._LaunchLocked(Queued)
 
-    def _launch_locked(self, record):
-        receive_connection, send_connection = self.context.Pipe(duplex=False)
-        process = self.context.Process(
-            target=_analysis_worker,
+    #MARK: worker stuffs
+    def _LaunchLocked(self, Record):
+        ReceiveConnection, SendConnection = self.Context.Pipe(duplex=False)
+        Process = self.Context.Process(
+            target=_AnalysisWorker,
             args=(
-                send_connection,
-                record["time_values"],
-                record["flux_values"],
-                record["options"],
-                self.runner,
-                record.get("source_file"),
+                SendConnection,
+                Record["time_values"],
+                Record["flux_values"],
+                Record["options"],
+                self.Runner,
+                Record.get("source_file"),
             ),
-            name=f"transit-analysis-{record['job_id'][:8]}",
+            name=f"transit-analysis-{Record['job_id'][:8]}",
         )
-        process.daemon = False
-        record["status"] = "running"
-        record["started_at"] = time.time()
-        record["telemetry"] = ExecutionTelemetry()
-        record["telemetry"].update("starting", "Starting analysis", {}, 0.0)
-        record["stage"] = "starting"
-        record["stage_label"] = "Starting analysis"
-        record["process"] = process
-        record["connection"] = receive_connection
+        Process.daemon = False
+        Record["status"] = "running"
+        Record["started_at"] = Time.time()
+        Record["telemetry"] = ExecutionTelemetry()
+        Record["telemetry"].update("starting", "Starting analysis", {}, 0.0)
+        Record["stage"] = "starting"
+        Record["stage_label"] = "Starting analysis"
+        Record["process"] = Process
+        Record["connection"] = ReceiveConnection
         try:
-            process.start()
-        except Exception as exc:
-            receive_connection.close()
-            send_connection.close()
-            record["status"] = "failed"
-            record["error"] = f"Could not start analysis worker: {exc}"
-            record["finished_at"] = time.time()
-            record["stage"] = "failed"
-            record["stage_label"] = "Analysis failed"
-            self._drop_inputs_locked(record)
+            Process.start()
+        except Exception as Exc:
+            ReceiveConnection.close()
+            SendConnection.close()
+            Record["status"] = "failed"
+            Record["error"] = f"Could not start analysis worker: {Exc}"
+            Record["finished_at"] = Time.time()
+            Record["stage"] = "failed"
+            Record["stage_label"] = "Analysis failed"
+            self._DropInputsLocked(Record)
             return
-        send_connection.close()
-        monitor = threading.Thread(
-            target=self._monitor,
-            args=(record["job_id"], process, receive_connection),
+        SendConnection.close()
+        # the monitor waits for messages without blocking http requests.
+        Monitor = Threading.Thread(
+            target=self._Monitor,
+            args=(Record["job_id"], Process, ReceiveConnection),
             daemon=True,
-            name=f"analysis-monitor-{record['job_id'][:8]}",
+            name=f"analysis-monitor-{Record['job_id'][:8]}",
         )
-        monitor.start()
+        Monitor.start()
 
-    def _monitor(self, job_id, process, receive_connection):
-        message = None
+    #MARK: run progress
+    def _Monitor(self, JobId, Process, ReceiveConnection):
+        Message = None
         try:
             while True:
-                incoming = receive_connection.recv()
-                if incoming.get("status") != "progress":
-                    message = incoming
+                Incoming = ReceiveConnection.recv()
+                if Incoming.get("status") != "progress":
+                    Message = Incoming
                     break
-                with self.lock:
-                    record = self.jobs.get(job_id)
-                    if record is None or record["status"] != "running":
+                with self.Lock:
+                    Record = self.Jobs.get(JobId)
+                    if Record is None or Record["status"] != "running":
                         continue
-                    record["stage"] = incoming.get("stage") or record.get("stage")
-                    record["stage_label"] = (
-                        incoming.get("stage_label")
-                        or record.get("stage_label")
+                    Record["stage"] = Incoming.get("stage") or Record.get("stage")
+                    Record["stage_label"] = (
+                        Incoming.get("stage_label")
+                        or Record.get("stage_label")
                     )
-                    record["progress"] = cleaned_progress_details(incoming)
-                    record["progress_updated_at"] = time.time()
-                    record["telemetry"].update(record["stage"], record["stage_label"],
-                        record["progress"], record["progress_updated_at"] - record["started_at"])
+                    Record["progress"] = CleanedProgressDetails(Incoming)
+                    Record["progress_updated_at"] = Time.time()
+                    Record["telemetry"].update(Record["stage"], Record["stage_label"],
+                        Record["progress"], Record["progress_updated_at"] - Record["started_at"])
         except (EOFError, OSError):
             pass
         finally:
-            receive_connection.close()
-            process.join(timeout=2.0)
+            ReceiveConnection.close()
+            Process.join(timeout=2.0)
 
-        with self.lock:
-            record = self.jobs.get(job_id)
-            if record is None:
+        #MARK: worker stuffs
+        with self.Lock:
+            Record = self.Jobs.get(JobId)
+            if Record is None:
                 return
-            if record["status"] in {"cancelled", "cancelling"}:
-                record["status"] = "cancelled"
-                record["stage"] = "cancelled"
-                record["stage_label"] = "Cancelled"
-            elif message and message.get("status") == "completed":
-                record["status"] = "completed"
-                record["result"] = message.get("result")
-                record["stage"] = "completed"
-                record["stage_label"] = "Complete"
+            if Record["status"] in {"cancelled", "cancelling"}:
+                Record["status"] = "cancelled"
+                Record["stage"] = "cancelled"
+                Record["stage_label"] = "Cancelled"
+            elif Message and Message.get("status") == "completed":
+                Record["status"] = "completed"
+                Record["result"] = Message.get("result")
+                Record["stage"] = "completed"
+                Record["stage_label"] = "Complete"
             else:
-                record["status"] = "failed"
-                record["error"] = (
-                    message.get("error")
-                    if message
-                    else f"Analysis worker exited unexpectedly (exit code {process.exitcode})."
+                Record["status"] = "failed"
+                Record["error"] = (
+                    Message.get("error")
+                    if Message
+                    else f"Analysis worker exited unexpectedly (exit code {Process.exitcode})."
                 )
-                record["stage"] = "failed"
-                record["stage_label"] = "Analysis failed"
-            record["finished_at"] = record.get("finished_at") or time.time()
-            telemetry = record.get("telemetry")
-            if telemetry is not None:
-                record["execution"] = telemetry.finish(record["stage"], record["stage_label"],
-                    record["finished_at"] - record["started_at"],
-                    record["started_at"] - record["submitted_at"])
-                if isinstance(record.get("result"), dict):
-                    record["result"]["execution"] = record["execution"]
-                record["telemetry"] = None
-            record["process"] = None
-            record["connection"] = None
-            self._drop_inputs_locked(record)
-            self._schedule_locked()
+                Record["stage"] = "failed"
+                Record["stage_label"] = "Analysis failed"
+            Record["finished_at"] = Record.get("finished_at") or Time.time()
+            Telemetry = Record.get("telemetry")
+            if Telemetry is not None:
+                Record["execution"] = Telemetry.finish(Record["stage"], Record["stage_label"],
+                    Record["finished_at"] - Record["started_at"],
+                    Record["started_at"] - Record["submitted_at"])
+                if isinstance(Record.get("result"), dict):
+                    Record["result"]["execution"] = Record["execution"]
+                Record["telemetry"] = None
+            Record["process"] = None
+            Record["connection"] = None
+            self._DropInputsLocked(Record)
+            self._ScheduleLocked()
 
-    def _public_record_locked(self, record, include_result=True):
-        now = time.time()
-        start = record.get("started_at") or record["submitted_at"]
-        end = record.get("finished_at") or now
-        queued_before = 0
-        if record["status"] == "queued":
-            for item in self.jobs.values():
-                if item is record:
+    #MARK: worker stuffs
+    def _PublicRecordLocked(self, Record, IncludeResult=True):
+        Now = Time.time()
+        Start = Record.get("started_at") or Record["submitted_at"]
+        End = Record.get("finished_at") or Now
+        QueuedBefore = 0
+        if Record["status"] == "queued":
+            for Item in self.Jobs.values():
+                if Item is Record:
                     break
-                if item["status"] == "queued":
-                    queued_before += 1
-        payload = {
-            "job_id": record["job_id"],
-            "status": record["status"],
-            "source_file": record.get("source_file"),
-            "submitted_at": record["submitted_at"],
-            "started_at": record.get("started_at"),
-            "finished_at": record.get("finished_at"),
-            "elapsed_seconds": max(0.0, end - start) if record.get("started_at") else 0.0,
-            "queue_position": queued_before + 1 if record["status"] == "queued" else None,
-            "stage": record.get("stage"),
-            "stage_label": record.get("stage_label"),
-            "batch_id": record.get("batch_id"),
-            "request_id": record.get("request_id"),
-            "queue_wait_seconds": max(0.0, (record.get("started_at") or end) - record["submitted_at"]),
-            "progress_updated_at": record.get("progress_updated_at"),
+                if Item["status"] == "queued":
+                    QueuedBefore += 1
+        Payload = {
+            "job_id": Record["job_id"],
+            "status": Record["status"],
+            "source_file": Record.get("source_file"),
+            "submitted_at": Record["submitted_at"],
+            "started_at": Record.get("started_at"),
+            "finished_at": Record.get("finished_at"),
+            "elapsed_seconds": max(0.0, End - Start) if Record.get("started_at") else 0.0,
+            "queue_position": QueuedBefore + 1 if Record["status"] == "queued" else None,
+            "stage": Record.get("stage"),
+            "stage_label": Record.get("stage_label"),
+            "batch_id": Record.get("batch_id"),
+            "request_id": Record.get("request_id"),
+            "queue_wait_seconds": max(0.0, (Record.get("started_at") or End) - Record["submitted_at"]),
+            "progress_updated_at": Record.get("progress_updated_at"),
         }
-        if record["status"] == "running":
-            payload.update(record.get("progress") or {})
-            if not payload.get("eta_state"):
-                payload["eta_state"] = "available" if payload.get("estimated_remaining_seconds") is not None else "estimating"
-            # An estimate based on old throughput is withdrawn after progress stalls.
-            if record.get("progress_updated_at") and now - record["progress_updated_at"] > 45:
-                payload.update({key: None for key in ("estimated_remaining_seconds", "eta_lower_seconds", "eta_upper_seconds", "remaining_seconds_range")})
-                payload["eta_state"] = "estimating"
+        if Record["status"] == "running":
+            Payload.update(Record.get("progress") or {})
+            if not Payload.get("eta_state"):
+                Payload["eta_state"] = "available" if Payload.get("estimated_remaining_seconds") is not None else "estimating"
+            # stop showing an old eta if the worker has stopped reporting progress.
+            if Record.get("progress_updated_at") and Now - Record["progress_updated_at"] > 45:
+                Payload.update({Key: None for Key in ("estimated_remaining_seconds", "eta_lower_seconds", "eta_upper_seconds", "remaining_seconds_range")})
+                Payload["eta_state"] = "estimating"
         else:
-            payload.update({key: None for key in PROGRESS_FIELDS})
-        if record["status"] == "failed":
-            payload["error"] = record.get("error") or "Analysis failed."
-        if record.get("execution") is not None:
-            payload["execution"] = record["execution"]
-        if include_result and record["status"] == "completed":
-            payload["result"] = record.get("result")
-        return payload
+            # finished or queued work should not keep a live search eta.
+            Payload.update({Key: None for Key in PROGRESS_FIELDS})
+        if Record["status"] == "failed":
+            Payload["error"] = Record.get("error") or "Analysis failed."
+        if Record.get("execution") is not None:
+            Payload["execution"] = Record["execution"]
+        if IncludeResult and Record["status"] == "completed":
+            Payload["result"] = Record.get("result")
+        return Payload
 
-    def _drop_inputs_locked(self, record):
-        record["time_values"] = None
-        record["flux_values"] = None
-        record["options"] = None
+    #MARK: cancel runs
+    def _MarkCancelledLocked(self, Record):
+        Record.update(status="cancelled", finished_at=Time.time(),
+                      stage="cancelled", stage_label="Cancelled")
+        self._DropInputsLocked(Record)
 
-    def _cleanup_locked(self, now):
-        expired = [
-            job_id
-            for job_id, record in self.jobs.items()
-            if record["status"] in TERMINAL_STATES
-            and record.get("finished_at") is not None
-            and now - record["finished_at"] > self.retention_seconds
+    def _DropInputsLocked(self, Record):
+        Record["time_values"] = None
+        Record["flux_values"] = None
+        Record["options"] = None
+
+    def _CleanupLocked(self, Now):
+        Expired = [
+            JobId
+            for JobId, Record in self.Jobs.items()
+            if Record["status"] in TERMINAL_STATES
+            and Record.get("finished_at") is not None
+            and Now - Record["finished_at"] > self.RetentionSeconds
         ]
-        for job_id in expired:
-            del self.jobs[job_id]
+        for JobId in Expired:
+            del self.Jobs[JobId]
 
+    #MARK: worker stuffs
     @staticmethod
-    def _terminate_process(process):
-        if process is None or not process.is_alive():
+    def _TerminateProcess(Process):
+        if Process is None or not Process.is_alive():
             return
-        terminated_group = False
-        if hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        TerminatedGroup = False
+        if hasattr(Os, "getpgid") and hasattr(Os, "killpg"):
             try:
-                process_group = os.getpgid(process.pid)
-                if process_group == process.pid:
-                    os.killpg(process_group, signal.SIGTERM)
-                    terminated_group = True
+                ProcessGroup = Os.getpgid(Process.pid)
+                if ProcessGroup == Process.pid:
+                    Os.killpg(ProcessGroup, Signal.SIGTERM)
+                    TerminatedGroup = True
             except (OSError, ProcessLookupError):
                 pass
-        if not terminated_group:
+        if not TerminatedGroup:
             try:
-                process.terminate()
+                Process.terminate()
             except (OSError, ProcessLookupError):
                 pass
-        process.join(timeout=2.0)
-        if process.is_alive():
+        Process.join(timeout=2.0)
+        # escalate only if the normal termination request did not finish it.
+        if Process.is_alive():
             try:
-                process.kill()
+                Process.kill()
             except (AttributeError, OSError, ProcessLookupError):
-                process.terminate()
-            process.join(timeout=1.0)
+                Process.terminate()
+            Process.join(timeout=1.0)
+
+
+#MARK: old calls
+# keep the old entry point for scripts written before the naming change.
+def annotate_analysis_result(result, options=None, source_file=None):
+    return AnnotateAnalysisResult(result, options, SourceFile=source_file)

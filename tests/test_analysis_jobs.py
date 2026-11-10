@@ -1,105 +1,111 @@
-import io
+import io as Io
 from pathlib import Path
-import sys
-import time
-import unittest
-from unittest import mock
+import sys as Sys
+import time as Time
+import unittest as Unittest
+from unittest import mock as Mock
 
-import numpy as np
+import numpy as Np
 
 
 APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
-sys.path.insert(0, str(APP_DIR))
+Sys.path.insert(0, str(APP_DIR))
 
 from analysis_jobs import AnalysisJobManager  # noqa: E402
-from main import TransitRequestHandler, format_analysis_job_poll  # noqa: E402
+from main import TransitRequestHandler, FormatAnalysisJobPoll  # noqa: E402
 
 
-def quick_runner(time_values, flux_values, options):
+#MARK: quick runner
+def QuickRunner(TimeValues, FluxValues, Options):
     return {
-        "point_count": len(time_values),
-        "option_marker": options.get("marker"),
-        "flux_mean": float(np.mean(flux_values)),
+        "point_count": len(TimeValues),
+        "option_marker": Options.get("marker"),
+        "flux_mean": float(Np.mean(FluxValues)),
     }
 
 
-def slow_runner(time_values, flux_values, options):
-    time.sleep(30)
+#MARK: slow runner
+def SlowRunner(TimeValues, FluxValues, Options):
+    Time.sleep(30)
     return {"finished": True}
 
 
-def staged_runner(time_values, flux_values, options, progress_callback=None):
-    progress_callback("tls_search", "Searching periods with TLS")
-    time.sleep(0.3)
+#MARK: staged runner
+def StagedRunner(TimeValues, FluxValues, Options, ProgressCallback=None):
+    ProgressCallback("tls_search", "Searching periods with TLS")
+    Time.sleep(0.3)
     return {"finished": True}
 
 
-def wait_for_terminal(manager, job_id, timeout=10):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        job = manager.get(job_id)
-        if job and job["status"] in {"completed", "failed", "cancelled"}:
-            return job
-        time.sleep(0.05)
-    raise AssertionError(f"Job {job_id} did not finish within {timeout} seconds")
+#MARK: wait for terminal
+def WaitForTerminal(Manager, JobId, Timeout=10):
+    Deadline = Time.monotonic() + Timeout
+    while Time.monotonic() < Deadline:
+        Job = Manager.get(JobId)
+        if Job and Job["status"] in {"completed", "failed", "cancelled"}:
+            return Job
+        Time.sleep(0.05)
+    raise AssertionError(f"Job {JobId} did not finish within {Timeout} seconds")
 
 
-class AnalysisJobManagerTests(unittest.TestCase):
-    def test_spawned_job_completes_and_returns_result(self):
-        manager = AnalysisJobManager(start_method="spawn", runner=quick_runner)
-        self.addCleanup(manager.shutdown)
-        submitted = manager.submit(
-            np.arange(12, dtype=float),
-            np.full(12, 1.25),
+#MARK: worker stuffs
+class AnalysisJobManagerTests(Unittest.TestCase):
+    def testSpawnedJobCompletesAndReturnsResult(self):
+        Manager = AnalysisJobManager(StartMethod="spawn", Runner=QuickRunner)
+        self.addCleanup(Manager.shutdown)
+        Submitted = Manager.submit(
+            Np.arange(12, dtype=float),
+            Np.full(12, 1.25),
             {"marker": "kept"},
-            source_file="curve.csv",
+            SourceFile="curve.csv",
         )
 
-        self.assertIn(submitted["status"], {"queued", "running"})
-        job = wait_for_terminal(manager, submitted["job_id"])
+        self.assertIn(Submitted["status"], {"queued", "running"})
+        Job = WaitForTerminal(Manager, Submitted["job_id"])
 
-        self.assertEqual(job["status"], "completed")
-        self.assertEqual(job["source_file"], "curve.csv")
-        self.assertEqual(job["result"]["point_count"], 12)
-        self.assertEqual(job["result"]["option_marker"], "kept")
+        self.assertEqual(Job["status"], "completed")
+        self.assertEqual(Job["source_file"], "curve.csv")
+        self.assertEqual(Job["result"]["point_count"], 12)
+        self.assertEqual(Job["result"]["option_marker"], "kept")
 
-    def test_running_job_can_be_cancelled(self):
-        manager = AnalysisJobManager(start_method="spawn", runner=slow_runner)
-        self.addCleanup(manager.shutdown)
-        submitted = manager.submit(np.arange(20), np.ones(20), {})
+    def testRunningJobCanBeCancelled(self):
+        Manager = AnalysisJobManager(StartMethod="spawn", Runner=SlowRunner)
+        self.addCleanup(Manager.shutdown)
+        Submitted = Manager.submit(Np.arange(20), Np.ones(20), {})
 
-        job = manager.cancel(submitted["job_id"])
+        Job = Manager.cancel(Submitted["job_id"])
 
-        self.assertEqual(job["status"], "cancelled")
-        self.assertLess(job["elapsed_seconds"], 10)
-        self.assertEqual(manager.get(submitted["job_id"])["status"], "cancelled")
+        self.assertEqual(Job["status"], "cancelled")
+        self.assertLess(Job["elapsed_seconds"], 10)
+        self.assertEqual(Manager.get(Submitted["job_id"])["status"], "cancelled")
 
-    def test_running_job_reports_worker_stage(self):
-        manager = AnalysisJobManager(start_method="spawn", runner=staged_runner)
-        self.addCleanup(manager.shutdown)
-        submitted = manager.submit(np.arange(20), np.ones(20), {})
-        deadline = time.monotonic() + 5
-        observed = None
-        while time.monotonic() < deadline:
-            job = manager.get(submitted["job_id"])
-            if job.get("stage") == "tls_search":
-                observed = job
+    def testRunningJobReportsWorkerStage(self):
+        Manager = AnalysisJobManager(StartMethod="spawn", Runner=StagedRunner)
+        self.addCleanup(Manager.shutdown)
+        Submitted = Manager.submit(Np.arange(20), Np.ones(20), {})
+        Deadline = Time.monotonic() + 5
+        Observed = None
+        while Time.monotonic() < Deadline:
+            Job = Manager.get(Submitted["job_id"])
+            if Job.get("stage") == "tls_search":
+                Observed = Job
                 break
-            time.sleep(0.02)
+            Time.sleep(0.02)
 
-        self.assertIsNotNone(observed)
-        self.assertEqual(observed["status"], "running")
-        self.assertEqual(observed["stage_label"], "Searching periods with TLS")
+        self.assertIsNotNone(Observed)
+        self.assertEqual(Observed["status"], "running")
+        self.assertEqual(Observed["stage_label"], "Searching periods with TLS")
         self.assertEqual(
-            wait_for_terminal(manager, submitted["job_id"])["status"],
+            WaitForTerminal(Manager, Submitted["job_id"])["status"],
             "completed",
         )
 
 
-class DisconnectHandlingTests(unittest.TestCase):
-    def test_periodic_job_poll_log_shows_progress_without_result_payload(self):
-        with mock.patch("main.time.strftime", return_value="2026-07-24 09:30:00"):
-            message = format_analysis_job_poll(
+#MARK: run checks
+class DisconnectHandlingTests(Unittest.TestCase):
+    def testPeriodicJobPollLogShowsProgressWithoutResultPayload(self):
+        with Mock.patch("main.Time.strftime", return_value="2026-07-24 09:30:00"):
+            Message = FormatAnalysisJobPoll(
                 "abcdef123456",
                 {
                     "status": "running",
@@ -112,16 +118,16 @@ class DisconnectHandlingTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            message,
+            Message,
             '[2026-07-24 09:30:00] [analysis poll] job=abcdef12 '
             'file="kepler curve.csv" status=running elapsed=3723.5s '
             'stage="Searching periods with TLS"',
         )
-        self.assertNotIn("payload", message)
+        self.assertNotIn("payload", Message)
 
-    def test_failed_job_poll_log_includes_error(self):
-        with mock.patch("main.time.strftime", return_value="2026-07-24 09:31:00"):
-            message = format_analysis_job_poll(
+    def testFailedJobPollLogIncludesError(self):
+        with Mock.patch("main.Time.strftime", return_value="2026-07-24 09:31:00"):
+            Message = FormatAnalysisJobPoll(
                 "9876543210",
                 {
                     "status": "failed",
@@ -132,35 +138,35 @@ class DisconnectHandlingTests(unittest.TestCase):
                 },
             )
 
-        self.assertIn("job=98765432", message)
-        self.assertIn("status=failed", message)
-        self.assertIn('error=\"TLS did not fit a valid transit.\"', message)
+        self.assertIn("job=98765432", Message)
+        self.assertIn("status=failed", Message)
+        self.assertIn('error=\"TLS did not fit a valid transit.\"', Message)
 
-    def test_json_write_treats_broken_pipe_as_client_disconnect(self):
-        handler = object.__new__(TransitRequestHandler)
-        handler.client_address = ("127.0.0.1", 51000)
-        handler.send_response = mock.Mock()
-        handler.send_header = mock.Mock()
-        handler.end_headers = mock.Mock()
-        handler.wfile = mock.Mock()
-        handler.wfile.write.side_effect = BrokenPipeError(32, "Broken pipe")
+    def testJsonWriteTreatsBrokenPipeAsClientDisconnect(self):
+        Handler = object.__new__(TransitRequestHandler)
+        Handler.client_address = ("127.0.0.1", 51000)
+        Handler.send_response = Mock.Mock()
+        Handler.send_header = Mock.Mock()
+        Handler.end_headers = Mock.Mock()
+        Handler.wfile = Mock.Mock()
+        Handler.wfile.write.side_effect = BrokenPipeError(32, "Broken pipe")
 
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-            delivered = handler.write_json({"ok": True})
+        with Mock.patch("sys.stdout", new_callable=Io.StringIO) as Output:
+            Delivered = Handler.WriteJson({"ok": True})
 
-        self.assertFalse(delivered)
-        self.assertIn("connection closed", output.getvalue())
-        handler.send_response.assert_called_once_with(200)
-        handler.wfile.write.assert_called_once()
+        self.assertFalse(Delivered)
+        self.assertIn("connection closed", Output.getvalue())
+        Handler.send_response.assert_called_once_with(200)
+        Handler.wfile.write.assert_called_once()
 
-    def test_job_path_parser_rejects_nested_or_empty_paths(self):
+    def testJobPathParserRejectsNestedOrEmptyPaths(self):
         self.assertEqual(
-            TransitRequestHandler.analysis_job_id("/analysis-jobs/abc123"),
+            TransitRequestHandler.AnalysisJobId("/analysis-jobs/abc123"),
             "abc123",
         )
-        self.assertIsNone(TransitRequestHandler.analysis_job_id("/analysis-jobs/"))
-        self.assertIsNone(TransitRequestHandler.analysis_job_id("/analysis-jobs/a/b"))
+        self.assertIsNone(TransitRequestHandler.AnalysisJobId("/analysis-jobs/"))
+        self.assertIsNone(TransitRequestHandler.AnalysisJobId("/analysis-jobs/a/b"))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    Unittest.RunApp()

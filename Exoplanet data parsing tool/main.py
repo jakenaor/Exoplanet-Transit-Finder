@@ -1,20 +1,21 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import cgi
-import json
-import mimetypes
-import os
+import cgi as Cgi
+import json as Json
+import mimetypes as Mimetypes
+import os as Os
 from pathlib import Path
-import threading
-import time
-from urllib.parse import parse_qs, unquote, urlparse
-import webbrowser
+import threading as Threading
+import time as Time
+from urllib.parse import parse_qs as ParseQs, unquote as Unquote, urlparse as Urlparse
+import webbrowser as Webbrowser
 
-from analysis import analyze, parse_detection_options
-from analysis_jobs import AnalysisJobManager, annotate_analysis_result
-from parsers import parse_light_curve_upload
-from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCacheManager, validate_session_id
+from analysis import RunCurve, ParseDetectionOptions
+from analysis_jobs import AnalysisJobManager, AnnotateAnalysisResult
+from parsers import ReadCurveUpload
+from session_cache import DEFAULT_MAX_SESSION_BYTES, SessionCacheManager, ValidateSessionId
 
 
+#MARK: core stuffs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,200 +30,245 @@ CLIENT_DISCONNECT_ERRORS = (
 )
 
 
-def read_static_file(path):
-    return path.read_bytes()
+#MARK: start the app
+def RunApp():
+    Os.environ.setdefault("MPLCONFIGDIR", Os.path.join(Os.getcwd(), ".matplotlib-cache"))
+    Server = None
+    for Port in range(DEFAULT_PORT, DEFAULT_PORT + 11):
+        try:
+            # try the next port if another local app is already using this one.
+            Server = ThreadingHTTPServer((HOST, Port), TransitRequestHandler)
+            break
+        except OSError:
+            continue
+    if Server is None:
+        raise OSError(f"Could not bind to any port from {DEFAULT_PORT} to {DEFAULT_PORT + 10}.")
+
+    try:
+        MaxJobs = max(1, int(Os.environ.get(MAX_JOBS_ENV, "1")))
+    except ValueError:
+        MaxJobs = 1
+    Server.AnalysisJobs = AnalysisJobManager(MaxRunning=MaxJobs)
+    Server.RunCache = SessionCacheManager()
+
+    Url = f"http://{HOST}:{Server.server_port}/"
+    print(f"Transit Finder running at {Url}")
+    print(f"Default session cache location: {Server.RunCache.DefaultDirectory}")
+    print("Press Ctrl+C to stop.")
+    OpenBrowserSoon(Url)
+    try:
+        Server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping server.")
+    finally:
+        Server.AnalysisJobs.shutdown()
+        Server.server_close()
 
 
-def open_browser_soon(url):
-    if os.environ.get(BROWSER_OPT_OUT_ENV):
+
+#MARK: core stuffs
+def ReadStaticFile(FilePath):
+    return FilePath.read_bytes()
+
+
+#MARK: open browser soon
+def OpenBrowserSoon(Url):
+    if Os.environ.get(BROWSER_OPT_OUT_ENV):
         return
 
-    def open_browser():
-        time.sleep(0.4)
+    def OpenBrowser():
+        # give the server a moment before opening the page.
+        Time.sleep(0.4)
         try:
-            webbrowser.open(url, new=2)
-        except Exception as exc:
-            print(f"Could not open browser automatically: {exc}")
+            Webbrowser.open(Url, new=2)
+        except Exception as Exc:
+            print(f"Could not open browser automatically: {Exc}")
 
-    threading.Thread(target=open_browser, daemon=True).start()
+    Threading.Thread(target=OpenBrowser, daemon=True).start()
 
 
-def format_analysis_job_poll(job_id, job):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    short_id = str(job_id)[:8]
-    if job is None:
-        return f"[{timestamp}] [analysis poll] job={short_id} status=not-found"
+#MARK: worker stuffs
+def FormatAnalysisJobPoll(JobId, Job):
+    Timestamp = Time.strftime("%Y-%m-%d %H:%M:%S")
+    ShortId = str(JobId)[:8]
+    if Job is None:
+        return f"[{Timestamp}] [analysis poll] job={ShortId} status=not-found"
 
-    status = str(job.get("status") or "unknown")
-    elapsed = max(0.0, float(job.get("elapsed_seconds") or 0.0))
-    source_file = json.dumps(str(job.get("source_file") or "unknown"))
-    details = [
-        f"[{timestamp}] [analysis poll]",
-        f"job={short_id}",
-        f"file={source_file}",
-        f"status={status}",
-        f"elapsed={elapsed:.1f}s",
+    Status = str(Job.get("status") or "unknown")
+    Elapsed = max(0.0, float(Job.get("elapsed_seconds") or 0.0))
+    SourceFile = Json.dumps(str(Job.get("source_file") or "unknown"))
+    Details = [
+        f"[{Timestamp}] [analysis poll]",
+        f"job={ShortId}",
+        f"file={SourceFile}",
+        f"status={Status}",
+        f"elapsed={Elapsed:.1f}s",
     ]
-    queue_position = job.get("queue_position")
-    if queue_position is not None:
-        details.append(f"queue={queue_position}")
-    if job.get("stage_label"):
-        details.append(f"stage={json.dumps(str(job['stage_label']))}")
-    if status == "failed" and job.get("error"):
-        details.append(f"error={json.dumps(str(job['error']))}")
-    return " ".join(details)
+    QueuePosition = Job.get("queue_position")
+    if QueuePosition is not None:
+        Details.append(f"queue={QueuePosition}")
+    if Job.get("stage_label"):
+        Details.append(f"stage={Json.dumps(str(Job['stage_label']))}")
+    if Status == "failed" and Job.get("error"):
+        Details.append(f"error={Json.dumps(str(Job['error']))}")
+    return " ".join(Details)
 
 
+#MARK: web stuffs
 class TransitRequestHandler(BaseHTTPRequestHandler):
     server_version = "TransitFinder/1.0"
 
+    #MARK: do get
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/analysis-jobs":
-            request_id = parse_qs(urlparse(self.path).query).get("request_id", [""])[0]
-            job = self.server.analysis_jobs.find_by_request_id(request_id)
-            self.write_json(job if job else {"error": "Analysis submission not found."}, status=200 if job else 404)
+        FilePath = Urlparse(self.path).path
+        if FilePath == "/analysis-jobs":
+            RequestId = ParseQs(Urlparse(self.path).query).get("request_id", [""])[0]
+            Job = self.server.AnalysisJobs.FindByRequestId(RequestId)
+            self.WriteJson(Job if Job else {"error": "Analysis submission not found."}, Status=200 if Job else 404)
             return
-        if path == "/analysis-sessions":
+        if FilePath == "/analysis-sessions":
             try:
-                self.write_json({
-                    "sessions": self.server.session_cache.list_sessions(),
-                    "default_directory": str(self.server.session_cache.default_directory),
+                self.WriteJson({
+                    "sessions": self.server.RunCache.ListSessions(),
+                    "default_directory": str(self.server.RunCache.DefaultDirectory),
                 })
-            except Exception as exc:
-                self.write_json({"error": str(exc)}, status=400)
+            except Exception as Exc:
+                self.WriteJson({"error": str(Exc)}, Status=400)
             return
-        session_id = self.analysis_session_id(path)
-        if session_id is not None:
+        SessionId = self.AnalysisSessionId(FilePath)
+        if SessionId is not None:
             try:
-                document = self.server.session_cache.load(session_id)
-                if document is None:
-                    self.write_json({
+                Document = self.server.RunCache.load(SessionId)
+                if Document is None:
+                    self.WriteJson({
                         "exists": False,
-                        "session_id": session_id,
-                        "cache_directory": str(self.server.session_cache.directory_for(session_id)),
-                        "cache_file": str(self.server.session_cache.path_for(session_id)),
+                        "session_id": SessionId,
+                        "cache_directory": str(self.server.RunCache.DirectoryFor(SessionId)),
+                        "cache_file": str(self.server.RunCache.PathFor(SessionId)),
                     })
                 else:
-                    self.write_json({
+                    self.WriteJson({
                         "exists": True,
-                        "cache_directory": str(self.server.session_cache.directory_for(session_id)),
-                        "cache_file": str(self.server.session_cache.path_for(session_id)),
-                        **document,
+                        "cache_directory": str(self.server.RunCache.DirectoryFor(SessionId)),
+                        "cache_file": str(self.server.RunCache.PathFor(SessionId)),
+                        **Document,
                     })
-            except Exception as exc:
-                self.write_json({"error": str(exc)}, status=400)
+            except Exception as Exc:
+                self.WriteJson({"error": str(Exc)}, Status=400)
             return
-        job_id = self.analysis_job_id(path)
-        if job_id is not None:
-            job = self.server.analysis_jobs.get(job_id)
-            print(format_analysis_job_poll(job_id, job), flush=True)
-            if job is None:
-                self.write_json({"error": "Analysis job not found."}, status=404)
+        JobId = self.AnalysisJobId(FilePath)
+        if JobId is not None:
+            Job = self.server.AnalysisJobs.get(JobId)
+            print(FormatAnalysisJobPoll(JobId, Job), flush=True)
+            if Job is None:
+                self.WriteJson({"error": "Analysis job not found."}, Status=404)
             else:
-                self.write_json(job, status=200)
+                self.WriteJson(Job, Status=200)
             return
-        if path == "/":
-            self.write_file(INDEX_PATH, "text/html; charset=utf-8")
+        if FilePath == "/":
+            self.WriteFile(INDEX_PATH, "text/html; charset=utf-8")
             return
-        if path.startswith("/static/"):
-            relative_path = unquote(path.removeprefix("/static/"))
-            requested_path = (STATIC_DIR / relative_path).resolve()
+        if FilePath.startswith("/static/"):
+            RelativePath = Unquote(FilePath.removeprefix("/static/"))
+            RequestedPath = (STATIC_DIR / RelativePath).resolve()
             try:
-                requested_path.relative_to(STATIC_DIR.resolve())
+                RequestedPath.relative_to(STATIC_DIR.resolve())
             except ValueError:
                 self.send_error(404)
                 return
-            if not requested_path.is_file():
+            if not RequestedPath.is_file():
                 self.send_error(404)
                 return
-            content_type = mimetypes.guess_type(str(requested_path))[0] or "application/octet-stream"
-            if requested_path.suffix == ".js":
-                content_type = "application/javascript; charset=utf-8"
-            elif requested_path.suffix == ".css":
-                content_type = "text/css; charset=utf-8"
-            self.write_file(requested_path, content_type)
+            ContentType = Mimetypes.guess_type(str(RequestedPath))[0] or "application/octet-stream"
+            if RequestedPath.suffix == ".js":
+                ContentType = "application/javascript; charset=utf-8"
+            elif RequestedPath.suffix == ".css":
+                ContentType = "text/css; charset=utf-8"
+            self.WriteFile(RequestedPath, ContentType)
             return
         self.send_error(404)
 
+    #MARK: do post
     def do_POST(self):
-        path = urlparse(self.path).path
-        location_session_id = self.analysis_session_location_id(path)
-        if location_session_id is not None:
+        FilePath = Urlparse(self.path).path
+        LocationSessionId = self.AnalysisSessionLocationId(FilePath)
+        if LocationSessionId is not None:
             try:
-                payload = self.read_json_request(16 * 1024)
-                relocated = self.server.session_cache.relocate(
-                    location_session_id,
-                    payload.get("directory"),
+                Payload = self.ReadJsonRequest(16 * 1024)
+                Relocated = self.server.RunCache.relocate(
+                    LocationSessionId,
+                    Payload.get("directory"),
                 )
                 print(
-                    f"[session cache] session={location_session_id[:8]} location="
-                    f"{json.dumps(relocated['cache_directory'])} moved={relocated['moved']}",
+                    f"[session cache] session={LocationSessionId[:8]} location="
+                    f"{Json.dumps(Relocated['cache_directory'])} moved={Relocated['moved']}",
                     flush=True,
                 )
-                self.write_json({"updated": True, **relocated})
+                self.WriteJson({"updated": True, **Relocated})
             except CLIENT_DISCONNECT_ERRORS:
-                self.log_client_disconnect()
-            except Exception as exc:
-                self.write_json({"error": str(exc)}, status=400)
+                self.LogClientDisconnect()
+            except Exception as Exc:
+                self.WriteJson({"error": str(Exc)}, Status=400)
             return
-        session_id = self.analysis_session_id(path)
-        if session_id is not None:
+        SessionId = self.AnalysisSessionId(FilePath)
+        if SessionId is not None:
             try:
-                state = self.read_json_request(DEFAULT_MAX_SESSION_BYTES)
-                saved = self.server.session_cache.save(session_id, state)
+                State = self.ReadJsonRequest(DEFAULT_MAX_SESSION_BYTES)
+                Saved = self.server.RunCache.save(SessionId, State)
                 print(
-                    f"[session cache] session={session_id[:8]} saved={saved['size_bytes']}B "
-                    f"path={json.dumps(saved['cache_file'])}",
+                    f"[session cache] session={SessionId[:8]} saved={Saved['size_bytes']}B "
+                    f"path={Json.dumps(Saved['cache_file'])}",
                     flush=True,
                 )
-                self.write_json({
+                self.WriteJson({
                     "saved": True,
-                    **saved,
+                    **Saved,
                 })
             except CLIENT_DISCONNECT_ERRORS:
-                self.log_client_disconnect()
-            except Exception as exc:
-                self.write_json({"error": str(exc)}, status=400)
+                self.LogClientDisconnect()
+            except Exception as Exc:
+                self.WriteJson({"error": str(Exc)}, Status=400)
             return
-        if path not in {"/analyze", "/analysis-jobs"}:
+        if FilePath not in {"/analyze", "/analysis-jobs"}:
             self.send_error(404)
             return
 
         try:
-            time_values, flux_values, options, source_file = self.parse_analysis_request()
-            if path == "/analysis-jobs":
-                job = self.server.analysis_jobs.submit(
-                    time_values,
-                    flux_values,
-                    options,
-                    source_file=source_file,
+            TimeValues, FluxValues, Options, SourceFile = self.ParseAnalysisRequest()
+            if FilePath == "/analysis-jobs":
+                Job = self.server.AnalysisJobs.submit(
+                    TimeValues,
+                    FluxValues,
+                    Options,
+                    SourceFile=SourceFile,
                 )
-                self.write_json(job, status=202)
+                self.WriteJson(Job, Status=202)
             else:
-                # Preserve the original synchronous endpoint for API compatibility.
-                payload = analyze(time_values, flux_values, options)
-                payload = annotate_analysis_result(payload, options, source_file)
-                self.write_json(payload, status=200)
+                # older clients can still use the direct analysis route.
+                Payload = RunCurve(TimeValues, FluxValues, Options)
+                Payload = AnnotateAnalysisResult(Payload, Options, SourceFile)
+                self.WriteJson(Payload, Status=200)
         except CLIENT_DISCONNECT_ERRORS:
-            self.log_client_disconnect()
-        except Exception as exc:
-            self.write_json({"error": str(exc)}, status=400)
+            self.LogClientDisconnect()
+        except Exception as Exc:
+            self.WriteJson({"error": str(Exc)}, Status=400)
 
+    #MARK: do delete
     def do_DELETE(self):
-        path = urlparse(self.path).path
-        job_id = self.analysis_job_id(path)
-        if job_id is None:
+        FilePath = Urlparse(self.path).path
+        JobId = self.AnalysisJobId(FilePath)
+        if JobId is None:
             self.send_error(404)
             return
-        job = self.server.analysis_jobs.cancel(job_id)
-        if job is None:
-            self.write_json({"error": "Analysis job not found."}, status=404)
+        Job = self.server.AnalysisJobs.cancel(JobId)
+        if Job is None:
+            self.WriteJson({"error": "Analysis job not found."}, Status=404)
         else:
-            self.write_json(job, status=200)
+            self.WriteJson(Job, Status=200)
 
-    def parse_analysis_request(self):
-        form = cgi.FieldStorage(
+    #MARK: curve uploads
+    def ParseAnalysisRequest(self):
+        Form = Cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
             environ={
@@ -231,150 +277,122 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
                 "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
             },
         )
-        file_item = form["datafile"] if "datafile" in form else (form["csv"] if "csv" in form else None)
-        if file_item is None or not getattr(file_item, "file", None):
+        FileItem = Form["datafile"] if "datafile" in Form else (Form["csv"] if "csv" in Form else None)
+        if FileItem is None or not getattr(FileItem, "file", None):
             raise ValueError("No CSV or FITS file was uploaded.")
-        parsed = parse_light_curve_upload(file_item, return_metadata=True,
-            time_format=form.getfirst("csvTimeFormat") or None,
-            time_scale=form.getfirst("csvTimeScale") or None,
-            time_unit=form.getfirst("csvTimeUnit") or None)
-        time_values, flux_values = parsed["time"], parsed["flux"]
-        options = parse_detection_options(form)
-        options["_input_metadata"] = parsed["input_metadata"]
-        options["_cleaning_report"] = parsed["cleaning"]
-        if parsed["flux_uncertainty"] is not None:
-            options["_flux_uncertainty"] = [float(v) if v == v else None for v in parsed["flux_uncertainty"]]
-        if parsed.get("exposure_seconds") is not None:
-            options["_exposure_seconds"] = [float(v) if v == v else None for v in parsed["exposure_seconds"]]
-        for field, key in (("batchId", "_batch_id"), ("analysisRequestId", "_request_id")):
-            value = str(form.getfirst(field) or "").strip()
-            if value:
-                if len(value) > 160 or not all(c.isalnum() or c in "_:-." for c in value):
-                    raise ValueError(f"Invalid {field}.")
-                options[key] = value
-        source_file = getattr(file_item, "filename", None)
-        return time_values, flux_values, options, source_file
+        Parsed = ReadCurveUpload(FileItem, ReturnMetadata=True,
+            TimeFormat=Form.getfirst("csvTimeFormat") or None,
+            TimeScale=Form.getfirst("csvTimeScale") or None,
+            TimeUnit=Form.getfirst("csvTimeUnit") or None)
+        TimeValues, FluxValues = Parsed["time"], Parsed["flux"]
+        Options = ParseDetectionOptions(Form)
+        Options["_input_metadata"] = Parsed["input_metadata"]
+        Options["_cleaning_report"] = Parsed["cleaning"]
+        # missing optional values stay null when sent to a worker.
+        if Parsed["flux_uncertainty"] is not None:
+            Options["_flux_uncertainty"] = [float(V) if V == V else None for V in Parsed["flux_uncertainty"]]
+        if Parsed.get("exposure_seconds") is not None:
+            Options["_exposure_seconds"] = [float(V) if V == V else None for V in Parsed["exposure_seconds"]]
+        for Field, Key in (("batchId", "_batch_id"), ("analysisRequestId", "_request_id")):
+            Value = str(Form.getfirst(Field) or "").strip()
+            if Value:
+                if len(Value) > 160 or not all(C.isalnum() or C in "_:-." for C in Value):
+                    raise ValueError(f"Invalid {Field}.")
+                Options[Key] = Value
+        SourceFile = getattr(FileItem, "filename", None)
+        return TimeValues, FluxValues, Options, SourceFile
 
-    def read_json_request(self, max_bytes):
+    #MARK: read requests
+    def ReadJsonRequest(self, MaxBytes):
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as exc:
-            raise ValueError("Invalid session cache request length.") from exc
-        if content_length <= 0:
+            ContentLength = int(self.headers.get("Content-Length", "0"))
+        except ValueError as Exc:
+            raise ValueError("Invalid session cache request length.") from Exc
+        if ContentLength <= 0:
             raise ValueError("Analysis session state is empty.")
-        if content_length > max_bytes:
+        if ContentLength > MaxBytes:
             raise ValueError("The analysis session is too large to save.")
         try:
-            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Analysis session state is not valid JSON.") from exc
-        if not isinstance(payload, dict):
+            Payload = Json.loads(self.rfile.read(ContentLength).decode("utf-8"))
+        except (UnicodeDecodeError, Json.JSONDecodeError) as Exc:
+            raise ValueError("Analysis session state is not valid JSON.") from Exc
+        if not isinstance(Payload, dict):
             raise ValueError("Analysis session state must be a JSON object.")
-        return payload
+        return Payload
 
+    #MARK: worker stuffs
     @staticmethod
-    def analysis_job_id(path):
-        prefix = "/analysis-jobs/"
-        if not path.startswith(prefix):
+    def AnalysisJobId(FilePath):
+        Prefix = "/analysis-jobs/"
+        if not FilePath.startswith(Prefix):
             return None
-        job_id = path[len(prefix):]
-        if not job_id or "/" in job_id:
+        JobId = FilePath[len(Prefix):]
+        if not JobId or "/" in JobId:
             return None
-        return job_id
+        return JobId
 
+    #MARK: cache files
     @staticmethod
-    def analysis_session_id(path):
-        prefix = "/analysis-sessions/"
-        if not path.startswith(prefix):
+    def AnalysisSessionId(FilePath):
+        Prefix = "/analysis-sessions/"
+        if not FilePath.startswith(Prefix):
             return None
-        session_id = path[len(prefix):]
-        if not session_id or "/" in session_id:
+        SessionId = FilePath[len(Prefix):]
+        if not SessionId or "/" in SessionId:
             return None
         try:
-            return validate_session_id(session_id)
+            return ValidateSessionId(SessionId)
         except ValueError:
             return None
 
+    #MARK: cache folders
     @staticmethod
-    def analysis_session_location_id(path):
-        prefix = "/analysis-sessions/"
-        suffix = "/location"
-        if not path.startswith(prefix) or not path.endswith(suffix):
+    def AnalysisSessionLocationId(FilePath):
+        Prefix = "/analysis-sessions/"
+        Suffix = "/location"
+        if not FilePath.startswith(Prefix) or not FilePath.endswith(Suffix):
             return None
-        session_id = path[len(prefix):-len(suffix)]
-        if not session_id or "/" in session_id:
+        SessionId = FilePath[len(Prefix):-len(Suffix)]
+        if not SessionId or "/" in SessionId:
             return None
         try:
-            return validate_session_id(session_id)
+            return ValidateSessionId(SessionId)
         except ValueError:
             return None
 
-    def write_file(self, path, content_type):
-        body = read_static_file(path)
+    #MARK: send responses
+    def WriteResponse(self, Body, Status, ContentType):
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
+            self.send_response(Status)
+            self.send_header("Content-Type", ContentType)
+            self.send_header("Content-Length", str(len(Body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(Body)
             return True
         except CLIENT_DISCONNECT_ERRORS:
-            self.log_client_disconnect()
+            self.LogClientDisconnect()
             return False
 
-    def write_json(self, payload, status=200):
-        body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return True
-        except CLIENT_DISCONNECT_ERRORS:
-            self.log_client_disconnect()
-            return False
+    #MARK: send replies
+    def WriteFile(self, FilePath, ContentType):
+        return self.WriteResponse(ReadStaticFile(FilePath), 200, ContentType)
 
-    def log_client_disconnect(self):
-        client = self.client_address[0] if self.client_address else "client"
-        print(f"{client} - connection closed before the response was delivered")
+    #MARK: send replies
+    def WriteJson(self, Payload, Status=200):
+        Body = Json.dumps(Payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return self.WriteResponse(Body, Status, "application/json; charset=utf-8")
 
-    def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args))
+    #MARK: log client disconnect
+    def LogClientDisconnect(self):
+        Client = self.client_address[0] if self.client_address else "client"
+        print(f"{Client} - connection closed before the response was delivered")
+
+    #MARK: log message
+    def log_message(self, Fmt, *Args):
+        print("%s - %s" % (self.address_string(), Fmt % Args))
 
 
-def main():
-    os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getcwd(), ".matplotlib-cache"))
-    server = None
-    for port in range(DEFAULT_PORT, DEFAULT_PORT + 11):
-        try:
-            server = ThreadingHTTPServer((HOST, port), TransitRequestHandler)
-            break
-        except OSError:
-            continue
-    if server is None:
-        raise OSError(f"Could not bind to any port from {DEFAULT_PORT} to {DEFAULT_PORT + 10}.")
-
-    try:
-        max_jobs = max(1, int(os.environ.get(MAX_JOBS_ENV, "1")))
-    except ValueError:
-        max_jobs = 1
-    server.analysis_jobs = AnalysisJobManager(max_running=max_jobs)
-    server.session_cache = SessionCacheManager()
-
-    url = f"http://{HOST}:{server.server_port}/"
-    print(f"Transit Finder running at {url}")
-    print(f"Default session cache location: {server.session_cache.default_directory}")
-    print("Press Ctrl+C to stop.")
-    open_browser_soon(url)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping server.")
-    finally:
-        server.analysis_jobs.shutdown()
-        server.server_close()
 
 
 if __name__ == "__main__":
-    main()
+    RunApp()

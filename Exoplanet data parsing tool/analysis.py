@@ -1,19 +1,19 @@
-import math
+import math as Math
 
-import numpy as np
+import numpy as Np
 
-from tls_search import run_tls_search, exposure_array_seconds, exposure_integrated_template
-
-try:
-    from scipy.signal import find_peaks, peak_widths
-except Exception:
-    find_peaks = None
-    peak_widths = None
+from tls_search import RunTlsSearch, ExposureArraySeconds, ExposureIntegratedTemplate
 
 try:
-    from scipy.stats import chi2
+    from scipy.signal import find_peaks as FindPeaks, peak_widths as PeakWidths
 except Exception:
-    chi2 = None
+    FindPeaks = None
+    PeakWidths = None
+
+try:
+    from scipy.stats import chi2 as Chi2
+except Exception:
+    Chi2 = None
 
 try:
     from astropy.timeseries import BoxLeastSquares
@@ -21,6 +21,7 @@ except Exception:
     BoxLeastSquares = None
 
 
+#MARK: core stuffs
 MAX_PLOT_POINTS = 12000
 MAX_PERIODOGRAM_POINTS = 1600
 DEFAULT_DETECTION_OPTIONS = {
@@ -47,66 +48,398 @@ DEFAULT_DETECTION_OPTIONS = {
 }
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+#MARK: curve funcs
+def RunCurve(Time, Flux, Options=None, ProgressCallback=None, **LegacyOptions):
+    # keep the callback spelling older scripts pass in.
+    ProgressCallback = LegacyOptions.pop("progress_callback", ProgressCallback)
+    if LegacyOptions:
+        raise TypeError(f"Unknown analysis options: {', '.join(LegacyOptions)}")
+    def ReportProgress(Stage, StageLabel, Details=None):
+        if callable(ProgressCallback):
+            if Details is None:
+                ProgressCallback(Stage, StageLabel)
+            else:
+                ProgressCallback(Stage, StageLabel, Details)
+
+    #MARK: curve funcs
+    Time, Flux, Options, Exposures, ExposureMetadata = _PrepCurve(Time, Flux, Options)
+    ReportProgress("preparing", "Preparing light curve")
+    NormalizationPlan = FluxNormalizationPlan(Flux)
+    AnalysisFlux, Segments = NormalizeFluxBySegments(Time, Flux)
+    NormalizedUncertainty, UncertaintyComplete = _ScaleFluxErrors(
+        Flux, Segments, NormalizationPlan, Options.get("_flux_uncertainty")
+    )
+    if UncertaintyComplete:
+        Options = {**Options, "_normalized_flux_uncertainty": NormalizedUncertainty}
+    #MARK: period funcs
+    SearchMode = Options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
+    if SearchMode == "tls":
+        ReportProgress("tls_search", "Searching periods with TLS")
+    else:
+        ReportProgress("bls_search", "Searching periods with BLS")
+    Detection = DetectTransits(Time, AnalysisFlux, Options,
+                                ProgressCallback=lambda Details: ReportProgress(
+                                    "tls_finalizing" if Details.get("search_complete") else "tls_search",
+                                    "Finalizing TLS model" if Details.get("search_complete") else "Searching periods with TLS", Details))
+    #MARK: plot stuffs
+    ReportProgress("building", "Building transit model and plots")
+    TimeReference = float(Time[0])
+    DisplayTime = Time - TimeReference
+    RawLow, RawHigh = RobustFluxLimits(AnalysisFlux, Sigma=4.0)
+    RawClipped = Np.clip(AnalysisFlux, RawLow, RawHigh)
+
+    TransitModel = Detection.get("transit_model")
+    BaseSmoothWidth = int(max(25, min(251, len(AnalysisFlux) // 300)))
+    SmoothWidth = OddWindowWidth(BaseSmoothWidth, float(Options["smoothing"]), 5, 601)
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    PeriodSde = FiniteNumber(Detection.get("period_sde"))
+    if TransitModel is not None and PeriodSde is not None and PeriodSde >= 5.0:
+        SmoothWidth = TransitPreservingSmoothingWidth(
+            SmoothWidth,
+            Cadence,
+            Detection.get("period_duration"),
+        )
+    SmoothFlux = MovingAverageBySegments(RawClipped, SmoothWidth, Segments)
+
+    ObservedModelFlux = ModelFluxAtObservations(
+        Time,
+        Detection.get("period"),
+        Detection.get("period_epoch"),
+        TransitModel,
+        Exposures,
+    )
+    DisplayModelFlux = None
+    if ObservedModelFlux is not None:
+        DisplayModelFlux = MovingAverageBySegments(ObservedModelFlux, SmoothWidth, Segments)
+
+    PlotKeep = DownsampleIndicesForSeries(
+        [AnalysisFlux, SmoothFlux, DisplayModelFlux] if DisplayModelFlux is not None else [AnalysisFlux, SmoothFlux],
+        MAX_PLOT_POINTS,
+    )
+    # keep each segment's ends when shrinking the plot.
+    PlotKeep = Np.unique(Np.r_[PlotKeep, [Index for Start, End in Segments for Index in (Start, End - 1)]]).astype(int)
+    PlotBreaks = [int(Np.searchsorted(PlotKeep, Start)) for Start, _ in Segments[1:]]
+    PlotTime = DisplayTime[PlotKeep]
+    PlotRaw = AnalysisFlux[PlotKeep]
+    PlotSmooth = SmoothFlux[PlotKeep]
+    RawFluxMin, RawFluxMax = DomainFor(RawClipped, 0.5, 99.5)
+    CleanDomainValues = (
+        Np.r_[SmoothFlux, DisplayModelFlux]
+        if DisplayModelFlux is not None
+        else SmoothFlux
+    )
+    CleanFluxMin, CleanFluxMax = DomainFor(CleanDomainValues, 0.2, 99.8)
+    PhaseFolded = MakePhasePlot(
+        Time,
+        RawClipped,
+        SmoothFlux,
+        Detection["period"],
+        Detection["period_epoch"],
+        Detection["period_duration"],
+    )
+    TransitStack = BuildTransitStack(
+        Time,
+        AnalysisFlux,
+        [Event for Event in Detection["transits"] if Event.get("points", 1) > 0],
+        Detection["period"],
+        Detection["period_duration"],
+    )
+
+    if TransitModel is not None and DisplayModelFlux is not None:
+        TransitModel = {
+            **TransitModel,
+            "time": PlotTime.tolist(),
+            "flux": DisplayModelFlux[PlotKeep].tolist(),
+            "time_series_representation": "observation-aligned and plot-smoothed",
+            "plot_smooth_points": SmoothWidth,
+        }
+        Detection = {**Detection, "transit_model": TransitModel}
+
+    #MARK: transit checks
+    DisplayTransits = []
+    for Transit in Detection["transits"]:
+        DisplayTransit = dict(Transit)
+        AddDepthMetrics(DisplayTransit, Transit.get("local_baseline", Detection["median_flux"]))
+        for Key in ("predicted_center", "measured_center"):
+            if Transit.get(Key) is not None:
+                DisplayTransit[Key] = float(Transit[Key] - TimeReference)
+        DisplayTransit["start"] = float(Transit["start"] - TimeReference)
+        DisplayTransit["center"] = float(Transit["center"] - TimeReference)
+        DisplayTransit["end"] = float(Transit["end"] - TimeReference)
+        DisplayTransit["display_extents"] = _TransitBoxLimits(
+            Time, Transit, AnalysisFlux, SmoothFlux, DisplayModelFlux
+        )
+        if TransitModel is not None and DisplayModelFlux is not None:
+            DisplayStart, DisplayEnd = SmoothedTransitDisplayBounds(
+                DisplayTransit["start"],
+                DisplayTransit["end"],
+                Cadence,
+                SmoothWidth,
+                float(DisplayTime[0]),
+                float(DisplayTime[-1]),
+            )
+            DisplayTransit["display_start"] = DisplayStart
+            DisplayTransit["display_end"] = DisplayEnd
+        DisplayTransits.append(DisplayTransit)
+    ObservedRanges = [
+        (float(Time[Start] - TimeReference), float(Time[End - 1] - TimeReference))
+        for Start, End in Segments
+    ]
+    #MARK: transit checks
+    ReportProgress("vetting", "Calculating diagnostics")
+    Diagnostics, Warnings = BuildCandidateDiagnostics(DisplayTransits, Detection, TimeReference, ObservedRanges)
+    if SearchMode == "tls" and ExposureMetadata["unknown_rows"]:
+        Warnings.append({"severity": "info", "title": "Unknown exposure duration",
+                         "detail": "Some or all sample exposure durations are unknown. Template refinement uses an instantaneous approximation for those rows; cadence is not treated as exposure, and duration uncertainty excludes this systematic. Supply an exposure in seconds when known."})
+    if NormalizedUncertainty is not None and not UncertaintyComplete:
+        Warnings.append({"severity": "info", "title": "Partial measurement uncertainties",
+                         "detail": "Some flux errors are missing or invalid. They remain null in plots/exports; TLS uses its unweighted fallback for this file and local checks use empirical noise."})
+    PlanetAssessment = BuildPlanetAssessment(DisplayTransits, Detection, Diagnostics, Warnings)
+    # these markers are for inspection. they stay out of the score above.
+    ExploratoryDips, ExploratoryMetadata = ([], None)
+    if not Options.get("_skip_local_inspection"):
+        ExploratoryDips, ExploratoryMetadata = ExploratoryLocalDips(Time, AnalysisFlux, Options, TimeReference)
+    FitAccepted = PlanetAssessment["status"] in ("strong_candidate", "possible_candidate")
+    FitQuality = {"state": "accepted" if FitAccepted else "tentative",
+                   "label": "Candidate model" if FitAccepted else "Tentative fit - below candidate threshold",
+                   "reason_codes": [Warning["title"].lower().replace(" ", "_") for Warning in Warnings if Warning.get("severity") in ("caution", "danger")]}
+    SearchFlux = None
+    if SearchMode == "tls":
+        SearchFlux, _ = NormalizedFluxForTls(Time, AnalysisFlux)
+    Comparison = None
+    if SearchFlux is not None and ObservedModelFlux is not None:
+        Comparison = _MakePlotThing(
+            PlotTime, SearchFlux, ObservedModelFlux, PlotKeep, PlotBreaks,
+            "search-detrended observations and physical template on identical timestamps",
+        )
+
+    ZoomDomain = None
+    if DisplayTransits:
+        First = DisplayTransits[0]
+        Last = DisplayTransits[-1]
+        MedianDuration = float(Np.median([Item["duration"] for Item in DisplayTransits]))
+        if len(DisplayTransits) == 1:
+            Pad = max(First["duration"] * 2.8, (Time[-1] - Time[0]) * 0.015, 1.0)
+        else:
+            Pad = max(MedianDuration * 3.0, (Time[-1] - Time[0]) * 0.02, 1.0)
+        ZoomTimeMin = float(max(0.0, First["start"] - Pad))
+        ZoomTimeMax = float(min(DisplayTime[-1], Last["end"] + Pad))
+        ZoomMask = (DisplayTime >= ZoomTimeMin) & (DisplayTime <= ZoomTimeMax)
+        ZoomValues = SmoothFlux[ZoomMask]
+        if DisplayModelFlux is not None:
+            ZoomValues = Np.r_[ZoomValues, DisplayModelFlux[ZoomMask]]
+        ZoomFluxMin, ZoomFluxMax = DomainFor(ZoomValues, 0.0, 100.0)
+        ZoomDomain = {
+            "time_min": ZoomTimeMin,
+            "time_max": ZoomTimeMax,
+            "flux_min": ZoomFluxMin,
+            "flux_max": ZoomFluxMax,
+        }
+
+    #MARK: run details
+    ReportProgress("finalizing", "Finalizing results")
+    PublicOptions = {Key: Value for Key, Value in Options.items() if not Key.startswith("_")}
+    Result = {
+        "total_points": int(len(Time)),
+        "time_reference": TimeReference,
+        "time_unit": "Days since first observation",
+        "flux_unit": "relative flux",
+        "normalization": {
+            "method": NormalizationPlan["method"],
+            "input_representation": NormalizationPlan["input_representation"],
+            "residual_scale": NormalizationPlan["residual_scale"],
+            "segment_count": len(Segments),
+            "segment_time_ranges": [
+                {
+                    "start_day": float(Time[Start] - TimeReference),
+                    "end_day": float(Time[End - 1] - TimeReference),
+                    "median_flux": float(Np.median(Flux[Start:End])),
+                }
+                for Start, End in Segments
+            ],
+        },
+        "plot": {
+            "time": PlotTime.tolist(),
+            "raw_flux": PlotRaw.tolist(),
+            "smooth_flux": PlotSmooth.tolist(),
+            "break_indices": PlotBreaks.copy(),
+            "raw_representation": "unclipped segment-normalized flux at retained plot samples",
+            "clean_representation": "display-clipped, segment-smoothed observations",
+        },
+        "domain": {
+            "time_min": 0.0,
+            "time_max": float(DisplayTime[-1]),
+        },
+        "raw_domain": {"flux_min": RawFluxMin, "flux_max": RawFluxMax},
+        "clean_domain": {"flux_min": CleanFluxMin, "flux_max": CleanFluxMax},
+        "zoom_domain": ZoomDomain,
+        "phase_folded": PhaseFolded,
+        "transit_stack": TransitStack,
+        "plot_smooth_points": SmoothWidth,
+        "diagnostics": Diagnostics,
+        "warnings": Warnings,
+        "planet_assessment": PlanetAssessment,
+        "fit_quality": FitQuality,
+        "model_comparison": Comparison,
+        "predicted_windows": DisplayTransits,
+        "observed_events": [Event for Event in DisplayTransits if Event.get("state", "supported_dip") == "supported_dip"],
+        "exploratory_dips": ExploratoryDips,
+        "exploratory_dips_metadata": ExploratoryMetadata,
+        "cleaning_report": Options.get("_cleaning_report"),
+        "input_metadata": Options.get("_input_metadata", {"time_format": "unspecified", "time_standard": "unspecified"}),
+        "exposure_metadata": ExposureMetadata,
+        "preprocessing": {"normalized": "per-observing-segment median", "search": "segment-local trend removal; downward samples retained", "display": "segment-local moving average", "stack": "per-event linear baseline, no automatic recentering"},
+        "significance_metadata": {"p_value": "Approximate fixed-model-versus-flat chi-squared comparison after selecting the period; not search-wide false alarm or planet probability.",
+                                  "tls_fap": "Reference TLS white-noise lookup; correlated noise and selection effects can make it optimistic.",
+                                  "candidate_score": "Heuristic review score, not a calibrated probability."},
+        "effective_settings": _PackSettingsThing(PublicOptions, Detection, ExposureMetadata, SearchMode),
+        "detection_snr": Diagnostics["detection_snr"],
+        "odd_even_depth_mismatch": Diagnostics["odd_even_depth_mismatch"],
+        "depth_scatter_ratio": Diagnostics["depth_scatter_ratio"],
+        **{**Detection, "transits": [Event for Event in DisplayTransits if Event.get("points", 1) > 0], "detection_options": PublicOptions},
+    }
+    if NormalizedUncertainty is not None:
+        Result["plot"]["flux_uncertainty"] = [float(Value) if Np.isfinite(Value) and Value > 0 else None for Value in NormalizedUncertainty[PlotKeep]]
+        Result["uncertainty_usage"] = ("Normalized input uncertainties supplied to TLS; local event estimates additionally use empirical correlated-noise errors." if UncertaintyComplete
+                                       else "Incomplete errors retained as null; TLS uses unweighted fallback and local checks use empirical correlated-noise errors.")
+    if ExposureMetadata["known_rows"]:
+        Result["plot"]["exposure_seconds"] = [float(Value) if Np.isfinite(Value) else None for Value in Exposures[PlotKeep]]
+    #MARK: extra signals
+    MaxSignals = int(Options.get("tls_max_signals", Options.get("max_signals", 1)))
+    if SearchMode == "tls" and MaxSignals > 1:
+        Signals = [{"signal_id": "signal-1", "label": "Signal 1", **Result}]
+        Retained = Np.ones(len(Time), dtype=bool)
+        StopReason = "requested_signal_limit"
+        for SignalIndex in range(1, min(MaxSignals, 5)):
+            Prev = Signals[-1]
+            # don't mask a bad fit and then search whatever it leaves behind.
+            if Prev["planet_assessment"]["status"] != "strong_candidate":
+                StopReason = "Previous signal lacks strong support; no tentative model was masked."
+                break
+            Supported = Prev.get("observed_events", [])
+            if len(Supported) < 3:
+                StopReason = "Fewer than three locally supported events; residual search stopped."
+                break
+            for Event in Supported:
+                Center = Event["center"] + Prev["time_reference"]
+                Retained &= Np.abs(Time - Center) > Event["duration"] * 0.65
+            if Np.count_nonzero(Retained) < 50:
+                StopReason = "Too few unmasked observations remain."
+                break
+            ReportProgress("tls_search", f"Searching residual observations for signal {SignalIndex + 1}")
+            NextOptions = {**Options, "tls_max_signals": 1, "max_signals": 1, "_skip_local_inspection": True}
+            if Options.get("_flux_uncertainty") is not None:
+                NextOptions["_flux_uncertainty"] = Np.asarray(Options["_flux_uncertainty"])[Retained]
+                NextOptions.pop("_normalized_flux_uncertainty", None)
+            NextOptions["_exposure_seconds"] = Exposures[Retained]
+            Candidate = RunCurve(Time[Retained], Flux[Retained], NextOptions, ProgressCallback)
+            # do not present another optimizer noise pattern as a recovered planet.
+            if Candidate["planet_assessment"]["status"] not in ("strong_candidate", "possible_candidate"):
+                Result["residual_search_attempt"] = {"period": Candidate.get("period"), "sde": Candidate.get("period_sde"), "fit_quality": Candidate.get("fit_quality")}
+                StopReason = "No additional credible periodic signal in the residual observations."
+                break
+            Candidate.update(signal_id=f"signal-{SignalIndex + 1}", label=f"Signal {SignalIndex + 1}",
+                             search_context={"method": "iterative conservative transit masking", "masked_samples": int(Np.count_nonzero(~Retained)), "joint_refit": False})
+            Signals.append(Candidate)
+        Result["signals"] = Signals
+        Result["multi_signal_search"] = {"requested": MaxSignals, "recovered": sum(Signal["planet_assessment"]["status"] in ("strong_candidate", "possible_candidate") for Signal in Signals),
+                                         "attempted_signals": len(Signals), "stop_reason": StopReason,
+                                         "method": "conservative supported-event masking; conditional residual searches", "joint_refit": False,
+                                         "limitation": "Overlapping events and period aliases still require joint follow-up vetting."}
+        #MARK: extra signals
+        if len(Signals) >= 2 and SearchFlux is not None:
+            ReportProgress("building", "Refining overlapping transit amplitudes together")
+            Joint = JointTemplateAmplitudes(Time, SearchFlux, Signals,
+                                               NormalizedUncertainty if UncertaintyComplete else None, Exposures)
+            if Joint is not None:
+                for Signal, Depth, DepthError in zip(Signals, Joint["depths"], Joint["depth_uncertainties"]):
+                    UpdateSignalJointDepth(Signal, Depth, DepthError)
+                    Signal["search_context"] = {**Signal.get("search_context", {}), "joint_refit": True,
+                                                 "joint_scope": "amplitudes and shared baseline; orbital parameters held fixed"}
+                for Field in ("transit_model", "tls", "model_comparison", "joint_depth_refinement"):
+                    Result[Field] = Signals[0][Field]
+                Result["joint_model_comparison"] = _MakePlotThing(
+                    PlotTime, SearchFlux, Joint["model_flux"], PlotKeep, PlotBreaks,
+                    "original search-detrended observations with simultaneous fixed-template signal amplitudes",
+                )
+                Result["joint_model_comparison"]["components"] = [
+                    {"signal_id": Signal["signal_id"], "label": Signal["label"], "flux": Component[PlotKeep].tolist()}
+                    for Signal, Component in zip(Signals, Joint["components"])
+                ]
+                Result["multi_signal_search"].update(joint_refit=True, joint_fit=Joint["metadata"],
+                                                      limitation="Joint amplitudes and baseline fitted; orbital parameters and transit shapes remain conditional and require follow-up vetting.")
+    TagExploratoryAssignments(Result, Result.get("signals") or [Result])
+    return Result
 
 
-def field_value(form, name):
-    if name not in form:
+
+
+#MARK: clamp
+def Clamp(Value, Low, High):
+    return max(Low, min(High, Value))
+
+
+#MARK: form bits
+def FieldValue(Form, Name):
+    if Name not in Form:
         return None
-    item = form[name]
-    if isinstance(item, list):
-        item = item[0]
-    return getattr(item, "value", None)
+    Item = Form[Name]
+    if isinstance(Item, list):
+        Item = Item[0]
+    return getattr(Item, "value", None)
 
 
-def parse_optional_float(form, name, low=None, high=None):
-    raw_value = field_value(form, name)
-    if raw_value is None or str(raw_value).strip() == "":
+#MARK: form bits
+def ParseOptionalFloat(Form, Name, Low=None, High=None):
+    RawValue = FieldValue(Form, Name)
+    if RawValue is None or str(RawValue).strip() == "":
         return None
     try:
-        value = float(raw_value)
+        Value = float(RawValue)
     except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a number.")
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite.")
-    if low is not None and value < low:
-        raise ValueError(f"{name} must be at least {low}.")
-    if high is not None and value > high:
-        raise ValueError(f"{name} must be at most {high}.")
-    return value
+        raise ValueError(f"{Name} must be a number.")
+    if not Math.isfinite(Value):
+        raise ValueError(f"{Name} must be finite.")
+    if Low is not None and Value < Low:
+        raise ValueError(f"{Name} must be at least {Low}.")
+    if High is not None and Value > High:
+        raise ValueError(f"{Name} must be at most {High}.")
+    return Value
 
 
-def parse_optional_int(form, name, low=None, high=None):
-    value = parse_optional_float(form, name, low, high)
-    if value is None:
+#MARK: form bits
+def ParseOptionalInt(Form, Name, Low=None, High=None):
+    Value = ParseOptionalFloat(Form, Name, Low, High)
+    if Value is None:
         return None
-    if not float(value).is_integer():
-        raise ValueError(f"{name} must be a whole number.")
-    return int(value)
+    if not float(Value).is_integer():
+        raise ValueError(f"{Name} must be a whole number.")
+    return int(Value)
 
 
-def parse_choice(form, name, choices, default):
-    raw_value = field_value(form, name)
-    if raw_value is None or str(raw_value).strip() == "":
-        return default
-    value = str(raw_value).strip().lower().replace("_", "-")
-    if value not in choices:
-        allowed = ", ".join(sorted(choices))
-        raise ValueError(f"{name} must be one of: {allowed}.")
-    return choices[value]
+#MARK: form bits
+def ParseChoice(Form, Name, Choices, Default):
+    RawValue = FieldValue(Form, Name)
+    if RawValue is None or str(RawValue).strip() == "":
+        return Default
+    Value = str(RawValue).strip().lower().replace("_", "-")
+    if Value not in Choices:
+        Allowed = ", ".join(sorted(Choices))
+        raise ValueError(f"{Name} must be one of: {Allowed}.")
+    return Choices[Value]
 
 
-def parse_detection_options(form):
-    options = dict(DEFAULT_DETECTION_OPTIONS)
-    strictness = parse_optional_float(form, "strictness", 0.2, 5.0)
-    smoothing = parse_optional_float(form, "smoothing", 0.25, 4.0)
-    if strictness is not None:
-        options["strictness"] = clamp(strictness, 0.2, 5.0)
-    if smoothing is not None:
-        options["smoothing"] = clamp(smoothing, 0.25, 4.0)
-    options["search_mode"] = parse_choice(
-        form,
+#MARK: parse detection options
+def ParseDetectionOptions(Form):
+    Options = dict(DEFAULT_DETECTION_OPTIONS)
+    Strictness = ParseOptionalFloat(Form, "strictness", 0.2, 5.0)
+    Smoothing = ParseOptionalFloat(Form, "smoothing", 0.25, 4.0)
+    if Strictness is not None:
+        Options["strictness"] = Clamp(Strictness, 0.2, 5.0)
+    if Smoothing is not None:
+        Options["smoothing"] = Clamp(Smoothing, 0.25, 4.0)
+    Options["search_mode"] = ParseChoice(
+        Form,
         "searchMode",
         {
             "bls": "bls",
@@ -118,3386 +451,3243 @@ def parse_detection_options(form):
         DEFAULT_DETECTION_OPTIONS["search_mode"],
     )
 
-    options["min_depth"] = parse_optional_float(form, "minDepth", 0.0, None)
-    options["min_duration"] = parse_optional_float(form, "minDuration", 0.0, None)
-    options["max_duration"] = parse_optional_float(form, "maxDuration", 0.0, None)
-    options["min_period"] = parse_optional_float(form, "minPeriod", 0.0, None)
-    options["max_period"] = parse_optional_float(form, "maxPeriod", 0.0, None)
-    options["tls_template"] = parse_choice(
-        form,
+    Options["min_depth"] = ParseOptionalFloat(Form, "minDepth", 0.0, None)
+    Options["min_duration"] = ParseOptionalFloat(Form, "minDuration", 0.0, None)
+    Options["max_duration"] = ParseOptionalFloat(Form, "maxDuration", 0.0, None)
+    Options["min_period"] = ParseOptionalFloat(Form, "minPeriod", 0.0, None)
+    Options["max_period"] = ParseOptionalFloat(Form, "maxPeriod", 0.0, None)
+    Options["tls_template"] = ParseChoice(
+        Form,
         "tlsTemplate",
         {"default": "default", "grazing": "grazing", "box": "box"},
         "default",
     )
-    options["stellar_radius"] = parse_optional_float(form, "stellarRadius", 0.1, 100.0)
-    options["stellar_mass"] = parse_optional_float(form, "stellarMass", 0.01, 100.0)
-    options["limb_darkening_u1"] = parse_optional_float(form, "limbDarkeningU1", -1.0, 2.0)
-    options["limb_darkening_u2"] = parse_optional_float(form, "limbDarkeningU2", -1.0, 2.0)
-    options["tls_oversampling"] = parse_optional_int(form, "tlsOversampling", 1, 9) or 3
-    options["tls_min_transits"] = parse_optional_int(form, "tlsMinTransits", 2, 10) or 3
-    options["tls_max_signals"] = parse_optional_int(form, "tlsMaxSignals", 1, 5) or 1
-    options["tls_threads"] = (
-        parse_optional_int(form, "tlsThreads", 1, 8)
+    Options["stellar_radius"] = ParseOptionalFloat(Form, "stellarRadius", 0.1, 100.0)
+    Options["stellar_mass"] = ParseOptionalFloat(Form, "stellarMass", 0.01, 100.0)
+    Options["limb_darkening_u1"] = ParseOptionalFloat(Form, "limbDarkeningU1", -1.0, 2.0)
+    Options["limb_darkening_u2"] = ParseOptionalFloat(Form, "limbDarkeningU2", -1.0, 2.0)
+    Options["tls_oversampling"] = ParseOptionalInt(Form, "tlsOversampling", 1, 9) or 3
+    Options["tls_min_transits"] = ParseOptionalInt(Form, "tlsMinTransits", 2, 10) or 3
+    Options["tls_max_signals"] = ParseOptionalInt(Form, "tlsMaxSignals", 1, 5) or 1
+    Options["tls_threads"] = (
+        ParseOptionalInt(Form, "tlsThreads", 1, 8)
         or DEFAULT_DETECTION_OPTIONS["tls_threads"]
     )
-    options["tls_min_depth_ppm"] = parse_optional_float(form, "tlsMinDepthPpm", 0.1, 500000.0) or 10.0
-    options["tls_duration_grid_step"] = parse_optional_float(form, "tlsDurationGridStep", 1.01, 2.0) or 1.1
-    options["exposure_seconds"] = parse_optional_float(form, "exposureSeconds", 0.0, 86400.0)
-    limb_u1 = options["limb_darkening_u1"]
-    limb_u2 = options["limb_darkening_u2"]
-    if (limb_u1 is None) != (limb_u2 is None):
+    Options["tls_min_depth_ppm"] = ParseOptionalFloat(Form, "tlsMinDepthPpm", 0.1, 500000.0) or 10.0
+    Options["tls_duration_grid_step"] = ParseOptionalFloat(Form, "tlsDurationGridStep", 1.01, 2.0) or 1.1
+    Options["exposure_seconds"] = ParseOptionalFloat(Form, "exposureSeconds", 0.0, 86400.0)
+    LimbU1 = Options["limb_darkening_u1"]
+    LimbU2 = Options["limb_darkening_u2"]
+    if (LimbU1 is None) != (LimbU2 is None):
         raise ValueError("Both limbDarkeningU1 and limbDarkeningU2 are required when either is set.")
-    if limb_u1 is not None and (limb_u1 + limb_u2 < 0 or limb_u1 + limb_u2 > 1.5):
+    if LimbU1 is not None and (LimbU1 + LimbU2 < 0 or LimbU1 + LimbU2 > 1.5):
         raise ValueError("Quadratic limb-darkening coefficients must have a sum between 0 and 1.5.")
     if (
-        options["min_duration"] is not None
-        and options["max_duration"] is not None
-        and options["max_duration"] <= options["min_duration"]
+        Options["min_duration"] is not None
+        and Options["max_duration"] is not None
+        and Options["max_duration"] <= Options["min_duration"]
     ):
         raise ValueError("maxDuration must be greater than minDuration.")
     if (
-        options["min_period"] is not None
-        and options["max_period"] is not None
-        and options["max_period"] <= options["min_period"]
+        Options["min_period"] is not None
+        and Options["max_period"] is not None
+        and Options["max_period"] <= Options["min_period"]
     ):
         raise ValueError("maxPeriod must be greater than minPeriod.")
-    return options
+    return Options
 
 
-def odd_window_width(base_width, scale, minimum, maximum):
-    width = int(round(base_width * scale))
-    width = int(clamp(width, minimum, maximum))
-    if width % 2 == 0:
-        width += 1
-    return int(min(width, maximum if maximum % 2 == 1 else maximum - 1))
+#MARK: clean rows
+def OddWindowWidth(BaseWidth, Scale, Minimum, Maximum):
+    Width = int(round(BaseWidth * Scale))
+    Width = int(Clamp(Width, Minimum, Maximum))
+    if Width % 2 == 0:
+        Width += 1
+    return int(min(Width, Maximum if Maximum % 2 == 1 else Maximum - 1))
 
 
-def transit_preserving_smoothing_width(requested_width, cadence, duration):
+#MARK: smooth flux
+def TransitPreservingSmoothingWidth(RequestedWidth, Cadence, Duration):
     if (
-        duration is None
-        or not math.isfinite(float(duration))
-        or float(duration) <= 0
-        or not math.isfinite(float(cadence))
-        or float(cadence) <= 0
+        Duration is None
+        or not Math.isfinite(float(Duration))
+        or float(Duration) <= 0
+        or not Math.isfinite(float(Cadence))
+        or float(Cadence) <= 0
     ):
-        return int(requested_width)
+        return int(RequestedWidth)
 
-    transit_samples = float(duration) / float(cadence)
-    max_width = max(1, int(math.floor(transit_samples / 3.0)))
-    if max_width % 2 == 0:
-        max_width = max(1, max_width - 1)
-    return int(min(int(requested_width), max_width))
+    TransitSamples = float(Duration) / float(Cadence)
+    MaxWidth = max(1, int(Math.floor(TransitSamples / 3.0)))
+    if MaxWidth % 2 == 0:
+        MaxWidth = max(1, MaxWidth - 1)
+    return int(min(int(RequestedWidth), MaxWidth))
 
 
-def smoothed_transit_display_bounds(start, end, cadence, smooth_width, domain_min, domain_max):
-    start = float(start)
-    end = float(end)
-    cadence = float(cadence)
-    smooth_width = int(smooth_width)
-    if not math.isfinite(cadence) or cadence <= 0 or smooth_width <= 1:
-        return start, end
+#MARK: smooth flux
+def SmoothedTransitDisplayBounds(Start, End, Cadence, SmoothWidth, DomainMin, DomainMax):
+    Start = float(Start)
+    End = float(End)
+    Cadence = float(Cadence)
+    SmoothWidth = int(SmoothWidth)
+    if not Math.isfinite(Cadence) or Cadence <= 0 or SmoothWidth <= 1:
+        return Start, End
 
-    smoothing_radius = (smooth_width // 2) * cadence
+    SmoothingRadius = (SmoothWidth // 2) * Cadence
     return (
-        float(max(domain_min, start - smoothing_radius)),
-        float(min(domain_max, end + smoothing_radius)),
+        float(max(DomainMin, Start - SmoothingRadius)),
+        float(min(DomainMax, End + SmoothingRadius)),
     )
 
 
-def moving_average(values, width):
-    if width <= 1:
-        return values.copy()
-    kernel = np.ones(width, dtype=float) / width
-    padded = np.pad(values, (width // 2, width - 1 - width // 2), mode="edge")
-    return np.convolve(padded, kernel, mode="valid")
+#MARK: moving average
+def MovingAverage(Values, Width):
+    if Width <= 1:
+        return Values.copy()
+    Kernel = Np.ones(Width, dtype=float) / Width
+    Padded = Np.pad(Values, (Width // 2, Width - 1 - Width // 2), mode="edge")
+    return Np.convolve(Padded, Kernel, mode="valid")
 
 
-def moving_average_by_segments(values, width, segments):
-    values = np.asarray(values, dtype=float)
-    if width <= 1 or not segments:
-        return values.copy()
+#MARK: curve funcs
+def MovingAverageBySegments(Values, Width, Segments):
+    Values = Np.asarray(Values, dtype=float)
+    if Width <= 1 or not Segments:
+        return Values.copy()
 
-    smoothed = values.copy()
-    for start, end in segments:
-        length = int(end - start)
-        if length <= 1:
+    Smoothed = Values.copy()
+    for Start, End in Segments:
+        Length = int(End - Start)
+        if Length <= 1:
             continue
-        segment_width = min(int(width), length)
-        if segment_width % 2 == 0:
-            segment_width -= 1
-        if segment_width <= 1:
+        SegmentWidth = min(int(Width), Length)
+        if SegmentWidth % 2 == 0:
+            SegmentWidth -= 1
+        if SegmentWidth <= 1:
             continue
-        smoothed[start:end] = moving_average(values[start:end], segment_width)
-    return smoothed
+        Smoothed[Start:End] = MovingAverage(Values[Start:End], SegmentWidth)
+    return Smoothed
 
 
-def observing_segments(time):
-    if len(time) == 0:
+#MARK: observing segments
+def ObservingSegments(Time):
+    if len(Time) == 0:
         return []
-    if len(time) == 1:
+    if len(Time) == 1:
         return [(0, 1)]
 
-    deltas = np.diff(time)
-    positive_deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
-    if positive_deltas.size == 0:
-        return [(0, len(time))]
+    Deltas = Np.diff(Time)
+    PositiveDeltas = Deltas[Np.isfinite(Deltas) & (Deltas > 0)]
+    if PositiveDeltas.size == 0:
+        return [(0, len(Time))]
 
-    cadence = float(np.median(positive_deltas))
-    full_span = float(time[-1] - time[0])
-    gap_threshold = max(cadence * 25.0, 0.25)
-    if full_span > 0:
-        gap_threshold = min(gap_threshold, max(cadence * 25.0, full_span * 0.08))
+    Cadence = float(Np.median(PositiveDeltas))
+    FullSpan = float(Time[-1] - Time[0])
+    GapThreshold = max(Cadence * 25.0, 0.25)
+    if FullSpan > 0:
+        GapThreshold = min(GapThreshold, max(Cadence * 25.0, FullSpan * 0.08))
 
-    starts = np.r_[0, np.where(deltas > gap_threshold)[0] + 1]
-    ends = np.r_[starts[1:], len(time)]
+    Starts = Np.r_[0, Np.where(Deltas > GapThreshold)[0] + 1]
+    Ends = Np.r_[Starts[1:], len(Time)]
     return [
-        (int(start), int(end))
-        for start, end in zip(starts, ends)
-        if end > start
+        (int(Start), int(End))
+        for Start, End in zip(Starts, Ends)
+        if End > Start
     ]
 
 
-def flux_normalization_plan(flux):
-    values = np.asarray(flux, dtype=float)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
+#MARK: clean rows
+def FluxNormalizationPlan(Flux):
+    Values = Np.asarray(Flux, dtype=float)
+    Finite = Values[Np.isfinite(Values)]
+    if Finite.size == 0:
         return {
             "input_representation": "absolute or relative flux",
             "residual_scale": None,
             "method": "per-observing-segment median",
         }
 
-    baseline = float(np.median(finite))
-    low, high = np.percentile(finite, [5.0, 95.0])
-    mad = float(np.median(np.abs(finite - baseline)))
-    robust_spread = max(1.4826 * mad, float((high - low) / 2.0), 1e-12)
-    crosses_zero = low < 0 < high
-    residual_like = (
-        not math.isfinite(baseline)
-        or baseline <= 1e-9
-        or (crosses_zero and abs(baseline) <= robust_spread * 5.0)
+    Baseline = float(Np.median(Finite))
+    Low, High = Np.percentile(Finite, [5.0, 95.0])
+    Mad = float(Np.median(Np.abs(Finite - Baseline)))
+    RobustSpread = max(1.4826 * Mad, float((High - Low) / 2.0), 1e-12)
+    CrossesZero = Low < 0 < High
+    ResidualLike = (
+        not Math.isfinite(Baseline)
+        or Baseline <= 1e-9
+        or (CrossesZero and abs(Baseline) <= RobustSpread * 5.0)
     )
-    if not residual_like:
+    if not ResidualLike:
         return {
             "input_representation": "absolute or relative flux",
             "residual_scale": None,
             "method": "per-observing-segment median",
         }
 
-    amplitude = float(np.percentile(np.abs(finite), 95.0))
-    residual_scale = 1000000.0 if amplitude > 1.0 else 1.0
+    Amplitude = float(Np.percentile(Np.abs(Finite), 95.0))
+    ResidualScale = 1000000.0 if Amplitude > 1.0 else 1.0
     return {
         "input_representation": (
             "zero-centered residual flux (ppm)"
-            if residual_scale == 1000000.0
+            if ResidualScale == 1000000.0
             else "zero-centered residual relative flux"
         ),
-        "residual_scale": residual_scale,
+        "residual_scale": ResidualScale,
         "method": "residual-to-relative conversion, then per-observing-segment median",
     }
 
 
-def normalize_flux_by_segments(time, flux):
-    plan = flux_normalization_plan(flux)
-    normalized = np.asarray(flux, dtype=float).copy()
-    residual_scale = plan["residual_scale"]
-    if residual_scale is not None:
-        normalized = 1.0 + normalized / residual_scale
-    segments = observing_segments(time)
+#MARK: clean rows
+def NormalizeFluxBySegments(Time, Flux):
+    Plan = FluxNormalizationPlan(Flux)
+    Normalized = Np.asarray(Flux, dtype=float).copy()
+    ResidualScale = Plan["residual_scale"]
+    if ResidualScale is not None:
+        Normalized = 1.0 + Normalized / ResidualScale
+    Segments = ObservingSegments(Time)
 
-    for start, end in segments:
-        segment = normalized[start:end]
-        baseline = float(np.median(segment))
-        if math.isfinite(baseline) and baseline > 1e-9:
-            normalized[start:end] = segment / baseline
+    for Start, End in Segments:
+        Segment = Normalized[Start:End]
+        Baseline = float(Np.median(Segment))
+        if Math.isfinite(Baseline) and Baseline > 1e-9:
+            Normalized[Start:End] = Segment / Baseline
 
-    return normalized, segments
+    return Normalized, Segments
 
 
-def contiguous_regions(mask):
-    if not np.any(mask):
+#MARK: contiguous regions
+def ContiguousRegions(Mask):
+    if not Np.any(Mask):
         return []
-    edges = np.diff(mask.astype(np.int8))
-    starts = np.where(edges == 1)[0] + 1
-    ends = np.where(edges == -1)[0] + 1
-    if mask[0]:
-        starts = np.r_[0, starts]
-    if mask[-1]:
-        ends = np.r_[ends, mask.size]
-    return list(zip(starts.tolist(), ends.tolist()))
+    Edges = Np.diff(Mask.astype(Np.int8))
+    Starts = Np.where(Edges == 1)[0] + 1
+    Ends = Np.where(Edges == -1)[0] + 1
+    if Mask[0]:
+        Starts = Np.r_[0, Starts]
+    if Mask[-1]:
+        Ends = Np.r_[Ends, Mask.size]
+    return list(zip(Starts.tolist(), Ends.tolist()))
 
 
-def merge_regions(regions, max_gap):
-    if not regions:
+#MARK: merge regions
+def MergeRegions(Regions, MaxGap):
+    if not Regions:
         return []
-    merged = [regions[0]]
-    for start, end in regions[1:]:
-        prev_start, prev_end = merged[-1]
-        if start - prev_end <= max_gap:
-            merged[-1] = (prev_start, end)
+    Merged = [Regions[0]]
+    for Start, End in Regions[1:]:
+        PrevStart, PrevEnd = Merged[-1]
+        if Start - PrevEnd <= MaxGap:
+            Merged[-1] = (PrevStart, End)
         else:
-            merged.append((start, end))
-    return merged
+            Merged.append((Start, End))
+    return Merged
 
 
-def estimate_period(centers):
-    if len(centers) < 2:
+#MARK: period funcs
+def EstimatePeriod(Centers):
+    if len(Centers) < 2:
         return None, None, 0
-    centers = np.asarray(sorted(centers), dtype=float)
-    gaps = np.diff(centers)
-    if gaps.size == 0:
+    Centers = Np.asarray(sorted(Centers), dtype=float)
+    Gaps = Np.diff(Centers)
+    if Gaps.size == 0:
         return None, None, 0
 
-    period = float(np.mean(gaps))
-    scatter = float(np.std(gaps)) if gaps.size > 1 else 0.0
-    return period, scatter, int(len(centers))
+    Period = float(Np.mean(Gaps))
+    Scatter = float(Np.std(Gaps)) if Gaps.size > 1 else 0.0
+    return Period, Scatter, int(len(Centers))
 
 
-def estimate_period_from_candidates(transits, time_span):
-    centers = np.asarray([item["center"] for item in transits], dtype=float)
-    return estimate_period(centers)
+#MARK: period funcs
+def EstimatePeriodFromCandidates(Transits, TimeSpan):
+    Centers = Np.asarray([Item["center"] for Item in Transits], dtype=float)
+    return EstimatePeriod(Centers)
 
 
-def flattened_flux_for_period_search(time, flux):
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    if full_span <= 0:
+#MARK: period funcs
+def FlattenedFluxForPeriodSearch(Time, Flux):
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    if FullSpan <= 0:
         return None
 
-    flattened_flux = np.empty_like(flux, dtype=float)
-    for start, end in observing_segments(time):
-        values = np.asarray(flux[start:end], dtype=float)
-        segment_steps = np.diff(time[start:end])
-        positive = segment_steps[segment_steps > 0]
-        local_cadence = float(np.median(positive)) if positive.size else cadence
-        # Clip only upward transients for the search. Clipping the low tail at
-        # a global MAD erased deep, short transits in otherwise quiet curves.
-        low, high = robust_flux_limits(values, sigma=5.0)
-        clipped = np.minimum(values, high)
-        trend_days = min(10.0, max(2.0, float(time[end - 1] - time[start]) / 6.0))
-        trend_width = min(len(values), max(5, int(trend_days / max(local_cadence, 1e-9))))
-        if trend_width % 2 == 0:
-            trend_width -= 1
-        # A clipped trend prevents transits from pulling the local continuum
-        # down while the un-clipped downward samples remain available to TLS.
-        trend = moving_average(np.clip(values, low, high), max(trend_width, 1))
-        segment_flat = clipped - trend
-        flattened_flux[start:end] = segment_flat - np.median(segment_flat)
-    return flattened_flux
+    FlattenedFlux = Np.empty_like(Flux, dtype=float)
+    for Start, End in ObservingSegments(Time):
+        Values = Np.asarray(Flux[Start:End], dtype=float)
+        SegmentSteps = Np.diff(Time[Start:End])
+        Positive = SegmentSteps[SegmentSteps > 0]
+        LocalCadence = float(Np.median(Positive)) if Positive.size else Cadence
+        # keep dips for tls. only clip upward spikes here.
+        Low, High = RobustFluxLimits(Values, Sigma=5.0)
+        Clipped = Np.minimum(Values, High)
+        TrendDays = min(10.0, max(2.0, float(Time[End - 1] - Time[Start]) / 6.0))
+        TrendWidth = min(len(Values), max(5, int(TrendDays / max(LocalCadence, 1e-9))))
+        if TrendWidth % 2 == 0:
+            TrendWidth -= 1
+        # clip the trend separately so deep dips don't drag the baseline down.
+        Trend = MovingAverage(Np.clip(Values, Low, High), max(TrendWidth, 1))
+        SegmentFlat = Clipped - Trend
+        FlattenedFlux[Start:End] = SegmentFlat - Np.median(SegmentFlat)
+    return FlattenedFlux
 
 
-def chi_squared_transit_probability(time, flattened_flux, period, duration, transit_time):
-    if chi2 is None or period <= 0 or duration <= 0:
+#MARK: curve funcs
+def ChiSquaredTransitProbability(Time, FlattenedFlux, Period, Duration, TransitTime):
+    if Chi2 is None or Period <= 0 or Duration <= 0:
         return None
 
-    phase = ((time - transit_time + period / 2.0) % period) - period / 2.0
-    in_transit = np.abs(phase) <= duration / 2.0
-    if np.count_nonzero(in_transit) < 3 or np.count_nonzero(~in_transit) < 3:
+    Phase = ((Time - TransitTime + Period / 2.0) % Period) - Period / 2.0
+    InTransit = Np.abs(Phase) <= Duration / 2.0
+    if Np.count_nonzero(InTransit) < 3 or Np.count_nonzero(~InTransit) < 3:
         return None
 
-    y = np.asarray(flattened_flux, dtype=float)
-    baseline = float(np.mean(y))
-    flat_residuals = y - baseline
-    flat_mad = float(np.median(np.abs(flat_residuals - np.median(flat_residuals))))
-    sigma = max(1.4826 * flat_mad, float(np.std(flat_residuals)), 1e-9)
+    Y = Np.asarray(FlattenedFlux, dtype=float)
+    Baseline = float(Np.mean(Y))
+    FlatResiduals = Y - Baseline
+    FlatMad = float(Np.median(Np.abs(FlatResiduals - Np.median(FlatResiduals))))
+    Sigma = max(1.4826 * FlatMad, float(Np.std(FlatResiduals)), 1e-9)
 
-    in_level = float(np.mean(y[in_transit]))
-    out_level = float(np.mean(y[~in_transit]))
-    if in_level >= out_level:
+    InLevel = float(Np.mean(Y[InTransit]))
+    OutLevel = float(Np.mean(Y[~InTransit]))
+    if InLevel >= OutLevel:
         return None
 
-    box_model = np.where(in_transit, in_level, out_level)
-    chi2_flat = float(np.sum(((y - baseline) / sigma) ** 2))
-    chi2_box = float(np.sum(((y - box_model) / sigma) ** 2))
-    delta_chi2 = max(0.0, chi2_flat - chi2_box)
-    p_value = float(chi2.sf(delta_chi2, 1))
-    if not math.isfinite(p_value):
-        p_value = 0.0
+    BoxModel = Np.where(InTransit, InLevel, OutLevel)
+    Chi2Flat = float(Np.sum(((Y - Baseline) / Sigma) ** 2))
+    Chi2Box = float(Np.sum(((Y - BoxModel) / Sigma) ** 2))
+    DeltaChi2 = max(0.0, Chi2Flat - Chi2Box)
+    PValue = float(Chi2.sf(DeltaChi2, 1))
+    if not Math.isfinite(PValue):
+        PValue = 0.0
 
     return {
-        "chi_squared_flat": chi2_flat,
-        "chi_squared_box": chi2_box,
-        "reduced_chi_squared_box": chi2_box / max(len(y) - 2, 1),
-        "delta_chi_squared": delta_chi2,
-        "p_value": p_value,
+        "chi_squared_flat": Chi2Flat,
+        "chi_squared_box": Chi2Box,
+        "reduced_chi_squared_box": Chi2Box / max(len(Y) - 2, 1),
+        "delta_chi_squared": DeltaChi2,
+        "p_value": PValue,
     }
 
 
-def period_search_bounds(cadence, full_span, options=None):
-    auto_min_period = max(cadence * 20.0, 0.5)
-    minimum_transits = int((options or {}).get("tls_min_transits", 3))
-    auto_max_period = max(auto_min_period * 1.5, full_span / max(minimum_transits, 2))
-    min_period = auto_min_period
-    max_period = auto_max_period
-    if options:
-        if options.get("min_period") is not None:
-            min_period = max(cadence * 2.0, float(options["min_period"]))
-        if options.get("max_period") is not None:
-            max_period = min(full_span * 0.95, float(options["max_period"]))
-    return min_period, max_period
+#MARK: period funcs
+def PeriodSearchBounds(Cadence, FullSpan, Options=None):
+    AutoMinPeriod = max(Cadence * 20.0, 0.5)
+    MinimumTransits = int((Options or {}).get("tls_min_transits", 3))
+    AutoMaxPeriod = max(AutoMinPeriod * 1.5, FullSpan / max(MinimumTransits, 2))
+    MinPeriod = AutoMinPeriod
+    MaxPeriod = AutoMaxPeriod
+    if Options:
+        if Options.get("min_period") is not None:
+            MinPeriod = max(Cadence * 2.0, float(Options["min_period"]))
+        if Options.get("max_period") is not None:
+            MaxPeriod = min(FullSpan * 0.95, float(Options["max_period"]))
+    return MinPeriod, MaxPeriod
 
 
-def duration_search_bounds(cadence, full_span, options=None):
-    auto_min_duration = max(cadence * 4.0, 0.05)
-    auto_max_duration = min(30.0, max(auto_min_duration * 2.0, full_span / 8.0))
-    min_duration = auto_min_duration
-    max_duration = auto_max_duration
-    if options:
-        if options.get("min_duration") is not None:
-            min_duration = max(cadence * 2.0, float(options["min_duration"]))
-        if options.get("max_duration") is not None:
-            max_duration = min(full_span * 0.25, float(options["max_duration"]))
-    return min_duration, max_duration
+#MARK: model shape
+def DurationSearchBounds(Cadence, FullSpan, Options=None):
+    AutoMinDuration = max(Cadence * 4.0, 0.05)
+    AutoMaxDuration = min(30.0, max(AutoMinDuration * 2.0, FullSpan / 8.0))
+    MinDuration = AutoMinDuration
+    MaxDuration = AutoMaxDuration
+    if Options:
+        if Options.get("min_duration") is not None:
+            MinDuration = max(Cadence * 2.0, float(Options["min_duration"]))
+        if Options.get("max_duration") is not None:
+            MaxDuration = min(FullSpan * 0.25, float(Options["max_duration"]))
+    return MinDuration, MaxDuration
 
 
-def period_grid(min_period, max_period, count):
-    if min_period >= max_period:
-        return np.asarray([], dtype=float)
+#MARK: period funcs
+def PeriodGrid(MinPeriod, MaxPeriod, Count):
+    if MinPeriod >= MaxPeriod:
+        return Np.asarray([], dtype=float)
 
-    linear_periods = np.linspace(min_period, max_period, count)
-    frequency_periods = 1.0 / np.linspace(1.0 / max_period, 1.0 / min_period, count)
-    periods = np.unique(np.r_[linear_periods, frequency_periods])
-    periods = periods[(periods >= min_period) & (periods <= max_period)]
-    return np.sort(periods.astype(float))
+    LinearPeriods = Np.linspace(MinPeriod, MaxPeriod, Count)
+    FrequencyPeriods = 1.0 / Np.linspace(1.0 / MaxPeriod, 1.0 / MinPeriod, Count)
+    Periods = Np.unique(Np.r_[LinearPeriods, FrequencyPeriods])
+    Periods = Periods[(Periods >= MinPeriod) & (Periods <= MaxPeriod)]
+    return Np.sort(Periods.astype(float))
 
 
-def build_periodogram_payload(periods, powers, power_median=None, power_std=None, method=None, selected_period=None):
-    periods = np.asarray(periods, dtype=float)
-    powers = np.asarray(powers, dtype=float)
-    size = min(periods.size, powers.size)
-    if size == 0:
+#MARK: period peaks
+def BuildPeriodogramPayload(Periods, Powers, PowerMedian=None, PowerStd=None, Method=None, SelectedPeriod=None):
+    Periods = Np.asarray(Periods, dtype=float)
+    Powers = Np.asarray(Powers, dtype=float)
+    Size = min(Periods.size, Powers.size)
+    if Size == 0:
         return None
 
-    periods = periods[:size]
-    powers = powers[:size]
-    valid = np.isfinite(periods) & np.isfinite(powers) & (periods > 0)
-    if not np.any(valid):
+    Periods = Periods[:Size]
+    Powers = Powers[:Size]
+    Valid = Np.isfinite(Periods) & Np.isfinite(Powers) & (Periods > 0)
+    if not Np.any(Valid):
         return None
 
-    periods = periods[valid]
-    powers = powers[valid]
-    order = np.argsort(periods)
-    periods = periods[order]
-    powers = powers[order]
-    point_count = int(periods.size)
+    Periods = Periods[Valid]
+    Powers = Powers[Valid]
+    Order = Np.argsort(Periods)
+    Periods = Periods[Order]
+    Powers = Powers[Order]
+    PointCount = int(Periods.size)
 
-    finite_powers = powers[np.isfinite(powers)]
-    if power_median is None or power_std is None:
-        if finite_powers.size >= 5:
-            power_median = float(np.median(finite_powers))
-            power_std = max(float(np.std(finite_powers)), 1e-9)
-    if power_median is not None and power_std is not None and power_std > 0:
-        sdes = (powers - float(power_median)) / float(power_std)
+    FinitePowers = Powers[Np.isfinite(Powers)]
+    if PowerMedian is None or PowerStd is None:
+        if FinitePowers.size >= 5:
+            PowerMedian = float(Np.median(FinitePowers))
+            PowerStd = max(float(Np.std(FinitePowers)), 1e-9)
+    if PowerMedian is not None and PowerStd is not None and PowerStd > 0:
+        Sdes = (Powers - float(PowerMedian)) / float(PowerStd)
     else:
-        sdes = np.full(periods.shape, np.nan, dtype=float)
+        Sdes = Np.full(Periods.shape, Np.nan, dtype=float)
 
-    keep = set(np.linspace(0, point_count - 1, min(point_count, MAX_PERIODOGRAM_POINTS), dtype=int).tolist())
-    top_count = min(80, point_count)
-    if top_count:
-        top_indices = np.argpartition(powers, point_count - top_count)[-top_count:]
-        keep.update(int(index) for index in top_indices)
-    if selected_period is not None and math.isfinite(float(selected_period)) and selected_period > 0:
-        keep.add(int(np.argmin(np.abs(periods - float(selected_period)))))
+    Keep = set(Np.linspace(0, PointCount - 1, min(PointCount, MAX_PERIODOGRAM_POINTS), dtype=int).tolist())
+    TopCount = min(80, PointCount)
+    if TopCount:
+        TopIndices = Np.argpartition(Powers, PointCount - TopCount)[-TopCount:]
+        Keep.update(int(Index) for Index in TopIndices)
+    if SelectedPeriod is not None and Math.isfinite(float(SelectedPeriod)) and SelectedPeriod > 0:
+        Keep.add(int(Np.argmin(Np.abs(Periods - float(SelectedPeriod)))))
 
-    keep_indices = np.asarray(sorted(keep), dtype=int)
-    shown_periods = periods[keep_indices]
-    shown_powers = powers[keep_indices]
-    shown_sdes = sdes[keep_indices]
+    KeepIndices = Np.asarray(sorted(Keep), dtype=int)
+    ShownPeriods = Periods[KeepIndices]
+    ShownPowers = Powers[KeepIndices]
+    ShownSdes = Sdes[KeepIndices]
 
     return {
-        "periods": [float(value) for value in shown_periods],
-        "power": [float(value) for value in shown_powers],
-        "sde": [float(value) if math.isfinite(float(value)) else None for value in shown_sdes],
-        "method": method,
-        "selected_period": float(selected_period) if selected_period is not None and math.isfinite(float(selected_period)) and selected_period > 0 else None,
-        "power_median": float(power_median) if power_median is not None and math.isfinite(float(power_median)) else None,
-        "power_std": float(power_std) if power_std is not None and math.isfinite(float(power_std)) else None,
-        "point_count": point_count,
-        "shown_count": int(shown_periods.size),
+        "periods": [float(Value) for Value in ShownPeriods],
+        "power": [float(Value) for Value in ShownPowers],
+        "sde": [float(Value) if Math.isfinite(float(Value)) else None for Value in ShownSdes],
+        "method": Method,
+        "selected_period": float(SelectedPeriod) if SelectedPeriod is not None and Math.isfinite(float(SelectedPeriod)) and SelectedPeriod > 0 else None,
+        "power_median": float(PowerMedian) if PowerMedian is not None and Math.isfinite(float(PowerMedian)) else None,
+        "power_std": float(PowerStd) if PowerStd is not None and Math.isfinite(float(PowerStd)) else None,
+        "point_count": PointCount,
+        "shown_count": int(ShownPeriods.size),
     }
 
 
-def constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options=None):
-    max_duration = min(max_duration, min_period * 0.5)
-    if min_duration >= max_duration:
-        if options and options.get("min_duration") is not None:
-            return min_duration, max_duration
-        min_duration = max(cadence * 2.0, max_duration * 0.2)
-    return min_duration, max_duration
+#MARK: model shape
+def ConstrainDurationBounds(Cadence, MinPeriod, MinDuration, MaxDuration, Options=None):
+    MaxDuration = min(MaxDuration, MinPeriod * 0.5)
+    if MinDuration >= MaxDuration:
+        if Options and Options.get("min_duration") is not None:
+            return MinDuration, MaxDuration
+        MinDuration = max(Cadence * 2.0, MaxDuration * 0.2)
+    return MinDuration, MaxDuration
 
 
-def estimate_period_with_binned_bls(time, flux, options=None):
-    if len(time) < 50:
+#MARK: bls funcs
+def EstimatePeriodWithBinnedBls(Time, Flux, Options=None):
+    if len(Time) < 50:
         return None
 
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    if full_span <= 0:
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    if FullSpan <= 0:
         return None
 
-    flattened_flux = flattened_flux_for_period_search(time, flux)
-    if flattened_flux is None:
+    FlattenedFlux = FlattenedFluxForPeriodSearch(Time, Flux)
+    if FlattenedFlux is None:
         return None
-    residual_median = float(np.median(flattened_flux))
-    residual_mad = float(np.median(np.abs(flattened_flux - residual_median)))
-    sigma = max(1.4826 * residual_mad, float(np.std(flattened_flux)), 1e-9)
+    ResidualMedian = float(Np.median(FlattenedFlux))
+    ResidualMad = float(Np.median(Np.abs(FlattenedFlux - ResidualMedian)))
+    Sigma = max(1.4826 * ResidualMad, float(Np.std(FlattenedFlux)), 1e-9)
 
-    min_period, max_period = period_search_bounds(cadence, full_span, options)
-    min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
-    min_duration, max_duration = constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options)
-    if min_period >= max_period or min_duration >= max_duration:
+    MinPeriod, MaxPeriod = PeriodSearchBounds(Cadence, FullSpan, Options)
+    MinDuration, MaxDuration = DurationSearchBounds(Cadence, FullSpan, Options)
+    MinDuration, MaxDuration = ConstrainDurationBounds(Cadence, MinPeriod, MinDuration, MaxDuration, Options)
+    if MinPeriod >= MaxPeriod or MinDuration >= MaxDuration:
         return None
 
-    periods = period_grid(min_period, max_period, 900)
-    durations = np.linspace(min_duration, max_duration, 10)
-    bin_count = 360
-    best = None
-    powers = []
-    reference_time = float(time[0])
+    Periods = PeriodGrid(MinPeriod, MaxPeriod, 900)
+    Durations = Np.linspace(MinDuration, MaxDuration, 10)
+    BinCount = 360
+    Best = None
+    Powers = []
+    ReferenceTime = float(Time[0])
 
-    for period in periods:
-        phase = ((time - reference_time) % period) / period
-        bin_ids = np.minimum((phase * bin_count).astype(int), bin_count - 1)
-        sums = np.bincount(bin_ids, weights=flattened_flux, minlength=bin_count)
-        counts = np.bincount(bin_ids, minlength=bin_count)
-        doubled_sums = np.r_[sums, sums]
-        doubled_counts = np.r_[counts, counts]
-        sum_prefix = np.r_[0.0, np.cumsum(doubled_sums)]
-        count_prefix = np.r_[0.0, np.cumsum(doubled_counts)]
-        period_best_power = -math.inf
+    for Period in Periods:
+        Phase = ((Time - ReferenceTime) % Period) / Period
+        BinIds = Np.minimum((Phase * BinCount).astype(int), BinCount - 1)
+        Sums = Np.bincount(BinIds, weights=FlattenedFlux, minlength=BinCount)
+        Counts = Np.bincount(BinIds, minlength=BinCount)
+        DoubledSums = Np.r_[Sums, Sums]
+        DoubledCounts = Np.r_[Counts, Counts]
+        SumPrefix = Np.r_[0.0, Np.cumsum(DoubledSums)]
+        CountPrefix = Np.r_[0.0, Np.cumsum(DoubledCounts)]
+        PeriodBestPower = -Math.inf
 
-        for duration in durations:
-            window = max(1, int(round((duration / period) * bin_count)))
-            if window >= bin_count // 2:
+        for Duration in Durations:
+            Window = max(1, int(round((Duration / Period) * BinCount)))
+            if Window >= BinCount // 2:
                 continue
 
-            window_sums = sum_prefix[window:window + bin_count] - sum_prefix[:bin_count]
-            window_counts = count_prefix[window:window + bin_count] - count_prefix[:bin_count]
-            valid = window_counts > 2
-            if not np.any(valid):
+            WindowSums = SumPrefix[Window:Window + BinCount] - SumPrefix[:BinCount]
+            WindowCounts = CountPrefix[Window:Window + BinCount] - CountPrefix[:BinCount]
+            Valid = WindowCounts > 2
+            if not Np.any(Valid):
                 continue
 
-            means = np.where(valid, window_sums / np.maximum(window_counts, 1), np.inf)
-            bin_index = int(np.argmin(means))
-            depth = -float(means[bin_index])
-            if depth <= 0:
+            Means = Np.where(Valid, WindowSums / Np.maximum(WindowCounts, 1), Np.inf)
+            BinIndex = int(Np.argmin(Means))
+            Depth = -float(Means[BinIndex])
+            if Depth <= 0:
                 continue
 
-            power = depth / sigma * math.sqrt(max(float(window_counts[bin_index]), 1.0))
-            period_best_power = max(period_best_power, power)
-            if best is None or power > best["power"]:
-                transit_time = reference_time + ((bin_index + window / 2.0) / bin_count) * period
-                best = {
-                    "period": float(period),
-                    "duration": float(duration),
-                    "transit_time": float(transit_time),
+            power = Depth / Sigma * Math.sqrt(max(float(WindowCounts[BinIndex]), 1.0))
+            PeriodBestPower = max(PeriodBestPower, power)
+            if Best is None or power > Best["power"]:
+                TransitTime = ReferenceTime + ((BinIndex + Window / 2.0) / BinCount) * Period
+                Best = {
+                    "period": float(Period),
+                    "duration": float(Duration),
+                    "transit_time": float(TransitTime),
                     "power": float(power),
                 }
 
-        powers.append(period_best_power if math.isfinite(period_best_power) else 0.0)
+        Powers.append(PeriodBestPower if Math.isfinite(PeriodBestPower) else 0.0)
 
-    if best is None:
+    if Best is None:
         return None
 
-    powers = np.asarray(powers, dtype=float)
-    finite_powers = powers[np.isfinite(powers)]
-    power_median = None
-    power_std = None
-    if finite_powers.size >= 5:
-        power_median = float(np.median(finite_powers))
-        power_std = max(float(np.std(finite_powers)), 1e-9)
-        sde = (best["power"] - power_median) / power_std
+    Powers = Np.asarray(Powers, dtype=float)
+    FinitePowers = Powers[Np.isfinite(Powers)]
+    PowerMedian = None
+    PowerStd = None
+    if FinitePowers.size >= 5:
+        PowerMedian = float(Np.median(FinitePowers))
+        PowerStd = max(float(Np.std(FinitePowers)), 1e-9)
+        Sde = (Best["power"] - PowerMedian) / PowerStd
     else:
-        sde = None
+        Sde = None
 
-    candidate_indices = np.argsort(powers)[-8:][::-1]
-    candidates = []
-    for index in candidate_indices:
-        power = float(powers[index])
-        if not math.isfinite(power) or power <= 0:
+    CandidateIndices = Np.argsort(Powers)[-8:][::-1]
+    Candidates = []
+    for Index in CandidateIndices:
+        power = float(Powers[Index])
+        if not Math.isfinite(power) or power <= 0:
             continue
-        candidates.append({
-            "period": float(periods[index]),
+        Candidates.append({
+            "period": float(Periods[Index]),
             "power": power,
-            "sde": None if sde is None else float((power - power_median) / power_std),
+            "sde": None if Sde is None else float((power - PowerMedian) / PowerStd),
         })
 
-    first_epoch = math.ceil((time[0] - best["transit_time"]) / best["period"])
-    last_epoch = math.floor((time[-1] - best["transit_time"]) / best["period"])
-    expected_count = max(1, int(last_epoch - first_epoch + 1))
-    chi_squared = chi_squared_transit_probability(
-        time,
-        flattened_flux,
-        best["period"],
-        best["duration"],
-        best["transit_time"],
+    FirstEpoch = Math.ceil((Time[0] - Best["transit_time"]) / Best["period"])
+    LastEpoch = Math.floor((Time[-1] - Best["transit_time"]) / Best["period"])
+    ExpectedCount = max(1, int(LastEpoch - FirstEpoch + 1))
+    ChiSquared = ChiSquaredTransitProbability(
+        Time,
+        FlattenedFlux,
+        Best["period"],
+        Best["duration"],
+        Best["transit_time"],
     )
     return {
-        "period": best["period"],
+        "period": Best["period"],
         "scatter": 0.0,
-        "count": expected_count,
-        "duration": best["duration"],
-        "transit_time": best["transit_time"],
-        "power": best["power"],
-        "sde": sde,
-        "candidates": candidates,
-        "periodogram": build_periodogram_payload(
-            periods,
-            powers,
-            power_median=power_median,
-            power_std=power_std,
-            method="binned BLS fallback",
-            selected_period=best["period"],
+        "count": ExpectedCount,
+        "duration": Best["duration"],
+        "transit_time": Best["transit_time"],
+        "power": Best["power"],
+        "sde": Sde,
+        "candidates": Candidates,
+        "periodogram": BuildPeriodogramPayload(
+            Periods,
+            Powers,
+            PowerMedian=PowerMedian,
+            PowerStd=PowerStd,
+            Method="binned BLS fallback",
+            SelectedPeriod=Best["period"],
         ),
-        "search_min_period": float(min_period),
-        "search_max_period": float(max_period),
-        "search_min_duration": float(min_duration),
-        "search_max_duration": float(max_duration),
+        "search_min_period": float(MinPeriod),
+        "search_max_period": float(MaxPeriod),
+        "search_min_duration": float(MinDuration),
+        "search_max_duration": float(MaxDuration),
         "method": "binned BLS fallback",
-        **(chi_squared or {}),
+        **(ChiSquared or {}),
     }
 
 
-def estimate_period_with_bls(time, flux, options=None):
-    if BoxLeastSquares is None or len(time) < 50:
-        return estimate_period_with_binned_bls(time, flux, options)
+#MARK: bls funcs
+def EstimatePeriodWithBls(Time, Flux, Options=None):
+    if BoxLeastSquares is None or len(Time) < 50:
+        return EstimatePeriodWithBinnedBls(Time, Flux, Options)
 
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    if full_span <= 0:
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    if FullSpan <= 0:
         return None
 
-    flattened_flux = flattened_flux_for_period_search(time, flux)
-    if flattened_flux is None:
+    FlattenedFlux = FlattenedFluxForPeriodSearch(Time, Flux)
+    if FlattenedFlux is None:
         return None
 
-    min_period, max_period = period_search_bounds(cadence, full_span, options)
-    min_duration, max_duration = duration_search_bounds(cadence, full_span, options)
-    min_duration, max_duration = constrain_duration_bounds(cadence, min_period, min_duration, max_duration, options)
-    if min_period >= max_period or min_duration >= max_duration:
+    MinPeriod, MaxPeriod = PeriodSearchBounds(Cadence, FullSpan, Options)
+    MinDuration, MaxDuration = DurationSearchBounds(Cadence, FullSpan, Options)
+    MinDuration, MaxDuration = ConstrainDurationBounds(Cadence, MinPeriod, MinDuration, MaxDuration, Options)
+    if MinPeriod >= MaxPeriod or MinDuration >= MaxDuration:
         return None
 
-    periods = period_grid(min_period, max_period, 1200)
-    durations = np.linspace(min_duration, max_duration, 12)
+    Periods = PeriodGrid(MinPeriod, MaxPeriod, 1200)
+    Durations = Np.linspace(MinDuration, MaxDuration, 12)
     try:
-        model = BoxLeastSquares(time, flattened_flux)
-        result = model.power(periods, durations)
+        Model = BoxLeastSquares(Time, FlattenedFlux)
+        Result = Model.power(Periods, Durations)
     except Exception:
-        return estimate_period_with_binned_bls(time, flux, options)
+        return EstimatePeriodWithBinnedBls(Time, Flux, Options)
 
-    if len(result.power) == 0 or not np.any(np.isfinite(result.power)):
+    if len(Result.power) == 0 or not Np.any(Np.isfinite(Result.power)):
         return None
 
-    best_index = int(np.nanargmax(result.power))
-    period = float(result.period[best_index])
-    duration = float(result.duration[best_index])
-    transit_time = float(result.transit_time[best_index])
-    power = float(result.power[best_index])
-    if not math.isfinite(period) or period <= 0:
+    BestIndex = int(Np.nanargmax(Result.power))
+    Period = float(Result.period[BestIndex])
+    Duration = float(Result.duration[BestIndex])
+    TransitTime = float(Result.transit_time[BestIndex])
+    power = float(Result.power[BestIndex])
+    if not Math.isfinite(Period) or Period <= 0:
         return None
 
-    first_epoch = math.ceil((time[0] - transit_time) / period)
-    last_epoch = math.floor((time[-1] - transit_time) / period)
-    expected_count = max(1, int(last_epoch - first_epoch + 1))
-    chi_squared = chi_squared_transit_probability(time, flattened_flux, period, duration, transit_time)
-    order = np.argsort(result.power)[-8:][::-1]
-    candidates = []
-    power_median = float(np.nanmedian(result.power))
-    power_std = max(float(np.nanstd(result.power)), 1e-9)
-    for index in order:
-        if not math.isfinite(float(result.power[index])):
+    FirstEpoch = Math.ceil((Time[0] - TransitTime) / Period)
+    LastEpoch = Math.floor((Time[-1] - TransitTime) / Period)
+    ExpectedCount = max(1, int(LastEpoch - FirstEpoch + 1))
+    ChiSquared = ChiSquaredTransitProbability(Time, FlattenedFlux, Period, Duration, TransitTime)
+    Order = Np.argsort(Result.power)[-8:][::-1]
+    Candidates = []
+    PowerMedian = float(Np.nanmedian(Result.power))
+    PowerStd = max(float(Np.nanstd(Result.power)), 1e-9)
+    for Index in Order:
+        if not Math.isfinite(float(Result.power[Index])):
             continue
-        power_value = float(result.power[index])
-        candidates.append({
-            "period": float(result.period[index]),
-            "power": power_value,
-            "sde": (power_value - power_median) / power_std,
+        PowerValue = float(Result.power[Index])
+        Candidates.append({
+            "period": float(Result.period[Index]),
+            "power": PowerValue,
+            "sde": (PowerValue - PowerMedian) / PowerStd,
         })
 
     return {
-        "period": period,
+        "period": Period,
         "scatter": 0.0,
-        "count": expected_count,
-        "duration": duration,
-        "transit_time": transit_time,
+        "count": ExpectedCount,
+        "duration": Duration,
+        "transit_time": TransitTime,
         "power": power,
-        "sde": (power - power_median) / power_std,
-        "candidates": candidates,
-        "periodogram": build_periodogram_payload(
-            result.period,
-            result.power,
-            power_median=power_median,
-            power_std=power_std,
-            method="BLS",
-            selected_period=period,
+        "sde": (power - PowerMedian) / PowerStd,
+        "candidates": Candidates,
+        "periodogram": BuildPeriodogramPayload(
+            Result.period,
+            Result.power,
+            PowerMedian=PowerMedian,
+            PowerStd=PowerStd,
+            Method="BLS",
+            SelectedPeriod=Period,
         ),
-        "search_min_period": float(min_period),
-        "search_max_period": float(max_period),
-        "search_min_duration": float(min_duration),
-        "search_max_duration": float(max_duration),
+        "search_min_period": float(MinPeriod),
+        "search_max_period": float(MaxPeriod),
+        "search_min_duration": float(MinDuration),
+        "search_max_duration": float(MaxDuration),
         "method": "BLS",
-        **(chi_squared or {}),
+        **(ChiSquared or {}),
     }
 
 
-def normalized_flux_for_tls(time, flux):
-    flux = np.asarray(flux, dtype=float)
-    plan = flux_normalization_plan(flux)
-    residual_scale = plan["residual_scale"]
-    if residual_scale is not None:
-        normalized = 1.0 + flux / residual_scale
+#MARK: tls funcs
+def NormalizedFluxForTls(Time, Flux):
+    Flux = Np.asarray(Flux, dtype=float)
+    Plan = FluxNormalizationPlan(Flux)
+    ResidualScale = Plan["residual_scale"]
+    if ResidualScale is not None:
+        Normalized = 1.0 + Flux / ResidualScale
     else:
-        baseline = float(np.median(flux))
-        normalized = flux / baseline
+        Baseline = float(Np.median(Flux))
+        Normalized = Flux / Baseline
 
-    flattened = flattened_flux_for_period_search(time, normalized)
-    if flattened is None:
+    Flattened = FlattenedFluxForPeriodSearch(Time, Normalized)
+    if Flattened is None:
         return None, None
-    tls_flux = 1.0 + flattened
-    finite = tls_flux[np.isfinite(tls_flux)]
-    if finite.size == 0:
+    TlsFlux = 1.0 + Flattened
+    Finite = TlsFlux[Np.isfinite(TlsFlux)]
+    if Finite.size == 0:
         return None, None
-    positive_floor = max(float(np.percentile(finite, 0.01)), 1e-6)
-    tls_flux = np.maximum(tls_flux, positive_floor)
-    residual = tls_flux - 1.0
-    residual_median = float(np.median(residual))
-    residual_mad = float(np.median(np.abs(residual - residual_median)))
-    robust_noise = max(1.4826 * residual_mad, float(np.std(residual)), 1e-9)
-    return tls_flux, robust_noise
+    PositiveFloor = max(float(Np.percentile(Finite, 0.01)), 1e-6)
+    TlsFlux = Np.maximum(TlsFlux, PositiveFloor)
+    Residual = TlsFlux - 1.0
+    ResidualMedian = float(Np.median(Residual))
+    ResidualMad = float(Np.median(Np.abs(Residual - ResidualMedian)))
+    RobustNoise = max(1.4826 * ResidualMad, float(Np.std(Residual)), 1e-9)
+    return TlsFlux, RobustNoise
 
 
-def estimate_period_with_tls(time, flux, options=None, progress_callback=None):
-    if len(time) < 50:
+#MARK: tls funcs
+def EstimatePeriodWithTls(Time, Flux, Options=None, ProgressCallback=None):
+    if len(Time) < 50:
         raise ValueError("TLS needs at least 50 finite light-curve samples.")
-    if options is None:
-        options = dict(DEFAULT_DETECTION_OPTIONS)
+    if Options is None:
+        Options = dict(DEFAULT_DETECTION_OPTIONS)
 
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    if full_span <= 0:
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    if FullSpan <= 0:
         return None
 
-    tls_flux, tls_noise = normalized_flux_for_tls(time, flux)
-    if tls_flux is None:
+    TlsFlux, TlsNoise = NormalizedFluxForTls(Time, Flux)
+    if TlsFlux is None:
         return None
-    min_period, max_period = period_search_bounds(cadence, full_span, options)
-    max_period = min(max_period, full_span / max(int(options.get("tls_min_transits", 3)), 1))
-    if min_period >= max_period:
+    MinPeriod, MaxPeriod = PeriodSearchBounds(Cadence, FullSpan, Options)
+    MaxPeriod = min(MaxPeriod, FullSpan / max(int(Options.get("tls_min_transits", 3)), 1))
+    if MinPeriod >= MaxPeriod:
         raise ValueError(
             "TLS period bounds do not leave room for the requested minimum number of transits."
         )
 
-    tls_options = {
-        **options,
-        "period_min": float(min_period),
-        "period_max": float(max_period),
+    TlsOptions = {
+        **Options,
+        "period_min": float(MinPeriod),
+        "period_max": float(MaxPeriod),
     }
-    result = run_tls_search(time, tls_flux, tls_options, progress_callback=progress_callback)
-    flattened_flux = tls_flux - 1.0
-    chi_squared = chi_squared_transit_probability(
-        time,
-        flattened_flux,
-        result["period"],
-        result["duration"],
-        result["transit_time"],
+    Result = RunTlsSearch(Time, TlsFlux, TlsOptions, ProgressCallback=ProgressCallback)
+    FlattenedFlux = TlsFlux - 1.0
+    ChiSquared = ChiSquaredTransitProbability(
+        Time,
+        FlattenedFlux,
+        Result["period"],
+        Result["duration"],
+        Result["transit_time"],
     )
-    expected_count = result.get("transit_count")
-    if expected_count is None:
-        first_epoch = math.ceil((time[0] - result["transit_time"]) / result["period"])
-        last_epoch = math.floor((time[-1] - result["transit_time"]) / result["period"])
-        expected_count = max(1, int(last_epoch - first_epoch + 1))
+    ExpectedCount = Result.get("transit_count")
+    if ExpectedCount is None:
+        FirstEpoch = Math.ceil((Time[0] - Result["transit_time"]) / Result["period"])
+        LastEpoch = Math.floor((Time[-1] - Result["transit_time"]) / Result["period"])
+        ExpectedCount = max(1, int(LastEpoch - FirstEpoch + 1))
 
     return {
-        "period": result["period"],
-        "period_uncertainty": result.get("period_uncertainty"),
-        "scatter": result.get("period_uncertainty") or 0.0,
-        "count": int(expected_count),
-        "duration": result["duration"],
-        "transit_time": result["transit_time"],
-        "power": result.get("power"),
-        "sde": result.get("sde"),
-        "sde_raw": result.get("sde_raw"),
-        "fap": result.get("fap"),
-        "snr": result.get("snr"),
-        "candidates": result.get("candidates", []),
-        "periodogram": result.get("periodogram"),
-        "search_min_period": float(min_period),
-        "search_max_period": float(max_period),
+        "period": Result["period"],
+        "period_uncertainty": Result.get("period_uncertainty"),
+        "scatter": Result.get("period_uncertainty") or 0.0,
+        "count": int(ExpectedCount),
+        "duration": Result["duration"],
+        "transit_time": Result["transit_time"],
+        "power": Result.get("power"),
+        "sde": Result.get("sde"),
+        "sde_raw": Result.get("sde_raw"),
+        "fap": Result.get("fap"),
+        "snr": Result.get("snr"),
+        "candidates": Result.get("candidates", []),
+        "periodogram": Result.get("periodogram"),
+        "search_min_period": float(MinPeriod),
+        "search_max_period": float(MaxPeriod),
         "search_min_duration": None,
         "search_max_duration": None,
         "method": "TLS",
-        "tls_noise": tls_noise,
-        "tls_result": result,
-        "transit_model": result.get("model"),
-        **(chi_squared or {}),
+        "tls_noise": TlsNoise,
+        "tls_result": Result,
+        "transit_model": Result.get("model"),
+        **(ChiSquared or {}),
     }
 
 
-def robust_standard_error(values):
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    if values.size < 2:
+#MARK: transit checks
+def RobustStandardError(Values):
+    Values = Np.asarray(Values, dtype=float)
+    Values = Values[Np.isfinite(Values)]
+    if Values.size < 2:
         return None
-    center = float(np.median(values))
-    sigma = max(1.4826 * float(np.median(np.abs(values - center))), 1e-9)
-    # Median standard error, with a short-block noise floor for correlations.
-    error = 1.253 * sigma / math.sqrt(values.size)
-    if values.size >= 12:
-        blocks = [np.mean(block) for block in np.array_split(values - center, min(8, values.size // 3))]
-        error = max(error, float(np.std(blocks, ddof=1)) / math.sqrt(len(blocks)))
-    return float(error)
+    Center = float(Np.median(Values))
+    Sigma = max(1.4826 * float(Np.median(Np.abs(Values - Center))), 1e-9)
+    # median standard error, with a short-block noise floor for correlations.
+    Error = 1.253 * Sigma / Math.sqrt(Values.size)
+    if Values.size >= 12:
+        Blocks = [Np.mean(Block) for Block in Np.array_split(Values - Center, min(8, Values.size // 3))]
+        Error = max(Error, float(Np.std(Blocks, ddof=1)) / Math.sqrt(len(Blocks)))
+    return float(Error)
 
 
-def transits_from_tls_result(time, flux, tls_period):
-    if tls_period is None:
+#MARK: tls funcs
+def TransitsFromTlsResult(Time, Flux, TlsPeriod):
+    if TlsPeriod is None:
         return []
-    result = tls_period.get("tls_result") or {}
-    duration = finite_number(tls_period.get("duration"))
-    period = finite_number(tls_period.get("period"))
-    epoch = finite_number(tls_period.get("transit_time"))
-    if duration is None or duration <= 0 or period is None or epoch is None:
+    Result = TlsPeriod.get("tls_result") or {}
+    Duration = FiniteNumber(TlsPeriod.get("duration"))
+    Period = FiniteNumber(TlsPeriod.get("period"))
+    Epoch = FiniteNumber(TlsPeriod.get("transit_time"))
+    if Duration is None or Duration <= 0 or Period is None or Epoch is None:
         return []
-    time, flux = np.asarray(time, dtype=float), np.asarray(flux, dtype=float)
-    segments = observing_segments(time)
-    steps = np.diff(time)
-    positive = steps[steps > 0]
-    cadence = float(np.median(positive)) if positive.size else duration
-    transits = []
-    for center in finite_values(result.get("transit_times", [])):
-        start, end = center - duration / 2.0, center + duration / 2.0
-        left = int(np.searchsorted(time, start, side="left"))
-        right = int(np.searchsorted(time, end, side="right"))
-        count = right - left
-        segment = next(((a, b) for a, b in segments if time[a] <= center <= time[b - 1]), None)
-        expected_points = max(1.0, duration / max(cadence, 1e-9))
-        coverage = min(1.0, count / expected_points)
-        shoulders = np.asarray([], dtype=float)
-        if segment is not None:
-            a, b = segment
-            shoulder_start = max(a, int(np.searchsorted(time, center - duration * 2.5)))
-            shoulder_left = max(a, min(b, int(np.searchsorted(time, center - duration * 0.75, side="right"))))
-            shoulder_right = max(a, min(b, int(np.searchsorted(time, center + duration * 0.75))))
-            shoulder_end = min(b, int(np.searchsorted(time, center + duration * 2.5, side="right")))
-            shoulders = np.r_[flux[shoulder_start:shoulder_left], flux[shoulder_right:shoulder_end]]
-        in_flux = np.asarray(flux[left:right], dtype=float)
-        core_flux = in_flux[np.abs(time[left:right] - center) <= duration * 0.25]
-        if core_flux.size < 3:
-            core_flux = in_flux
-        baseline = float(np.median(shoulders)) if shoulders.size >= 3 else None
-        depth = baseline - float(np.median(core_flux)) if baseline is not None and core_flux.size else None
-        in_error = robust_standard_error(core_flux)
-        out_error = robust_standard_error(shoulders)
-        error = math.hypot(in_error, out_error) if in_error is not None and out_error is not None else None
-        local_snr = depth / error if depth is not None and error and error > 0 else None
-        if count == 0:
-            state = "outside_observations"
-        elif segment is None or count < 3 or shoulders.size < 6 or coverage < 0.35:
-            state = "insufficient_coverage"
-        elif local_snr is not None and local_snr >= 3.0 and depth > 0:
-            state = "supported_dip"
+    Time, Flux = Np.asarray(Time, dtype=float), Np.asarray(Flux, dtype=float)
+    Segments = ObservingSegments(Time)
+    Steps = Np.diff(Time)
+    Positive = Steps[Steps > 0]
+    Cadence = float(Np.median(Positive)) if Positive.size else Duration
+    Transits = []
+    for Center in FiniteValues(Result.get("transit_times", [])):
+        Start, End = Center - Duration / 2.0, Center + Duration / 2.0
+        Left = int(Np.searchsorted(Time, Start, side="left"))
+        Right = int(Np.searchsorted(Time, End, side="right"))
+        Count = Right - Left
+        Segment = next(((A, B) for A, B in Segments if Time[A] <= Center <= Time[B - 1]), None)
+        ExpectedPoints = max(1.0, Duration / max(Cadence, 1e-9))
+        Coverage = min(1.0, Count / ExpectedPoints)
+        Shoulders = Np.asarray([], dtype=float)
+        if Segment is not None:
+            A, B = Segment
+            ShoulderStart = max(A, int(Np.searchsorted(Time, Center - Duration * 2.5)))
+            ShoulderLeft = max(A, min(B, int(Np.searchsorted(Time, Center - Duration * 0.75, side="right"))))
+            ShoulderRight = max(A, min(B, int(Np.searchsorted(Time, Center + Duration * 0.75))))
+            ShoulderEnd = min(B, int(Np.searchsorted(Time, Center + Duration * 2.5, side="right")))
+            Shoulders = Np.r_[Flux[ShoulderStart:ShoulderLeft], Flux[ShoulderRight:ShoulderEnd]]
+        InFlux = Np.asarray(Flux[Left:Right], dtype=float)
+        CoreFlux = InFlux[Np.abs(Time[Left:Right] - Center) <= Duration * 0.25]
+        if CoreFlux.size < 3:
+            CoreFlux = InFlux
+        Baseline = float(Np.median(Shoulders)) if Shoulders.size >= 3 else None
+        Depth = Baseline - float(Np.median(CoreFlux)) if Baseline is not None and CoreFlux.size else None
+        InError = RobustStandardError(CoreFlux)
+        OutError = RobustStandardError(Shoulders)
+        Error = Math.hypot(InError, OutError) if InError is not None and OutError is not None else None
+        LocalSnr = Depth / Error if Depth is not None and Error and Error > 0 else None
+        if Count == 0:
+            State = "outside_observations"
+        elif Segment is None or Count < 3 or Shoulders.size < 6 or Coverage < 0.35:
+            State = "insufficient_coverage"
+        elif LocalSnr is not None and LocalSnr >= 3.0 and Depth > 0:
+            State = "supported_dip"
         else:
-            state = "unsupported_window"
-        measured_center = timing_error = None
-        if state == "supported_dip" and count >= 5:
-            # A flux-weighted local centroid is measured from observations,
-            # not copied from T0+nP. It is conditional on the selected window.
-            deficits = np.maximum(0.0, baseline - in_flux - (out_error or 0.0))
-            if deficits.sum() > 0:
-                measured_center = float(np.sum(time[left:right] * deficits) / deficits.sum())
-                timing_error = max(cadence / math.sqrt(12.0), duration / (2.0 * local_snr))
-        values = np.r_[in_flux, baseline] if baseline is not None else in_flux
-        raw_min, raw_max = (np.percentile(values, [5, 95]).tolist() if values.size else [None, None])
-        transits.append({
-            "start": float(start), "end": float(end), "center": float(center),
-            "predicted_center": float(center), "measured_center": measured_center,
-            "timing_uncertainty": timing_error, "timing_method": "conditional local flux centroid" if measured_center is not None else None,
-            "cycle_number": int(round((center - epoch) / period)),
-            "duration": float(duration), "depth": depth, "signed_depth": depth,
+            State = "unsupported_window"
+        MeasuredCenter = TimingError = None
+        if State == "supported_dip" and Count >= 5:
+            # a flux-weighted local centroid is measured from observations,
+            # not copied from t0+np. it is conditional on the selected window.
+            Deficits = Np.maximum(0.0, Baseline - InFlux - (OutError or 0.0))
+            if Deficits.sum() > 0:
+                MeasuredCenter = float(Np.sum(Time[Left:Right] * Deficits) / Deficits.sum())
+                TimingError = max(Cadence / Math.sqrt(12.0), Duration / (2.0 * LocalSnr))
+        Values = Np.r_[InFlux, Baseline] if Baseline is not None else InFlux
+        RawMin, RawMax = (Np.percentile(Values, [5, 95]).tolist() if Values.size else [None, None])
+        Transits.append({
+            "start": float(Start), "end": float(End), "center": float(Center),
+            "predicted_center": float(Center), "measured_center": MeasuredCenter,
+            "timing_uncertainty": TimingError, "timing_method": "conditional local flux centroid" if MeasuredCenter is not None else None,
+            "cycle_number": int(round((Center - Epoch) / Period)),
+            "duration": float(Duration), "depth": Depth, "signed_depth": Depth,
             "depth_estimator": "median flux in central half of predicted window relative to local shoulders",
-            "full_window_depth": baseline - float(np.median(in_flux)) if baseline is not None and count else None,
-            "depth_uncertainty": error, "local_snr": local_snr,
-            "local_baseline": baseline, "points": int(count), "coverage_fraction": float(coverage),
-            "baseline_points": int(shoulders.size), "state": state,
-            "flux_min": float(raw_min) if raw_min is not None else None,
-            "flux_max": float(raw_max) if raw_max is not None else None,
+            "full_window_depth": Baseline - float(Np.median(InFlux)) if Baseline is not None and Count else None,
+            "depth_uncertainty": Error, "local_snr": LocalSnr,
+            "local_baseline": Baseline, "points": int(Count), "coverage_fraction": float(Coverage),
+            "baseline_points": int(Shoulders.size), "state": State,
+            "flux_min": float(RawMin) if RawMin is not None else None,
+            "flux_max": float(RawMax) if RawMax is not None else None,
             "source": "TLS model", "evidence_source": "local observations",
         })
-    return transits
+    return Transits
 
 
-def transit_regularity_tolerance(period, durations):
-    clean_durations = np.asarray(
-        [value for value in durations if math.isfinite(float(value)) and float(value) > 0],
+#MARK: period checks
+def TransitRegularityTolerance(Period, Durations):
+    CleanDurations = Np.asarray(
+        [Value for Value in Durations if Math.isfinite(float(Value)) and float(Value) > 0],
         dtype=float,
     )
-    duration_scale = float(np.percentile(clean_durations, 40)) if clean_durations.size else 0.0
-    tolerance = max(duration_scale * 1.25, period * 0.02)
-    return float(min(tolerance, period * 0.12))
+    DurationScale = float(Np.percentile(CleanDurations, 40)) if CleanDurations.size else 0.0
+    Tolerance = max(DurationScale * 1.25, Period * 0.02)
+    return float(min(Tolerance, Period * 0.12))
 
 
-def is_dense_regularity_match(match_count, event_count, expected_coverage, transit_count):
+#MARK: period checks
+def IsDenseRegularityMatch(MatchCount, EventCount, ExpectedCoverage, TransitCount):
     if (
-        match_count is None
-        or event_count is None
-        or expected_coverage is None
-        or transit_count < 12
+        MatchCount is None
+        or EventCount is None
+        or ExpectedCoverage is None
+        or TransitCount < 12
     ):
         return False
-    dense_box_floor = max(6, int(math.ceil(transit_count * 0.35)))
+    DenseBoxFloor = max(6, int(Math.ceil(TransitCount * 0.35)))
     return (
-        int(match_count) >= dense_box_floor
-        and int(event_count) >= 3
-        and float(match_count) / transit_count >= 0.35
-        and float(expected_coverage) >= 0.30
+        int(MatchCount) >= DenseBoxFloor
+        and int(EventCount) >= 3
+        and float(MatchCount) / TransitCount >= 0.35
+        and float(ExpectedCoverage) >= 0.30
     )
 
 
-def score_transit_regularity_period(
-    centers,
-    durations,
-    depths,
-    time_start,
-    time_end,
-    period,
-    candidate_support=0,
-    pair_support=0,
-    fixed_epoch=None,
+#MARK: period checks
+def ScoreTransitRegularityPeriod(
+    Centers,
+    Durations,
+    Depths,
+    TimeStart,
+    TimeEnd,
+    Period,
+    CandidateSupport=0,
+    PairSupport=0,
+    FixedEpoch=None,
 ):
-    if centers.size < 3 or not math.isfinite(float(period)) or period <= 0:
+    if Centers.size < 3 or not Math.isfinite(float(Period)) or Period <= 0:
         return None
 
-    period = float(period)
-    tolerance = transit_regularity_tolerance(period, durations)
-    if not math.isfinite(tolerance) or tolerance <= 0:
+    Period = float(Period)
+    Tolerance = TransitRegularityTolerance(Period, Durations)
+    if not Math.isfinite(Tolerance) or Tolerance <= 0:
         return None
 
-    epoch_values = [float(fixed_epoch)] if fixed_epoch is not None and math.isfinite(float(fixed_epoch)) else centers
-    best = None
-    for epoch in epoch_values:
-        first_epoch = math.ceil((float(time_start) - epoch) / period)
-        last_epoch = math.floor((float(time_end) - epoch) / period)
-        expected_count = int(last_epoch - first_epoch + 1)
-        if expected_count < 3:
+    EpochValues = [float(FixedEpoch)] if FixedEpoch is not None and Math.isfinite(float(FixedEpoch)) else Centers
+    Best = None
+    for Epoch in EpochValues:
+        FirstEpoch = Math.ceil((float(TimeStart) - Epoch) / Period)
+        LastEpoch = Math.floor((float(TimeEnd) - Epoch) / Period)
+        ExpectedCount = int(LastEpoch - FirstEpoch + 1)
+        if ExpectedCount < 3:
             continue
 
-        residuals = np.abs(((centers - epoch + period / 2.0) % period) - period / 2.0)
-        matched_mask = residuals <= tolerance
-        matched_indices = np.flatnonzero(matched_mask)
-        if matched_indices.size == 0:
+        Residuals = Np.abs(((Centers - Epoch + Period / 2.0) % Period) - Period / 2.0)
+        MatchedMask = Residuals <= Tolerance
+        MatchedIndices = Np.flatnonzero(MatchedMask)
+        if MatchedIndices.size == 0:
             continue
 
-        matched_cycles = np.rint((centers[matched_indices] - epoch) / period).astype(int)
-        unique_cycles = np.unique(matched_cycles)
-        event_match_count = int(unique_cycles.size)
-        if event_match_count == 0:
+        MatchedCycles = Np.rint((Centers[MatchedIndices] - Epoch) / Period).astype(int)
+        UniqueCycles = Np.unique(MatchedCycles)
+        EventMatchCount = int(UniqueCycles.size)
+        if EventMatchCount == 0:
             continue
 
-        representative_depths = []
-        representative_durations = []
-        representative_residuals = []
-        for cycle in unique_cycles:
-            cycle_indices = matched_indices[matched_cycles == cycle]
-            best_index = int(cycle_indices[np.argmax(depths[cycle_indices])])
-            representative_depths.append(float(depths[best_index]))
-            representative_durations.append(float(durations[best_index]))
-            representative_residuals.append(float(residuals[best_index]))
+        RepresentativeDepths = []
+        RepresentativeDurations = []
+        RepresentativeResiduals = []
+        for Cycle in UniqueCycles:
+            CycleIndices = MatchedIndices[MatchedCycles == Cycle]
+            BestIndex = int(CycleIndices[Np.argmax(Depths[CycleIndices])])
+            RepresentativeDepths.append(float(Depths[BestIndex]))
+            RepresentativeDurations.append(float(Durations[BestIndex]))
+            RepresentativeResiduals.append(float(Residuals[BestIndex]))
 
-        box_match_count = int(matched_indices.size)
-        expected_coverage = event_match_count / expected_count
-        residual_rms = float(np.sqrt(np.mean(np.asarray(representative_residuals) ** 2)))
-        depth_sum = float(np.sum(representative_depths))
-        duration = median_or_none(representative_durations) or median_or_none(durations) or tolerance
-        score_key = (
-            box_match_count,
-            event_match_count,
-            expected_coverage,
-            int(pair_support),
-            int(candidate_support),
-            depth_sum,
-            -residual_rms,
-            -period,
+        BoxMatchCount = int(MatchedIndices.size)
+        ExpectedCoverage = EventMatchCount / ExpectedCount
+        ResidualRms = float(Np.sqrt(Np.mean(Np.asarray(RepresentativeResiduals) ** 2)))
+        DepthSum = float(Np.sum(RepresentativeDepths))
+        Duration = MedianOrNone(RepresentativeDurations) or MedianOrNone(Durations) or Tolerance
+        ScoreKey = (
+            BoxMatchCount,
+            EventMatchCount,
+            ExpectedCoverage,
+            int(PairSupport),
+            int(CandidateSupport),
+            DepthSum,
+            -ResidualRms,
+            -Period,
         )
-        candidate = {
-            "period": period,
-            "scatter": residual_rms,
-            "count": expected_count,
-            "duration": float(duration),
-            "transit_time": float(epoch),
-            "event_match_count": event_match_count,
-            "box_match_count": box_match_count,
-            "expected_count": expected_count,
-            "expected_coverage": expected_coverage,
-            "match_fraction": box_match_count / centers.size,
-            "pair_support": int(pair_support),
-            "candidate_support": int(candidate_support),
-            "tolerance": tolerance,
-            "depth_sum": depth_sum,
-            "residual_median": median_or_none(representative_residuals),
-            "residual_rms": residual_rms,
+        Candidate = {
+            "period": Period,
+            "scatter": ResidualRms,
+            "count": ExpectedCount,
+            "duration": float(Duration),
+            "transit_time": float(Epoch),
+            "event_match_count": EventMatchCount,
+            "box_match_count": BoxMatchCount,
+            "expected_count": ExpectedCount,
+            "expected_coverage": ExpectedCoverage,
+            "match_fraction": BoxMatchCount / Centers.size,
+            "pair_support": int(PairSupport),
+            "candidate_support": int(CandidateSupport),
+            "tolerance": Tolerance,
+            "depth_sum": DepthSum,
+            "residual_median": MedianOrNone(RepresentativeResiduals),
+            "residual_rms": ResidualRms,
             "method": "transit regularity",
-            "_score_key": score_key,
+            "_score_key": ScoreKey,
         }
-        if best is None or score_key > best["_score_key"]:
-            best = candidate
+        if Best is None or ScoreKey > Best["_score_key"]:
+            Best = Candidate
 
-    return best
+    return Best
 
 
-def estimate_period_by_transit_regularity(transits, time, options=None, bls_period=None):
-    if len(transits) < 3 or len(time) < 3:
+#MARK: period checks
+def EstimatePeriodByTransitRegularity(Transits, Time, Options=None, BlsPeriod=None):
+    if len(Transits) < 3 or len(Time) < 3:
         return None
 
-    centers = np.asarray([item["center"] for item in transits], dtype=float)
-    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
-    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
-    finite_mask = np.isfinite(centers) & np.isfinite(durations) & np.isfinite(depths)
-    centers = centers[finite_mask]
-    durations = durations[finite_mask]
-    depths = depths[finite_mask]
-    if centers.size < 3:
+    Centers = Np.asarray([Item["center"] for Item in Transits], dtype=float)
+    Durations = Np.asarray([max(float(Item.get("duration", 0.0)), 0.0) for Item in Transits], dtype=float)
+    Depths = Np.asarray([max(float(Item.get("depth", 0.0)), 0.0) for Item in Transits], dtype=float)
+    FiniteMask = Np.isfinite(Centers) & Np.isfinite(Durations) & Np.isfinite(Depths)
+    Centers = Centers[FiniteMask]
+    Durations = Durations[FiniteMask]
+    Depths = Depths[FiniteMask]
+    if Centers.size < 3:
         return None
 
-    order = np.argsort(centers)
-    centers = centers[order]
-    durations = durations[order]
-    depths = depths[order]
+    Order = Np.argsort(Centers)
+    Centers = Centers[Order]
+    Durations = Durations[Order]
+    Depths = Depths[Order]
 
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    if full_span <= 0:
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    if FullSpan <= 0:
         return None
 
-    min_period, max_period = period_search_bounds(cadence, full_span, options)
-    positive_durations = durations[durations > 0]
-    if positive_durations.size:
-        duration_floor = float(np.percentile(positive_durations, 40))
-        min_period = max(min_period, duration_floor * 4.0)
-    if min_period >= max_period:
+    MinPeriod, MaxPeriod = PeriodSearchBounds(Cadence, FullSpan, Options)
+    PositiveDurations = Durations[Durations > 0]
+    if PositiveDurations.size:
+        DurationFloor = float(Np.percentile(PositiveDurations, 40))
+        MinPeriod = max(MinPeriod, DurationFloor * 4.0)
+    if MinPeriod >= MaxPeriod:
         return None
 
-    resolution = max(cadence * 5.0, full_span / 50000.0, 1e-4)
-    candidates = {}
+    Resolution = max(Cadence * 5.0, FullSpan / 50000.0, 1e-4)
+    Candidates = {}
 
-    def add_candidate(period, support=1, pair=False):
-        if period is None:
+    def AddCandidate(Period, Support=1, Pair=False):
+        if Period is None:
             return
         try:
-            period_value = float(period)
+            PeriodValue = float(Period)
         except (TypeError, ValueError):
             return
-        if not math.isfinite(period_value) or period_value < min_period or period_value > max_period:
+        if not Math.isfinite(PeriodValue) or PeriodValue < MinPeriod or PeriodValue > MaxPeriod:
             return
-        key = int(round(period_value / resolution))
-        record = candidates.setdefault(
-            key,
+        Key = int(round(PeriodValue / Resolution))
+        Record = Candidates.setdefault(
+            Key,
             {"period_sum": 0.0, "weight": 0.0, "support": 0, "pair_support": 0},
         )
-        weight = max(float(support), 1.0)
-        record["period_sum"] += period_value * weight
-        record["weight"] += weight
-        record["support"] += int(max(round(weight), 1))
-        if pair:
-            record["pair_support"] += int(max(round(weight), 1))
+        Weight = max(float(Support), 1.0)
+        Record["period_sum"] += PeriodValue * Weight
+        Record["weight"] += Weight
+        Record["support"] += int(max(round(Weight), 1))
+        if Pair:
+            Record["pair_support"] += int(max(round(Weight), 1))
 
-    pair_count = min(80, centers.size)
-    if centers.size > pair_count:
-        strongest = np.argsort(depths)[-pair_count:]
-        pair_centers = np.sort(centers[strongest])
+    PairCount = min(80, Centers.size)
+    if Centers.size > PairCount:
+        Strongest = Np.argsort(Depths)[-PairCount:]
+        PairCenters = Np.sort(Centers[Strongest])
     else:
-        pair_centers = centers
+        PairCenters = Centers
 
-    for left_index in range(pair_centers.size):
-        for right_index in range(left_index + 1, pair_centers.size):
-            gap = float(pair_centers[right_index] - pair_centers[left_index])
-            if gap < min_period:
+    for LeftIndex in range(PairCenters.size):
+        for RightIndex in range(LeftIndex + 1, PairCenters.size):
+            Gap = float(PairCenters[RightIndex] - PairCenters[LeftIndex])
+            if Gap < MinPeriod:
                 continue
-            max_cycles = min(30, int(gap / min_period))
-            for cycle_count in range(1, max_cycles + 1):
-                add_candidate(gap / cycle_count, pair=True)
+            MaxCycles = min(30, int(Gap / MinPeriod))
+            for CycleCount in range(1, MaxCycles + 1):
+                AddCandidate(Gap / CycleCount, Pair=True)
 
-    bls_sources = []
-    if bls_period is not None:
-        bls_sources.append(bls_period)
-        bls_sources.extend(bls_period.get("candidates", []))
-    for source in bls_sources:
-        source_period = source.get("period") if isinstance(source, dict) else None
-        add_candidate(source_period, support=30)
-        if source_period is None:
+    BlsSources = []
+    if BlsPeriod is not None:
+        BlsSources.append(BlsPeriod)
+        BlsSources.extend(BlsPeriod.get("candidates", []))
+    for Source in BlsSources:
+        SourcePeriod = Source.get("period") if isinstance(Source, dict) else None
+        AddCandidate(SourcePeriod, Support=30)
+        if SourcePeriod is None:
             continue
-        for divisor in range(2, 13):
-            add_candidate(float(source_period) / divisor, support=12)
-        for multiple in range(2, 5):
-            add_candidate(float(source_period) * multiple, support=6)
+        for Divisor in range(2, 13):
+            AddCandidate(float(SourcePeriod) / Divisor, Support=12)
+        for Multiple in range(2, 5):
+            AddCandidate(float(SourcePeriod) * Multiple, Support=6)
 
-    if not candidates:
+    if not Candidates:
         return None
 
-    candidate_records = sorted(
-        candidates.values(),
-        key=lambda item: (item["pair_support"], item["support"]),
+    CandidateRecords = sorted(
+        Candidates.values(),
+        key=lambda Item: (Item["pair_support"], Item["support"]),
         reverse=True,
     )[:3000]
 
-    pair_support_floor = max(3, min(12, int(math.ceil(centers.size * 0.25))))
-    event_floor = max(3, min(6, int(math.ceil(centers.size * 0.25))))
-    best = None
-    for record in candidate_records:
-        period = record["period_sum"] / max(record["weight"], 1.0)
-        score = score_transit_regularity_period(
-            centers,
-            durations,
-            depths,
-            float(time[0]),
-            float(time[-1]),
-            period,
-            candidate_support=record["support"],
-            pair_support=record["pair_support"],
+    PairSupportFloor = max(3, min(12, int(Math.ceil(Centers.size * 0.25))))
+    EventFloor = max(3, min(6, int(Math.ceil(Centers.size * 0.25))))
+    Best = None
+    for Record in CandidateRecords:
+        Period = Record["period_sum"] / max(Record["weight"], 1.0)
+        Score = ScoreTransitRegularityPeriod(
+            Centers,
+            Durations,
+            Depths,
+            float(Time[0]),
+            float(Time[-1]),
+            Period,
+            CandidateSupport=Record["support"],
+            PairSupport=Record["pair_support"],
         )
-        if score is None:
+        if Score is None:
             continue
-        if score["pair_support"] < pair_support_floor:
+        if Score["pair_support"] < PairSupportFloor:
             continue
-        if score["event_match_count"] < event_floor:
+        if Score["event_match_count"] < EventFloor:
             continue
         if (
-            score["expected_coverage"] < 0.55
-            and not is_dense_regularity_match(
-                score["box_match_count"],
-                score["event_match_count"],
-                score["expected_coverage"],
-                centers.size,
+            Score["expected_coverage"] < 0.55
+            and not IsDenseRegularityMatch(
+                Score["box_match_count"],
+                Score["event_match_count"],
+                Score["expected_coverage"],
+                Centers.size,
             )
         ):
             continue
-        if best is None or score["_score_key"] > best["_score_key"]:
-            best = score
+        if Best is None or Score["_score_key"] > Best["_score_key"]:
+            Best = Score
 
-    if best is None:
+    if Best is None:
         return None
 
-    best.pop("_score_key", None)
-    return best
+    Best.pop("_score_key", None)
+    return Best
 
 
-def should_prefer_regularity_period(regularity_period, bls_period, transits, time):
-    if regularity_period is None:
+#MARK: period checks
+def ShouldPreferRegularityPeriod(RegularityPeriod, BlsPeriod, Transits, Time):
+    if RegularityPeriod is None:
         return False
-    if bls_period is None:
+    if BlsPeriod is None:
         return True
 
-    bls_value = float(bls_period.get("period", 0.0) or 0.0)
-    regular_value = float(regularity_period.get("period", 0.0) or 0.0)
-    if bls_value <= 0 or regular_value <= 0:
+    BlsValue = float(BlsPeriod.get("period", 0.0) or 0.0)
+    RegularValue = float(RegularityPeriod.get("period", 0.0) or 0.0)
+    if BlsValue <= 0 or RegularValue <= 0:
         return True
-    if abs(regular_value - bls_value) / bls_value <= 0.02:
+    if abs(RegularValue - BlsValue) / BlsValue <= 0.02:
         return False
 
-    centers = np.asarray([item["center"] for item in transits], dtype=float)
-    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
-    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
-    bls_score = score_transit_regularity_period(
-        centers,
-        durations,
-        depths,
-        float(time[0]),
-        float(time[-1]),
-        bls_value,
-        fixed_epoch=bls_period.get("transit_time"),
+    Centers = Np.asarray([Item["center"] for Item in Transits], dtype=float)
+    Durations = Np.asarray([max(float(Item.get("duration", 0.0)), 0.0) for Item in Transits], dtype=float)
+    Depths = Np.asarray([max(float(Item.get("depth", 0.0)), 0.0) for Item in Transits], dtype=float)
+    BlsScore = ScoreTransitRegularityPeriod(
+        Centers,
+        Durations,
+        Depths,
+        float(Time[0]),
+        float(Time[-1]),
+        BlsValue,
+        FixedEpoch=BlsPeriod.get("transit_time"),
     )
-    bls_event_count = int(bls_score.get("event_match_count", 0)) if bls_score else 0
-    bls_coverage = float(bls_score.get("expected_coverage", 0.0)) if bls_score else 0.0
-    regular_event_count = int(regularity_period.get("event_match_count", 0))
-    regular_box_count = int(regularity_period.get("box_match_count", 0))
-    regular_coverage = float(regularity_period.get("expected_coverage", 0.0))
-    transit_count = len(transits)
+    BlsEventCount = int(BlsScore.get("event_match_count", 0)) if BlsScore else 0
+    BlsCoverage = float(BlsScore.get("expected_coverage", 0.0)) if BlsScore else 0.0
+    RegularEventCount = int(RegularityPeriod.get("event_match_count", 0))
+    RegularBoxCount = int(RegularityPeriod.get("box_match_count", 0))
+    RegularCoverage = float(RegularityPeriod.get("expected_coverage", 0.0))
+    TransitCount = len(Transits)
 
-    if regular_event_count >= bls_event_count + 2 and regular_coverage >= 0.55:
+    if RegularEventCount >= BlsEventCount + 2 and RegularCoverage >= 0.55:
         return True
     if (
-        regular_event_count >= bls_event_count + 2
-        and is_dense_regularity_match(
-            regular_box_count,
-            regular_event_count,
-            regular_coverage,
-            transit_count,
+        RegularEventCount >= BlsEventCount + 2
+        and IsDenseRegularityMatch(
+            RegularBoxCount,
+            RegularEventCount,
+            RegularCoverage,
+            TransitCount,
         )
     ):
         return True
     return (
-        regular_value < bls_value
-        and regular_event_count >= bls_event_count
-        and regular_coverage >= max(0.65, bls_coverage)
+        RegularValue < BlsValue
+        and RegularEventCount >= BlsEventCount
+        and RegularCoverage >= max(0.65, BlsCoverage)
     )
 
 
-def dealiased_bls_period(bls_period, transits, time, flux):
-    if bls_period is None or len(transits) < 3:
-        return bls_period
+#MARK: bls funcs
+def DealiasedBlsPeriod(BlsPeriod, Transits, Time, Flux):
+    if BlsPeriod is None or len(Transits) < 3:
+        return BlsPeriod
 
-    top_period = finite_number(bls_period.get("period"))
-    top_power = finite_number(bls_period.get("power"))
-    if top_period is None or top_period <= 0 or top_power is None or top_power <= 0:
-        return bls_period
+    TopPeriod = FiniteNumber(BlsPeriod.get("period"))
+    TopPower = FiniteNumber(BlsPeriod.get("power"))
+    if TopPeriod is None or TopPeriod <= 0 or TopPower is None or TopPower <= 0:
+        return BlsPeriod
 
-    candidates = [
-        candidate
-        for candidate in bls_period.get("candidates", [])
-        if finite_number(candidate.get("period")) is not None
+    Candidates = [
+        Candidate
+        for Candidate in BlsPeriod.get("candidates", [])
+        if FiniteNumber(Candidate.get("period")) is not None
     ]
-    if len(candidates) < 2:
-        return bls_period
+    if len(Candidates) < 2:
+        return BlsPeriod
 
-    centers = np.asarray([item["center"] for item in transits], dtype=float)
-    durations = np.asarray([max(float(item.get("duration", 0.0)), 0.0) for item in transits], dtype=float)
-    depths = np.asarray([max(float(item.get("depth", 0.0)), 0.0) for item in transits], dtype=float)
-    top_score = score_transit_regularity_period(
-        centers,
-        durations,
-        depths,
-        float(time[0]),
-        float(time[-1]),
-        top_period,
+    Centers = Np.asarray([Item["center"] for Item in Transits], dtype=float)
+    Durations = Np.asarray([max(float(Item.get("duration", 0.0)), 0.0) for Item in Transits], dtype=float)
+    Depths = Np.asarray([max(float(Item.get("depth", 0.0)), 0.0) for Item in Transits], dtype=float)
+    TopScore = ScoreTransitRegularityPeriod(
+        Centers,
+        Durations,
+        Depths,
+        float(Time[0]),
+        float(Time[-1]),
+        TopPeriod,
     )
-    if top_score is None:
-        return bls_period
+    if TopScore is None:
+        return BlsPeriod
 
-    best = None
-    for candidate in candidates:
-        candidate_period = finite_number(candidate.get("period"))
-        candidate_power = finite_number(candidate.get("power"))
-        candidate_sde = finite_number(candidate.get("sde"))
-        if candidate_period is None or candidate_power is None:
+    Best = None
+    for Candidate in Candidates:
+        CandidatePeriod = FiniteNumber(Candidate.get("period"))
+        CandidatePower = FiniteNumber(Candidate.get("power"))
+        CandidateSde = FiniteNumber(Candidate.get("sde"))
+        if CandidatePeriod is None or CandidatePower is None:
             continue
-        if candidate_period <= top_period * 1.5:
-            continue
-
-        ratio = candidate_period / top_period
-        harmonic = int(round(ratio))
-        if harmonic < 2 or harmonic > 4:
-            continue
-        if abs(ratio / harmonic - 1.0) > 0.035:
-            continue
-        if candidate_power / top_power < 0.75:
-            continue
-        if candidate_sde is not None and candidate_sde < 5.0:
+        if CandidatePeriod <= TopPeriod * 1.5:
             continue
 
-        candidate_score = score_transit_regularity_period(
-            centers,
-            durations,
-            depths,
-            float(time[0]),
-            float(time[-1]),
-            candidate_period,
+        Ratio = CandidatePeriod / TopPeriod
+        Harmonic = int(round(Ratio))
+        if Harmonic < 2 or Harmonic > 4:
+            continue
+        if abs(Ratio / Harmonic - 1.0) > 0.035:
+            continue
+        if CandidatePower / TopPower < 0.75:
+            continue
+        if CandidateSde is not None and CandidateSde < 5.0:
+            continue
+
+        CandidateScore = ScoreTransitRegularityPeriod(
+            Centers,
+            Durations,
+            Depths,
+            float(Time[0]),
+            float(Time[-1]),
+            CandidatePeriod,
         )
-        if candidate_score is None:
+        if CandidateScore is None:
             continue
 
-        top_box_count = int(top_score.get("box_match_count", 0))
-        top_event_count = int(top_score.get("event_match_count", 0))
-        candidate_box_count = int(candidate_score.get("box_match_count", 0))
-        candidate_event_count = int(candidate_score.get("event_match_count", 0))
-        if candidate_box_count < max(3, int(math.floor(top_box_count * 0.9))):
+        TopBoxCount = int(TopScore.get("box_match_count", 0))
+        TopEventCount = int(TopScore.get("event_match_count", 0))
+        CandidateBoxCount = int(CandidateScore.get("box_match_count", 0))
+        CandidateEventCount = int(CandidateScore.get("event_match_count", 0))
+        if CandidateBoxCount < max(3, int(Math.floor(TopBoxCount * 0.9))):
             continue
-        if candidate_event_count < max(3, int(math.floor(top_event_count * 0.9))):
+        if CandidateEventCount < max(3, int(Math.floor(TopEventCount * 0.9))):
             continue
-        if candidate_score["expected_count"] >= top_score["expected_count"] * 0.75:
+        if CandidateScore["expected_count"] >= TopScore["expected_count"] * 0.75:
             continue
 
-        selection_key = (
-            candidate_box_count,
-            candidate_event_count,
-            candidate_power / top_power,
-            candidate_sde if candidate_sde is not None else 0.0,
-            candidate_period,
+        SelectionKey = (
+            CandidateBoxCount,
+            CandidateEventCount,
+            CandidatePower / TopPower,
+            CandidateSde if CandidateSde is not None else 0.0,
+            CandidatePeriod,
         )
-        if best is None or selection_key > best["selection_key"]:
-            best = {
-                "candidate": candidate,
-                "score": candidate_score,
-                "harmonic": harmonic,
-                "selection_key": selection_key,
+        if Best is None or SelectionKey > Best["selection_key"]:
+            Best = {
+                "candidate": Candidate,
+                "score": CandidateScore,
+                "harmonic": Harmonic,
+                "selection_key": SelectionKey,
             }
 
-    if best is None:
-        return bls_period
+    if Best is None:
+        return BlsPeriod
 
-    candidate = best["candidate"]
-    score = best["score"]
-    flattened_flux = flattened_flux_for_period_search(time, flux)
-    chi_squared = None if flattened_flux is None else chi_squared_transit_probability(
-        time,
-        flattened_flux,
-        score["period"],
-        score["duration"],
-        score["transit_time"],
+    Candidate = Best["candidate"]
+    Score = Best["score"]
+    FlattenedFlux = FlattenedFluxForPeriodSearch(Time, Flux)
+    ChiSquared = None if FlattenedFlux is None else ChiSquaredTransitProbability(
+        Time,
+        FlattenedFlux,
+        Score["period"],
+        Score["duration"],
+        Score["transit_time"],
     )
 
-    selected_period = score["period"]
-    selected_candidates = []
-    selected_seen = set()
-    for item in [candidate, *candidates]:
-        item_period = finite_number(item.get("period"))
-        if item_period is None:
+    SelectedPeriod = Score["period"]
+    SelectedCandidates = []
+    SelectedSeen = set()
+    for Item in [Candidate, *Candidates]:
+        ItemPeriod = FiniteNumber(Item.get("period"))
+        if ItemPeriod is None:
             continue
-        key = round(item_period, 10)
-        if key in selected_seen:
+        Key = round(ItemPeriod, 10)
+        if Key in SelectedSeen:
             continue
-        selected_seen.add(key)
-        selected_candidates.append(item)
+        SelectedSeen.add(Key)
+        SelectedCandidates.append(Item)
 
     return {
-        **bls_period,
-        "period": selected_period,
-        "scatter": score["scatter"],
-        "count": score["expected_count"],
-        "duration": score["duration"],
-        "transit_time": score["transit_time"],
-        "power": finite_number(candidate.get("power")) or bls_period.get("power"),
-        "sde": finite_number(candidate.get("sde")),
-        "candidates": selected_candidates,
+        **BlsPeriod,
+        "period": SelectedPeriod,
+        "scatter": Score["scatter"],
+        "count": Score["expected_count"],
+        "duration": Score["duration"],
+        "transit_time": Score["transit_time"],
+        "power": FiniteNumber(Candidate.get("power")) or BlsPeriod.get("power"),
+        "sde": FiniteNumber(Candidate.get("sde")),
+        "candidates": SelectedCandidates,
         "harmonic_alias_corrected": True,
-        "harmonic_alias_period": top_period,
-        "harmonic_alias_factor": best["harmonic"],
-        "harmonic_alias_power_ratio": (finite_number(candidate.get("power")) or 0.0) / top_power,
-        **(chi_squared or {}),
+        "harmonic_alias_period": TopPeriod,
+        "harmonic_alias_factor": Best["harmonic"],
+        "harmonic_alias_power_ratio": (FiniteNumber(Candidate.get("power")) or 0.0) / TopPower,
+        **(ChiSquared or {}),
     }
 
 
-def time_at_fractional_index(time, index_position):
-    if index_position <= 0:
-        return float(time[0])
-    if index_position >= len(time) - 1:
-        return float(time[-1])
-    left = int(math.floor(index_position))
-    right = int(math.ceil(index_position))
-    if left == right:
-        return float(time[left])
-    fraction = index_position - left
-    return float(time[left] + (time[right] - time[left]) * fraction)
+#MARK: curve funcs
+def TimeAtFractionalIndex(Time, IndexPosition):
+    if IndexPosition <= 0:
+        return float(Time[0])
+    if IndexPosition >= len(Time) - 1:
+        return float(Time[-1])
+    Left = int(Math.floor(IndexPosition))
+    Right = int(Math.ceil(IndexPosition))
+    if Left == Right:
+        return float(Time[Left])
+    Fraction = IndexPosition - Left
+    return float(Time[Left] + (Time[Right] - Time[Left]) * Fraction)
 
 
-def prune_overlapping_transits(transits):
-    if not transits:
+#MARK: prune overlapping transits
+def PruneOverlappingTransits(Transits):
+    if not Transits:
         return []
 
-    kept = []
-    for candidate in sorted(transits, key=lambda item: item["center"]):
-        if not kept:
-            kept.append(candidate)
+    Kept = []
+    for Candidate in sorted(Transits, key=lambda Item: Item["center"]):
+        if not Kept:
+            Kept.append(Candidate)
             continue
 
-        previous = kept[-1]
-        overlap = min(previous["end"], candidate["end"]) - max(previous["start"], candidate["start"])
-        shorter = max(min(previous["duration"], candidate["duration"]), 1e-9)
-        if overlap > 0 and overlap / shorter > 0.78:
-            if candidate["depth"] > previous["depth"]:
-                kept[-1] = candidate
+        Prev = Kept[-1]
+        Overlap = min(Prev["end"], Candidate["end"]) - max(Prev["start"], Candidate["start"])
+        Shorter = max(min(Prev["duration"], Candidate["duration"]), 1e-9)
+        if Overlap > 0 and Overlap / Shorter > 0.78:
+            if Candidate["depth"] > Prev["depth"]:
+                Kept[-1] = Candidate
             continue
-        kept.append(candidate)
-    return kept
+        Kept.append(Candidate)
+    return Kept
 
 
-def detect_transits_by_prominence(time, flux, median_flux, options):
-    if find_peaks is None:
+#MARK: dip funcs
+def DetectTransitsByProminence(Time, Flux, MedianFlux, Options):
+    if FindPeaks is None:
         return None
 
-    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
-    clipped_flux = np.clip(flux, clipped_low, clipped_high)
+    ClippedLow, ClippedHigh = RobustFluxLimits(Flux, Sigma=3.0)
+    ClippedFlux = Np.clip(Flux, ClippedLow, ClippedHigh)
 
-    strictness = float(options["strictness"])
-    smoothing = float(options["smoothing"])
-    base_smooth_width = int(max(31, min(201, len(clipped_flux) // 360)))
-    smooth_width = odd_window_width(base_smooth_width, smoothing, 7, 501)
-    smoothed = moving_average_by_segments(clipped_flux, smooth_width, observing_segments(time))
+    Strictness = float(Options["strictness"])
+    Smoothing = float(Options["smoothing"])
+    BaseSmoothWidth = int(max(31, min(201, len(ClippedFlux) // 360)))
+    SmoothWidth = OddWindowWidth(BaseSmoothWidth, Smoothing, 7, 501)
+    Smoothed = MovingAverageBySegments(ClippedFlux, SmoothWidth, ObservingSegments(Time))
 
-    baseline = float(np.median(smoothed))
-    mad = float(np.median(np.abs(smoothed - baseline)))
-    robust_noise = max(1.4826 * mad, 1e-9)
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
+    Baseline = float(Np.median(Smoothed))
+    Mad = float(Np.median(Np.abs(Smoothed - Baseline)))
+    RobustNoise = max(1.4826 * Mad, 1e-9)
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
 
-    auto_min_width_time = max(cadence * 4.0, min(0.08, full_span / 5000.0))
-    auto_max_curve_time = max(auto_min_width_time * 4.0, min(36.0, max(1.0, full_span * 0.12)))
-    min_width_time = (
-        max(cadence * 2.0, float(options["min_duration"]))
-        if options["min_duration"] is not None
-        else auto_min_width_time
+    AutoMinWidthTime = max(Cadence * 4.0, min(0.08, FullSpan / 5000.0))
+    AutoMaxCurveTime = max(AutoMinWidthTime * 4.0, min(36.0, max(1.0, FullSpan * 0.12)))
+    MinWidthTime = (
+        max(Cadence * 2.0, float(Options["min_duration"]))
+        if Options["min_duration"] is not None
+        else AutoMinWidthTime
     )
-    max_curve_time = (
-        max(min_width_time * 1.2, float(options["max_duration"]))
-        if options["max_duration"] is not None
-        else auto_max_curve_time
+    MaxCurveTime = (
+        max(MinWidthTime * 1.2, float(Options["max_duration"]))
+        if Options["max_duration"] is not None
+        else AutoMaxCurveTime
     )
-    max_curve_points = max(4, int(max_curve_time / cadence))
-    min_distance_time = max(min_width_time * 2.5, min(4.0, full_span / 350.0))
-    min_distance_points = max(smooth_width // 2, int(min_distance_time / cadence))
-    auto_min_prominence = max(2.2 * robust_noise, abs(median_flux) * 0.002) * strictness
-    min_prominence = (
-        float(options["min_depth"])
-        if options["min_depth"] is not None
-        else auto_min_prominence
-    )
-
-    peaks, properties = find_peaks(
-        -smoothed,
-        prominence=min_prominence,
-        distance=min_distance_points,
-        wlen=max_curve_points * 2,
+    MaxCurvePoints = max(4, int(MaxCurveTime / Cadence))
+    MinDistanceTime = max(MinWidthTime * 2.5, min(4.0, FullSpan / 350.0))
+    MinDistancePoints = max(SmoothWidth // 2, int(MinDistanceTime / Cadence))
+    AutoMinProminence = max(2.2 * RobustNoise, abs(MedianFlux) * 0.002) * Strictness
+    MinProminence = (
+        float(Options["min_depth"])
+        if Options["min_depth"] is not None
+        else AutoMinProminence
     )
 
-    if len(peaks) == 0:
+    Peaks, Properties = FindPeaks(
+        -Smoothed,
+        prominence=MinProminence,
+        distance=MinDistancePoints,
+        wlen=MaxCurvePoints * 2,
+    )
+
+    if len(Peaks) == 0:
         return {
             "transits": [],
-            "robust_noise": robust_noise,
-            "smooth_points": smooth_width,
+            "robust_noise": RobustNoise,
+            "smooth_points": SmoothWidth,
         }
 
-    transits = []
-    peak_indexes = np.asarray(sorted(peaks.tolist()), dtype=int)
-    prominence_by_index = {
-        int(peak_index): float(properties["prominences"][offset])
-        for offset, peak_index in enumerate(peaks)
+    Transits = []
+    PeakIndexes = Np.asarray(sorted(Peaks.tolist()), dtype=int)
+    ProminenceByIndex = {
+        int(PeakIndex): float(Properties["prominences"][Offset])
+        for Offset, PeakIndex in enumerate(Peaks)
     }
 
-    for offset, center_index in enumerate(peak_indexes):
-        previous_center = peak_indexes[offset - 1] if offset > 0 else None
-        next_center = peak_indexes[offset + 1] if offset + 1 < len(peak_indexes) else None
+    for Offset, CenterIndex in enumerate(PeakIndexes):
+        PreviousCenter = PeakIndexes[Offset - 1] if Offset > 0 else None
+        NextCenter = PeakIndexes[Offset + 1] if Offset + 1 < len(PeakIndexes) else None
 
-        left_cap = max(0, center_index - max_curve_points)
-        right_cap = min(len(smoothed) - 1, center_index + max_curve_points)
-        if previous_center is not None:
-            left_cap = max(left_cap, int((previous_center + center_index) // 2))
-        if next_center is not None:
-            right_cap = min(right_cap, int((center_index + next_center) // 2))
-        if left_cap >= center_index or right_cap <= center_index:
+        LeftCap = max(0, CenterIndex - MaxCurvePoints)
+        RightCap = min(len(Smoothed) - 1, CenterIndex + MaxCurvePoints)
+        if PreviousCenter is not None:
+            LeftCap = max(LeftCap, int((PreviousCenter + CenterIndex) // 2))
+        if NextCenter is not None:
+            RightCap = min(RightCap, int((CenterIndex + NextCenter) // 2))
+        if LeftCap >= CenterIndex or RightCap <= CenterIndex:
             continue
 
-        left_index = left_cap + int(np.argmax(smoothed[left_cap:center_index + 1]))
-        right_index = center_index + int(np.argmax(smoothed[center_index:right_cap + 1]))
-        if left_index >= center_index or right_index <= center_index:
+        LeftIndex = LeftCap + int(Np.argmax(Smoothed[LeftCap:CenterIndex + 1]))
+        RightIndex = CenterIndex + int(Np.argmax(Smoothed[CenterIndex:RightCap + 1]))
+        if LeftIndex >= CenterIndex or RightIndex <= CenterIndex:
             continue
 
-        duration = float(time[right_index] - time[left_index])
-        if duration < min_width_time or duration > max_curve_time:
+        Duration = float(Time[RightIndex] - Time[LeftIndex])
+        if Duration < MinWidthTime or Duration > MaxCurveTime:
             continue
 
-        left_shoulder = float(smoothed[left_index])
-        right_shoulder = float(smoothed[right_index])
-        trough = float(smoothed[center_index])
-        depth = min(left_shoulder, right_shoulder) - trough
-        if depth < min_prominence:
+        LeftShoulder = float(Smoothed[LeftIndex])
+        RightShoulder = float(Smoothed[RightIndex])
+        Trough = float(Smoothed[CenterIndex])
+        Depth = min(LeftShoulder, RightShoulder) - Trough
+        if Depth < MinProminence:
             continue
 
-        box_level = trough + depth * 0.85
-        box_left = center_index
-        while box_left > left_index and smoothed[box_left] < box_level:
-            box_left -= 1
-        box_right = center_index
-        while box_right < right_index and smoothed[box_right] < box_level:
-            box_right += 1
+        BoxLevel = Trough + Depth * 0.85
+        BoxLeft = CenterIndex
+        while BoxLeft > LeftIndex and Smoothed[BoxLeft] < BoxLevel:
+            BoxLeft -= 1
+        BoxRight = CenterIndex
+        while BoxRight < RightIndex and Smoothed[BoxRight] < BoxLevel:
+            BoxRight += 1
 
-        left_index = box_left
-        right_index = box_right
-        duration = float(time[right_index] - time[left_index])
-        if duration < min_width_time or duration > max_curve_time:
+        LeftIndex = BoxLeft
+        RightIndex = BoxRight
+        Duration = float(Time[RightIndex] - Time[LeftIndex])
+        if Duration < MinWidthTime or Duration > MaxCurveTime:
             continue
 
-        segment = smoothed[left_index:right_index + 1]
-        if segment.size < 3:
+        Segment = Smoothed[LeftIndex:RightIndex + 1]
+        if Segment.size < 3:
             continue
 
-        shape_prominence = max(robust_noise * 0.8 * strictness, depth * 0.28)
-        inner_distance = max(3, smooth_width // 3)
-        inner_peaks, _ = find_peaks(segment, prominence=shape_prominence, distance=inner_distance)
-        inner_troughs, _ = find_peaks(-segment, prominence=shape_prominence, distance=inner_distance)
-        center_relative = center_index - left_index
-        extra_troughs = [
-            trough_index
-            for trough_index in inner_troughs
-            if abs(int(trough_index) - center_relative) > inner_distance
+        ShapeProminence = max(RobustNoise * 0.8 * Strictness, Depth * 0.28)
+        InnerDistance = max(3, SmoothWidth // 3)
+        InnerPeaks, _ = FindPeaks(Segment, prominence=ShapeProminence, distance=InnerDistance)
+        InnerTroughs, _ = FindPeaks(-Segment, prominence=ShapeProminence, distance=InnerDistance)
+        CenterRelative = CenterIndex - LeftIndex
+        ExtraTroughs = [
+            TroughIndex
+            for TroughIndex in InnerTroughs
+            if abs(int(TroughIndex) - CenterRelative) > InnerDistance
         ]
-        if len(inner_peaks) > 1 or len(extra_troughs) > 1:
+        if len(InnerPeaks) > 1 or len(ExtraTroughs) > 1:
             continue
 
-        flux_min = float(np.min(segment))
-        flux_max = float(np.max(segment))
-        transits.append({
-            "start": float(time[left_index]),
-            "end": float(time[right_index]),
-            "center": float(time[center_index]),
-            "duration": float(duration),
-            "depth": max(float(depth), prominence_by_index.get(int(center_index), float(depth))),
-            "points": int(right_index - left_index + 1),
-            "flux_min": flux_min,
-            "flux_max": flux_max,
+        FluxMin = float(Np.min(Segment))
+        FluxMax = float(Np.max(Segment))
+        Transits.append({
+            "start": float(Time[LeftIndex]),
+            "end": float(Time[RightIndex]),
+            "center": float(Time[CenterIndex]),
+            "duration": float(Duration),
+            "depth": max(float(Depth), ProminenceByIndex.get(int(CenterIndex), float(Depth))),
+            "points": int(RightIndex - LeftIndex + 1),
+            "flux_min": FluxMin,
+            "flux_max": FluxMax,
         })
 
     return {
-        "transits": prune_overlapping_transits(transits),
-        "robust_noise": robust_noise,
-        "smooth_points": smooth_width,
+        "transits": PruneOverlappingTransits(Transits),
+        "robust_noise": RobustNoise,
+        "smooth_points": SmoothWidth,
     }
 
 
-def detect_transits_by_threshold(time, flux, median_flux, options):
-    clipped_low, clipped_high = robust_flux_limits(flux, sigma=3.0)
-    clipped_flux = np.clip(flux, clipped_low, clipped_high)
+#MARK: dip funcs
+def DetectTransitsByThreshold(Time, Flux, MedianFlux, Options):
+    ClippedLow, ClippedHigh = RobustFluxLimits(Flux, Sigma=3.0)
+    ClippedFlux = Np.clip(Flux, ClippedLow, ClippedHigh)
 
-    strictness = float(options["strictness"])
-    smoothing = float(options["smoothing"])
-    base_smooth_width = int(max(31, min(101, len(clipped_flux) // 700)))
-    smooth_width = odd_window_width(base_smooth_width, smoothing, 7, 501)
-    smoothed = moving_average_by_segments(clipped_flux, smooth_width, observing_segments(time))
+    Strictness = float(Options["strictness"])
+    Smoothing = float(Options["smoothing"])
+    BaseSmoothWidth = int(max(31, min(101, len(ClippedFlux) // 700)))
+    SmoothWidth = OddWindowWidth(BaseSmoothWidth, Smoothing, 7, 501)
+    Smoothed = MovingAverageBySegments(ClippedFlux, SmoothWidth, ObservingSegments(Time))
 
-    baseline = float(np.median(smoothed))
-    mad = float(np.median(np.abs(smoothed - baseline)))
-    robust_noise = max(1.4826 * mad, 1e-9)
+    Baseline = float(Np.median(Smoothed))
+    Mad = float(Np.median(Np.abs(Smoothed - Baseline)))
+    RobustNoise = max(1.4826 * Mad, 1e-9)
 
-    dip_sigma = 2.4 * strictness
-    auto_min_depth = max(dip_sigma * robust_noise, abs(median_flux) * 0.002 * strictness)
-    min_depth = (
-        float(options["min_depth"])
-        if options["min_depth"] is not None
-        else auto_min_depth
+    DipSigma = 2.4 * Strictness
+    AutoMinDepth = max(DipSigma * RobustNoise, abs(MedianFlux) * 0.002 * Strictness)
+    MinDepth = (
+        float(Options["min_depth"])
+        if Options["min_depth"] is not None
+        else AutoMinDepth
     )
-    dip_threshold = min_depth if options["min_depth"] is not None else dip_sigma * robust_noise
-    candidate_mask = smoothed < (baseline - dip_threshold)
-    regions = merge_regions(contiguous_regions(candidate_mask), max_gap=max(2, smooth_width // 2))
+    DipThreshold = MinDepth if Options["min_depth"] is not None else DipSigma * RobustNoise
+    CandidateMask = Smoothed < (Baseline - DipThreshold)
+    Regions = MergeRegions(ContiguousRegions(CandidateMask), MaxGap=max(2, SmoothWidth // 2))
 
-    transits = []
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    auto_min_points = max(5, smooth_width // 4)
-    auto_max_points = max(smooth_width * 5, min(len(time), int(len(time) * 0.05)))
-    min_points = (
-        max(3, int(float(options["min_duration"]) / max(cadence, 1e-9)))
-        if options["min_duration"] is not None
-        else auto_min_points
+    Transits = []
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    AutoMinPoints = max(5, SmoothWidth // 4)
+    AutoMaxPoints = max(SmoothWidth * 5, min(len(Time), int(len(Time) * 0.05)))
+    MinPoints = (
+        max(3, int(float(Options["min_duration"]) / max(Cadence, 1e-9)))
+        if Options["min_duration"] is not None
+        else AutoMinPoints
     )
-    max_points = (
-        max(min_points + 1, int(float(options["max_duration"]) / max(cadence, 1e-9)))
-        if options["max_duration"] is not None
-        else auto_max_points
+    MaxPoints = (
+        max(MinPoints + 1, int(float(Options["max_duration"]) / max(Cadence, 1e-9)))
+        if Options["max_duration"] is not None
+        else AutoMaxPoints
     )
-    for start_index, end_index in regions:
-        if end_index - start_index < min_points:
+    for StartIndex, EndIndex in Regions:
+        if EndIndex - StartIndex < MinPoints:
             continue
-        if end_index - start_index > max_points:
+        if EndIndex - StartIndex > MaxPoints:
             continue
-        segment = smoothed[start_index:end_index]
-        local_min = float(np.min(segment))
-        depth = baseline - local_min
-        if depth < min_depth:
-            continue
-
-        edge_level = baseline - max(robust_noise * 0.55, depth * 0.28)
-        left = start_index
-        while left > 0 and smoothed[left - 1] < edge_level:
-            left -= 1
-        right = end_index
-        while right < len(smoothed) and smoothed[right] < edge_level:
-            right += 1
-
-        duration = float(time[right - 1] - time[left]) if right > left else 0.0
-        if duration <= 0:
-            continue
-        if options["min_duration"] is not None and duration < float(options["min_duration"]):
-            continue
-        if options["max_duration"] is not None and duration > float(options["max_duration"]):
-            continue
-        if full_span > 0 and duration > 0.15 * full_span:
+        Segment = Smoothed[StartIndex:EndIndex]
+        LocalMin = float(Np.min(Segment))
+        Depth = Baseline - LocalMin
+        if Depth < MinDepth:
             continue
 
-        center_index = left + int(np.argmin(smoothed[left:right]))
-        box_segment = smoothed[left:right]
-        transits.append({
-            "start": float(time[left]),
-            "end": float(time[right - 1]),
-            "center": float(time[center_index]),
-            "duration": duration,
-            "depth": float(depth),
-            "points": int(right - left),
-            "flux_min": float(np.min(box_segment)),
-            "flux_max": float(np.max(box_segment)),
+        EdgeLevel = Baseline - max(RobustNoise * 0.55, Depth * 0.28)
+        Left = StartIndex
+        while Left > 0 and Smoothed[Left - 1] < EdgeLevel:
+            Left -= 1
+        Right = EndIndex
+        while Right < len(Smoothed) and Smoothed[Right] < EdgeLevel:
+            Right += 1
+
+        Duration = float(Time[Right - 1] - Time[Left]) if Right > Left else 0.0
+        if Duration <= 0:
+            continue
+        if Options["min_duration"] is not None and Duration < float(Options["min_duration"]):
+            continue
+        if Options["max_duration"] is not None and Duration > float(Options["max_duration"]):
+            continue
+        if FullSpan > 0 and Duration > 0.15 * FullSpan:
+            continue
+
+        CenterIndex = Left + int(Np.argmin(Smoothed[Left:Right]))
+        BoxSegment = Smoothed[Left:Right]
+        Transits.append({
+            "start": float(Time[Left]),
+            "end": float(Time[Right - 1]),
+            "center": float(Time[CenterIndex]),
+            "duration": Duration,
+            "depth": float(Depth),
+            "points": int(Right - Left),
+            "flux_min": float(Np.min(BoxSegment)),
+            "flux_max": float(Np.max(BoxSegment)),
         })
 
     return {
-        "transits": prune_overlapping_transits(transits),
-        "robust_noise": robust_noise,
-        "smooth_points": smooth_width,
+        "transits": PruneOverlappingTransits(Transits),
+        "robust_noise": RobustNoise,
+        "smooth_points": SmoothWidth,
     }
 
 
-def detect_transits(time, flux, options=None, progress_callback=None):
-    if options is None:
-        options = dict(DEFAULT_DETECTION_OPTIONS)
-    median_flux = float(np.median(flux))
-    search_mode = options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
-    if search_mode == "tls":
-        flux_mad = float(np.median(np.abs(flux - median_flux)))
-        detection = {
+#MARK: run the search
+def DetectTransits(Time, Flux, Options=None, ProgressCallback=None):
+    if Options is None:
+        Options = dict(DEFAULT_DETECTION_OPTIONS)
+    MedianFlux = float(Np.median(Flux))
+    SearchMode = Options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
+    if SearchMode == "tls":
+        FluxMad = float(Np.median(Np.abs(Flux - MedianFlux)))
+        Detection = {
             "transits": [],
-            "robust_noise": max(1.4826 * flux_mad, 1e-9),
+            "robust_noise": max(1.4826 * FluxMad, 1e-9),
             "smooth_points": 1,
         }
     else:
-        detection = detect_transits_by_prominence(time, flux, median_flux, options)
-        threshold_detection = detect_transits_by_threshold(time, flux, median_flux, options)
-        if detection is None:
-            detection = threshold_detection
-        elif threshold_detection is not None and len(threshold_detection["transits"]) > len(detection["transits"]):
-            detection = {
-                **detection,
-                "transits": prune_overlapping_transits(detection["transits"] + threshold_detection["transits"]),
-                "robust_noise": min(float(detection["robust_noise"]), float(threshold_detection["robust_noise"])),
-                "smooth_points": min(int(detection["smooth_points"]), int(threshold_detection["smooth_points"])),
+        Detection = DetectTransitsByProminence(Time, Flux, MedianFlux, Options)
+        ThresholdDetection = DetectTransitsByThreshold(Time, Flux, MedianFlux, Options)
+        if Detection is None:
+            Detection = ThresholdDetection
+        elif ThresholdDetection is not None and len(ThresholdDetection["transits"]) > len(Detection["transits"]):
+            Detection = {
+                **Detection,
+                "transits": PruneOverlappingTransits(Detection["transits"] + ThresholdDetection["transits"]),
+                "robust_noise": min(float(Detection["robust_noise"]), float(ThresholdDetection["robust_noise"])),
+                "smooth_points": min(int(Detection["smooth_points"]), int(ThresholdDetection["smooth_points"])),
             }
 
-    transits = sorted(detection["transits"], key=lambda item: item["center"])
-    full_span = float(time[-1] - time[0]) if len(time) > 1 else 0.0
-    tls_period = estimate_period_with_tls(time, flux, options, progress_callback=progress_callback) if search_mode == "tls" else None
-    if tls_period is not None:
-        tls_transits = transits_from_tls_result(time, flux, tls_period)
-        if tls_transits:
-            transits = tls_transits
-        bls_period = None
-        regularity_period = None
-        use_regularity_period = False
+    Transits = sorted(Detection["transits"], key=lambda Item: Item["center"])
+    FullSpan = float(Time[-1] - Time[0]) if len(Time) > 1 else 0.0
+    TlsPeriod = EstimatePeriodWithTls(Time, Flux, Options, ProgressCallback=ProgressCallback) if SearchMode == "tls" else None
+    if TlsPeriod is not None:
+        TlsTransits = TransitsFromTlsResult(Time, Flux, TlsPeriod)
+        if TlsTransits:
+            Transits = TlsTransits
+        BlsPeriod = None
+        RegularityPeriod = None
+        UseRegularityPeriod = False
     else:
-        bls_period = estimate_period_with_bls(time, flux, options)
-        bls_period = dealiased_bls_period(bls_period, transits, time, flux)
-        regularity_period = estimate_period_by_transit_regularity(transits, time, options, bls_period)
-        use_regularity_period = should_prefer_regularity_period(regularity_period, bls_period, transits, time)
-    p_value = None
-    chi_squared_flat = None
-    chi_squared_box = None
-    reduced_chi_squared_box = None
-    delta_chi_squared = None
-    period_epoch = None
-    period_duration = None
-    period_sde = None
-    period_uncertainty = None
-    period_candidates = []
-    period_search = None
-    periodogram = None
-    tls_sde_raw = None
-    tls_fap = None
-    tls_snr = None
-    tls_details = None
-    transit_model = None
-    if tls_period is not None:
-        period = tls_period["period"]
-        period_scatter = tls_period["scatter"]
-        period_uncertainty = tls_period.get("period_uncertainty")
-        period_match_count = tls_period["count"]
-        period_method = tls_period["method"]
-        p_value = tls_period.get("p_value")
-        chi_squared_flat = tls_period.get("chi_squared_flat")
-        chi_squared_box = tls_period.get("chi_squared_box")
-        reduced_chi_squared_box = tls_period.get("reduced_chi_squared_box")
-        delta_chi_squared = tls_period.get("delta_chi_squared")
-        period_epoch = tls_period.get("transit_time")
-        period_duration = tls_period.get("duration")
-        period_sde = tls_period.get("sde")
-        tls_sde_raw = tls_period.get("sde_raw")
-        tls_fap = tls_period.get("fap")
-        tls_snr = tls_period.get("snr")
-        period_candidates = tls_period.get("candidates", [])
-        periodogram = tls_period.get("periodogram")
-        period_search = {
-            "min_period": tls_period.get("search_min_period"),
-            "max_period": tls_period.get("search_max_period"),
-            "min_duration": tls_period.get("search_min_duration"),
-            "max_duration": tls_period.get("search_max_duration"),
+        BlsPeriod = EstimatePeriodWithBls(Time, Flux, Options)
+        BlsPeriod = DealiasedBlsPeriod(BlsPeriod, Transits, Time, Flux)
+        RegularityPeriod = EstimatePeriodByTransitRegularity(Transits, Time, Options, BlsPeriod)
+        UseRegularityPeriod = ShouldPreferRegularityPeriod(RegularityPeriod, BlsPeriod, Transits, Time)
+    PValue = None
+    ChiSquaredFlat = None
+    ChiSquaredBox = None
+    ReducedChiSquaredBox = None
+    DeltaChiSquared = None
+    PeriodEpoch = None
+    PeriodDuration = None
+    PeriodSde = None
+    PeriodUncertainty = None
+    PeriodCandidates = []
+    PeriodSearch = None
+    Periodogram = None
+    TlsSdeRaw = None
+    TlsFap = None
+    TlsSnr = None
+    TlsDetails = None
+    TransitModel = None
+    if TlsPeriod is not None:
+        Period = TlsPeriod["period"]
+        PeriodScatter = TlsPeriod["scatter"]
+        PeriodUncertainty = TlsPeriod.get("period_uncertainty")
+        PeriodMatchCount = TlsPeriod["count"]
+        PeriodMethod = TlsPeriod["method"]
+        PValue = TlsPeriod.get("p_value")
+        ChiSquaredFlat = TlsPeriod.get("chi_squared_flat")
+        ChiSquaredBox = TlsPeriod.get("chi_squared_box")
+        ReducedChiSquaredBox = TlsPeriod.get("reduced_chi_squared_box")
+        DeltaChiSquared = TlsPeriod.get("delta_chi_squared")
+        PeriodEpoch = TlsPeriod.get("transit_time")
+        PeriodDuration = TlsPeriod.get("duration")
+        PeriodSde = TlsPeriod.get("sde")
+        TlsSdeRaw = TlsPeriod.get("sde_raw")
+        TlsFap = TlsPeriod.get("fap")
+        TlsSnr = TlsPeriod.get("snr")
+        PeriodCandidates = TlsPeriod.get("candidates", [])
+        Periodogram = TlsPeriod.get("periodogram")
+        PeriodSearch = {
+            "min_period": TlsPeriod.get("search_min_period"),
+            "max_period": TlsPeriod.get("search_max_period"),
+            "min_duration": TlsPeriod.get("search_min_duration"),
+            "max_duration": TlsPeriod.get("search_max_duration"),
         }
-        tls_result = tls_period.get("tls_result") or {}
-        tls_details = {
-            key: value
-            for key, value in tls_result.items()
-            if key not in ("candidates", "periodogram", "model")
+        TlsResult = TlsPeriod.get("tls_result") or {}
+        TlsDetails = {
+            Key: Value
+            for Key, Value in TlsResult.items()
+            if Key not in ("candidates", "periodogram", "model")
         }
-        transit_model = tls_period.get("transit_model")
-    elif bls_period is not None and not use_regularity_period:
-        periodogram = bls_period.get("periodogram")
-        period = bls_period["period"]
-        period_scatter = bls_period["scatter"]
-        period_match_count = bls_period["count"]
-        period_method = bls_period["method"]
-        p_value = bls_period.get("p_value")
-        chi_squared_flat = bls_period.get("chi_squared_flat")
-        chi_squared_box = bls_period.get("chi_squared_box")
-        reduced_chi_squared_box = bls_period.get("reduced_chi_squared_box")
-        delta_chi_squared = bls_period.get("delta_chi_squared")
-        period_epoch = bls_period.get("transit_time")
-        period_duration = bls_period.get("duration")
-        period_sde = bls_period.get("sde")
-        period_candidates = bls_period.get("candidates", [])
-        if regularity_period is not None:
-            period_candidates = [
+        TransitModel = TlsPeriod.get("transit_model")
+    elif BlsPeriod is not None and not UseRegularityPeriod:
+        Periodogram = BlsPeriod.get("periodogram")
+        Period = BlsPeriod["period"]
+        PeriodScatter = BlsPeriod["scatter"]
+        PeriodMatchCount = BlsPeriod["count"]
+        PeriodMethod = BlsPeriod["method"]
+        PValue = BlsPeriod.get("p_value")
+        ChiSquaredFlat = BlsPeriod.get("chi_squared_flat")
+        ChiSquaredBox = BlsPeriod.get("chi_squared_box")
+        ReducedChiSquaredBox = BlsPeriod.get("reduced_chi_squared_box")
+        DeltaChiSquared = BlsPeriod.get("delta_chi_squared")
+        PeriodEpoch = BlsPeriod.get("transit_time")
+        PeriodDuration = BlsPeriod.get("duration")
+        PeriodSde = BlsPeriod.get("sde")
+        PeriodCandidates = BlsPeriod.get("candidates", [])
+        if RegularityPeriod is not None:
+            PeriodCandidates = [
                 {
-                    "period": regularity_period["period"],
-                    "power": regularity_period["event_match_count"],
+                    "period": RegularityPeriod["period"],
+                    "power": RegularityPeriod["event_match_count"],
                     "sde": None,
-                    "method": regularity_period["method"],
-                    "event_match_count": regularity_period["event_match_count"],
-                    "expected_transit_count": regularity_period["expected_count"],
-                    "expected_transit_coverage": regularity_period["expected_coverage"],
+                    "method": RegularityPeriod["method"],
+                    "event_match_count": RegularityPeriod["event_match_count"],
+                    "expected_transit_count": RegularityPeriod["expected_count"],
+                    "expected_transit_coverage": RegularityPeriod["expected_coverage"],
                 },
-                *period_candidates,
+                *PeriodCandidates,
             ]
-        period_search = {
-            "min_period": bls_period.get("search_min_period"),
-            "max_period": bls_period.get("search_max_period"),
-            "min_duration": bls_period.get("search_min_duration"),
-            "max_duration": bls_period.get("search_max_duration"),
+        PeriodSearch = {
+            "min_period": BlsPeriod.get("search_min_period"),
+            "max_period": BlsPeriod.get("search_max_period"),
+            "min_duration": BlsPeriod.get("search_min_duration"),
+            "max_duration": BlsPeriod.get("search_max_duration"),
         }
-    elif regularity_period is not None:
-        period = regularity_period["period"]
-        period_scatter = regularity_period["scatter"]
-        period_match_count = regularity_period["count"]
-        period_method = regularity_period["method"]
-        period_epoch = regularity_period["transit_time"]
-        period_duration = regularity_period["duration"]
-        period_candidates = [
+    elif RegularityPeriod is not None:
+        Period = RegularityPeriod["period"]
+        PeriodScatter = RegularityPeriod["scatter"]
+        PeriodMatchCount = RegularityPeriod["count"]
+        PeriodMethod = RegularityPeriod["method"]
+        PeriodEpoch = RegularityPeriod["transit_time"]
+        PeriodDuration = RegularityPeriod["duration"]
+        PeriodCandidates = [
             {
-                "period": regularity_period["period"],
-                "power": regularity_period["event_match_count"],
+                "period": RegularityPeriod["period"],
+                "power": RegularityPeriod["event_match_count"],
                 "sde": None,
-                "method": regularity_period["method"],
-                "event_match_count": regularity_period["event_match_count"],
-                "expected_transit_count": regularity_period["expected_count"],
-                "expected_transit_coverage": regularity_period["expected_coverage"],
+                "method": RegularityPeriod["method"],
+                "event_match_count": RegularityPeriod["event_match_count"],
+                "expected_transit_count": RegularityPeriod["expected_count"],
+                "expected_transit_coverage": RegularityPeriod["expected_coverage"],
             },
-            *(bls_period.get("candidates", []) if bls_period is not None else []),
+            *(BlsPeriod.get("candidates", []) if BlsPeriod is not None else []),
         ]
-        if bls_period is not None:
-            periodogram = bls_period.get("periodogram")
-            period_search = {
-                "min_period": bls_period.get("search_min_period"),
-                "max_period": bls_period.get("search_max_period"),
-                "min_duration": bls_period.get("search_min_duration"),
-                "max_duration": bls_period.get("search_max_duration"),
+        if BlsPeriod is not None:
+            Periodogram = BlsPeriod.get("periodogram")
+            PeriodSearch = {
+                "min_period": BlsPeriod.get("search_min_period"),
+                "max_period": BlsPeriod.get("search_max_period"),
+                "min_duration": BlsPeriod.get("search_min_duration"),
+                "max_duration": BlsPeriod.get("search_max_duration"),
             }
-        flattened_flux = flattened_flux_for_period_search(time, flux)
-        chi_squared = None if flattened_flux is None else chi_squared_transit_probability(
-            time,
-            flattened_flux,
-            period,
-            period_duration,
-            period_epoch,
+        FlattenedFlux = FlattenedFluxForPeriodSearch(Time, Flux)
+        ChiSquared = None if FlattenedFlux is None else ChiSquaredTransitProbability(
+            Time,
+            FlattenedFlux,
+            Period,
+            PeriodDuration,
+            PeriodEpoch,
         )
-        if chi_squared:
-            p_value = chi_squared.get("p_value")
-            chi_squared_flat = chi_squared.get("chi_squared_flat")
-            chi_squared_box = chi_squared.get("chi_squared_box")
-            reduced_chi_squared_box = chi_squared.get("reduced_chi_squared_box")
-            delta_chi_squared = chi_squared.get("delta_chi_squared")
+        if ChiSquared:
+            PValue = ChiSquared.get("p_value")
+            ChiSquaredFlat = ChiSquared.get("chi_squared_flat")
+            ChiSquaredBox = ChiSquared.get("chi_squared_box")
+            ReducedChiSquaredBox = ChiSquared.get("reduced_chi_squared_box")
+            DeltaChiSquared = ChiSquared.get("delta_chi_squared")
     else:
-        period, period_scatter, period_match_count = estimate_period_from_candidates(transits, full_span)
-        period_method = "average gaps" if period is not None else None
-        if period is not None and transits:
-            period_epoch = float(transits[0]["center"])
-            period_duration = float(np.median([item["duration"] for item in transits]))
+        Period, PeriodScatter, PeriodMatchCount = EstimatePeriodFromCandidates(Transits, FullSpan)
+        PeriodMethod = "average gaps" if Period is not None else None
+        if Period is not None and Transits:
+            PeriodEpoch = float(Transits[0]["center"])
+            PeriodDuration = float(Np.median([Item["duration"] for Item in Transits]))
     return {
-        "transits": transits,
-        "period": period,
-        "period_scatter": period_scatter,
-        "period_match_count": period_match_count,
-        "period_method": period_method,
-        "period_epoch": period_epoch,
-        "period_duration": period_duration,
-        "period_sde": period_sde,
-        "period_uncertainty": period_uncertainty,
-        "period_candidates": period_candidates,
-        "period_search": period_search,
-        "periodogram": periodogram,
-        "tls_sde_raw": tls_sde_raw,
-        "tls_fap": tls_fap,
-        "tls_snr": tls_snr,
-        "tls": tls_details,
-        "transit_model": transit_model,
-        "p_value": p_value,
-        "p_value_percent": None if p_value is None else p_value * 100.0,
-        "chi_squared_flat": chi_squared_flat,
-        "chi_squared_box": chi_squared_box,
-        "reduced_chi_squared_box": reduced_chi_squared_box,
-        "delta_chi_squared": delta_chi_squared,
-        "median_flux": median_flux,
-        "robust_noise": float(detection["robust_noise"]),
-        "smooth_points": int(detection["smooth_points"]),
-        "detection_options": options,
+        "transits": Transits,
+        "period": Period,
+        "period_scatter": PeriodScatter,
+        "period_match_count": PeriodMatchCount,
+        "period_method": PeriodMethod,
+        "period_epoch": PeriodEpoch,
+        "period_duration": PeriodDuration,
+        "period_sde": PeriodSde,
+        "period_uncertainty": PeriodUncertainty,
+        "period_candidates": PeriodCandidates,
+        "period_search": PeriodSearch,
+        "periodogram": Periodogram,
+        "tls_sde_raw": TlsSdeRaw,
+        "tls_fap": TlsFap,
+        "tls_snr": TlsSnr,
+        "tls": TlsDetails,
+        "transit_model": TransitModel,
+        "p_value": PValue,
+        "p_value_percent": None if PValue is None else PValue * 100.0,
+        "chi_squared_flat": ChiSquaredFlat,
+        "chi_squared_box": ChiSquaredBox,
+        "reduced_chi_squared_box": ReducedChiSquaredBox,
+        "delta_chi_squared": DeltaChiSquared,
+        "median_flux": MedianFlux,
+        "robust_noise": float(Detection["robust_noise"]),
+        "smooth_points": int(Detection["smooth_points"]),
+        "detection_options": Options,
     }
 
 
-def add_depth_metrics(transit, baseline_flux):
-    depth = transit.get("depth")
+#MARK: check the results
+def AddDepthMetrics(Transit, BaselineFlux):
+    Depth = Transit.get("depth")
     if (
-        depth is None
-        or not math.isfinite(float(depth))
-        or float(depth) < 0
+        Depth is None
+        or not Math.isfinite(float(Depth))
+        or float(Depth) < 0
     ):
-        transit["depth_fraction"] = None
-        transit["depth_percent"] = None
-        transit["depth_ppm"] = None
-        transit["radius_ratio"] = None
-        transit["depth_basis"] = None
-        return transit
+        Transit["depth_fraction"] = None
+        Transit["depth_percent"] = None
+        Transit["depth_ppm"] = None
+        Transit["radius_ratio"] = None
+        Transit["depth_basis"] = None
+        return Transit
 
-    normalized_fraction = None
+    NormalizedFraction = None
     if (
-        baseline_flux is not None
-        and math.isfinite(float(baseline_flux))
-        and float(baseline_flux) > 0
+        BaselineFlux is not None
+        and Math.isfinite(float(BaselineFlux))
+        and float(BaselineFlux) > 0
     ):
-        normalized_fraction = float(depth) / float(baseline_flux)
+        NormalizedFraction = float(Depth) / float(BaselineFlux)
 
-    use_normalized_flux = normalized_fraction is not None and normalized_fraction <= 0.5
-    depth_fraction = normalized_fraction if use_normalized_flux else float(depth) / 1000000.0
-    transit["depth_fraction"] = depth_fraction
-    transit["depth_percent"] = depth_fraction * 100.0
-    transit["depth_ppm"] = depth_fraction * 1000000.0
-    transit["radius_ratio"] = math.sqrt(depth_fraction)
-    transit["depth_basis"] = "fractional flux" if use_normalized_flux else "ppm flux"
-    return transit
-
-
-def finite_values(values):
-    return [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    UseNormalizedFlux = NormalizedFraction is not None and NormalizedFraction <= 0.5
+    DepthFraction = NormalizedFraction if UseNormalizedFlux else float(Depth) / 1000000.0
+    Transit["depth_fraction"] = DepthFraction
+    Transit["depth_percent"] = DepthFraction * 100.0
+    Transit["depth_ppm"] = DepthFraction * 1000000.0
+    Transit["radius_ratio"] = Math.sqrt(DepthFraction)
+    Transit["depth_basis"] = "fractional flux" if UseNormalizedFlux else "ppm flux"
+    return Transit
 
 
-def finite_number(value):
-    if value is None or isinstance(value, (bool, np.bool_)):
+#MARK: finite values
+def FiniteValues(Values):
+    return [float(Value) for Value in Values if Value is not None and Math.isfinite(float(Value))]
+
+
+#MARK: finite number
+def FiniteNumber(Value):
+    if Value is None or isinstance(Value, (bool, Np.bool_)):
         return None
     try:
-        number = float(value)
+        Number = float(Value)
     except (TypeError, ValueError):
         return None
-    return number if math.isfinite(number) else None
+    return Number if Math.isfinite(Number) else None
 
 
-def format_metric(value, digits=2):
-    number = finite_number(value)
-    return "-" if number is None else f"{number:.{digits}f}"
+#MARK: format metric
+def FormatMetric(Value, Digits=2):
+    Number = FiniteNumber(Value)
+    return "-" if Number is None else f"{Number:.{Digits}f}"
 
 
-def median_or_none(values):
-    clean = sorted(finite_values(values))
-    if not clean:
+#MARK: median or none
+def MedianOrNone(Values):
+    Clean = sorted(FiniteValues(Values))
+    if not Clean:
         return None
-    middle = len(clean) // 2
-    if len(clean) % 2:
-        return clean[middle]
-    return (clean[middle - 1] + clean[middle]) / 2.0
+    Middle = len(Clean) // 2
+    if len(Clean) % 2:
+        return Clean[Middle]
+    return (Clean[Middle - 1] + Clean[Middle]) / 2.0
 
 
-def coefficient_of_variation(values):
-    clean = finite_values(values)
-    center = median_or_none(clean)
-    if center is None or center <= 0 or len(clean) < 2:
+#MARK: coefficient of variation
+def CoefficientOfVariation(Values):
+    Clean = FiniteValues(Values)
+    Center = MedianOrNone(Clean)
+    if Center is None or Center <= 0 or len(Clean) < 2:
         return None
-    return float(np.std(np.asarray(clean, dtype=float)) / center)
+    return float(Np.std(Np.asarray(Clean, dtype=float)) / Center)
 
 
-def normalize_observed_ranges(observed_ranges):
-    ranges = []
-    for item in observed_ranges or []:
-        if isinstance(item, dict):
-            start = finite_number(item.get("start_day", item.get("start")))
-            end = finite_number(item.get("end_day", item.get("end")))
+#MARK: normalize observed ranges
+def NormalizeObservedRanges(ObservedRanges):
+    Ranges = []
+    for Item in ObservedRanges or []:
+        if isinstance(Item, dict):
+            Start = FiniteNumber(Item.get("start_day", Item.get("start")))
+            End = FiniteNumber(Item.get("end_day", Item.get("end")))
         else:
             try:
-                start = finite_number(item[0])
-                end = finite_number(item[1])
+                Start = FiniteNumber(Item[0])
+                End = FiniteNumber(Item[1])
             except (TypeError, IndexError):
-                start = None
-                end = None
-        if start is None or end is None:
+                Start = None
+                End = None
+        if Start is None or End is None:
             continue
-        if end < start:
-            start, end = end, start
-        ranges.append((float(start), float(end)))
-    return ranges
+        if End < Start:
+            Start, End = End, Start
+        Ranges.append((float(Start), float(End)))
+    return Ranges
 
 
-def ephemeris_cycles_in_observed_ranges(period, epoch, tolerance, observed_ranges):
-    period = finite_number(period)
-    epoch = finite_number(epoch)
-    tolerance = finite_number(tolerance)
-    if period is None or epoch is None or tolerance is None or period <= 0:
+#MARK: event timing
+def EphemerisCyclesInObservedRanges(Period, Epoch, Tolerance, ObservedRanges):
+    Period = FiniteNumber(Period)
+    Epoch = FiniteNumber(Epoch)
+    Tolerance = FiniteNumber(Tolerance)
+    if Period is None or Epoch is None or Tolerance is None or Period <= 0:
         return set()
 
-    cycles = set()
-    for start, end in normalize_observed_ranges(observed_ranges):
-        first_cycle = math.ceil((start - tolerance - epoch) / period)
-        last_cycle = math.floor((end + tolerance - epoch) / period)
-        if last_cycle < first_cycle:
+    Cycles = set()
+    for Start, End in NormalizeObservedRanges(ObservedRanges):
+        FirstCycle = Math.ceil((Start - Tolerance - Epoch) / Period)
+        LastCycle = Math.floor((End + Tolerance - Epoch) / Period)
+        if LastCycle < FirstCycle:
             continue
-        cycles.update(range(int(first_cycle), int(last_cycle) + 1))
-    return cycles
+        Cycles.update(range(int(FirstCycle), int(LastCycle) + 1))
+    return Cycles
 
 
-def build_ephemeris_diagnostics(transits, detection, time_reference=0.0, observed_ranges=None):
-    period = finite_number(detection.get("period"))
-    epoch = finite_number(detection.get("period_epoch"))
-    period_duration = finite_number(detection.get("period_duration"))
-    expected_count = finite_number(detection.get("period_match_count"))
-    independent_timing = detection.get("period_method") == "TLS"
-    centers = finite_values([
-        item.get("measured_center") if independent_timing else item.get("center")
-        for item in transits
-        if not independent_timing or item.get("state") == "supported_dip"
+#MARK: event timing
+def BuildEphemerisDiagnostics(Transits, Detection, TimeReference=0.0, ObservedRanges=None):
+    Period = FiniteNumber(Detection.get("period"))
+    Epoch = FiniteNumber(Detection.get("period_epoch"))
+    PeriodDuration = FiniteNumber(Detection.get("period_duration"))
+    ExpectedCount = FiniteNumber(Detection.get("period_match_count"))
+    IndependentTiming = Detection.get("period_method") == "TLS"
+    Centers = FiniteValues([
+        Item.get("measured_center") if IndependentTiming else Item.get("center")
+        for Item in Transits
+        if not IndependentTiming or Item.get("state") == "supported_dip"
     ])
-    durations = finite_values([item.get("duration") for item in transits])
+    Durations = FiniteValues([Item.get("duration") for Item in Transits])
 
-    empty = {
+    Empty = {
         "ephemeris_match_count": None,
         "ephemeris_match_fraction": None,
         "ephemeris_event_match_count": None,
         "ephemeris_event_match_fraction": None,
         "off_ephemeris_transit_count": None,
         "off_ephemeris_fraction": None,
-        "expected_transit_count": expected_count,
+        "expected_transit_count": ExpectedCount,
         "expected_transit_coverage": None,
         "timing_residual_median": None,
         "timing_residual_max": None,
         "timing_residual_tolerance": None,
         "timing_residual_ratio": None,
-        "timing_basis": "independently measured local centroids" if independent_timing else "detected event centers",
-        "measured_timing_count": len(centers),
-        "predicted_window_count": len(transits),
-        "covered_window_count": sum(item.get("state") in ("supported_dip", "unsupported_window") for item in transits) if independent_timing else len(transits),
+        "timing_basis": "independently measured local centroids" if IndependentTiming else "detected event centers",
+        "measured_timing_count": len(Centers),
+        "predicted_window_count": len(Transits),
+        "covered_window_count": sum(Item.get("state") in ("supported_dip", "unsupported_window") for Item in Transits) if IndependentTiming else len(Transits),
     }
-    if not centers or period is None or epoch is None or period <= 0:
-        return empty
+    if not Centers or Period is None or Epoch is None or Period <= 0:
+        return Empty
 
-    epoch_relative = epoch - float(time_reference)
-    median_duration = median_or_none(durations)
-    duration_scale = max(
-        period_duration or 0.0,
-        median_duration or 0.0,
-        period * 0.035,
+    EpochRelative = Epoch - float(TimeReference)
+    MedianDuration = MedianOrNone(Durations)
+    DurationScale = max(
+        PeriodDuration or 0.0,
+        MedianDuration or 0.0,
+        Period * 0.035,
     )
-    tolerance = max(duration_scale * 1.5, period * 0.025)
-    tolerance = min(tolerance, period * 0.18)
-    if tolerance <= 0:
-        return empty
+    Tolerance = max(DurationScale * 1.5, Period * 0.025)
+    Tolerance = min(Tolerance, Period * 0.18)
+    if Tolerance <= 0:
+        return Empty
 
-    residuals = []
-    matched_residuals = []
-    matched_cycles = set()
-    for center in centers:
-        cycles = round((center - epoch_relative) / period)
-        nearest_epoch = epoch_relative + cycles * period
-        residual = abs(center - nearest_epoch)
-        residuals.append(residual)
-        if residual <= tolerance:
-            matched_residuals.append(residual)
-            matched_cycles.add(int(cycles))
+    Residuals = []
+    MatchedResiduals = []
+    MatchedCycles = set()
+    for Center in Centers:
+        Cycles = round((Center - EpochRelative) / Period)
+        NearestEpoch = EpochRelative + Cycles * Period
+        Residual = abs(Center - NearestEpoch)
+        Residuals.append(Residual)
+        if Residual <= Tolerance:
+            MatchedResiduals.append(Residual)
+            MatchedCycles.add(int(Cycles))
 
-    match_count = len(matched_residuals)
-    event_match_count = len(matched_cycles)
-    transit_count = len(centers)
-    off_count = transit_count - match_count
-    median_residual = median_or_none(residuals)
-    observed_cycles = ephemeris_cycles_in_observed_ranges(period, epoch_relative, tolerance, observed_ranges)
-    if independent_timing:
-        expected_count = sum(item.get("state") in ("supported_dip", "unsupported_window") for item in transits)
-    elif observed_cycles:
-        expected_count = len(observed_cycles)
-    expected_coverage = None
-    if expected_count is not None and expected_count > 0:
-        expected_coverage = min(1.0, event_match_count / expected_count)
+    MatchCount = len(MatchedResiduals)
+    EventMatchCount = len(MatchedCycles)
+    TransitCount = len(Centers)
+    OffCount = TransitCount - MatchCount
+    MedianResidual = MedianOrNone(Residuals)
+    ObservedCycles = EphemerisCyclesInObservedRanges(Period, EpochRelative, Tolerance, ObservedRanges)
+    if IndependentTiming:
+        ExpectedCount = sum(Item.get("state") in ("supported_dip", "unsupported_window") for Item in Transits)
+    elif ObservedCycles:
+        ExpectedCount = len(ObservedCycles)
+    ExpectedCoverage = None
+    if ExpectedCount is not None and ExpectedCount > 0:
+        ExpectedCoverage = min(1.0, EventMatchCount / ExpectedCount)
 
     return {
-        **empty,
-        "ephemeris_match_count": int(match_count),
-        "ephemeris_match_fraction": match_count / transit_count,
-        "ephemeris_event_match_count": int(event_match_count),
-        "ephemeris_event_match_fraction": None if expected_count is None or expected_count <= 0 else event_match_count / expected_count,
-        "off_ephemeris_transit_count": int(off_count),
-        "off_ephemeris_fraction": off_count / transit_count,
-        "expected_transit_count": int(expected_count) if expected_count is not None else None,
-        "expected_transit_coverage": expected_coverage,
-        "timing_residual_median": median_residual,
-        "timing_residual_max": max(residuals) if residuals else None,
-        "timing_residual_tolerance": tolerance,
-        "timing_residual_ratio": None if median_residual is None else median_residual / tolerance,
+        **Empty,
+        "ephemeris_match_count": int(MatchCount),
+        "ephemeris_match_fraction": MatchCount / TransitCount,
+        "ephemeris_event_match_count": int(EventMatchCount),
+        "ephemeris_event_match_fraction": None if ExpectedCount is None or ExpectedCount <= 0 else EventMatchCount / ExpectedCount,
+        "off_ephemeris_transit_count": int(OffCount),
+        "off_ephemeris_fraction": OffCount / TransitCount,
+        "expected_transit_count": int(ExpectedCount) if ExpectedCount is not None else None,
+        "expected_transit_coverage": ExpectedCoverage,
+        "timing_residual_median": MedianResidual,
+        "timing_residual_max": max(Residuals) if Residuals else None,
+        "timing_residual_tolerance": Tolerance,
+        "timing_residual_ratio": None if MedianResidual is None else MedianResidual / Tolerance,
     }
 
 
-def build_candidate_diagnostics(transits, detection, time_reference=0.0, observed_ranges=None):
-    has_window_states = any("state" in item for item in transits)
-    evidence_events = [item for item in transits if not has_window_states or item.get("state") == "supported_dip"]
-    depths = finite_values([item.get("depth") for item in evidence_events])
-    radius_ratios = finite_values([item.get("radius_ratio") for item in evidence_events])
-    point_counts = finite_values([item.get("points") for item in evidence_events])
-    # Absolute orbital cycle parity survives missing observations.
-    epoch = finite_number(detection.get("period_epoch"))
-    period = finite_number(detection.get("period"))
-    def parity(item, index):
-        if item.get("cycle_number") is not None:
-            return int(item["cycle_number"]) % 2
-        if epoch is not None and period and period > 0:
-            return int(round((item["center"] + time_reference - epoch) / period)) % 2
-        return index % 2
-    odd_depths = finite_values([item.get("depth") for i, item in enumerate(evidence_events) if parity(item, i) == 1])
-    even_depths = finite_values([item.get("depth") for i, item in enumerate(evidence_events) if parity(item, i) == 0])
-    odd_depth = median_or_none(odd_depths)
-    even_depth = median_or_none(even_depths)
-    depth_center = median_or_none(depths)
-    robust_noise = detection.get("robust_noise")
-    local_depth_snr = None
-    if depth_center is not None and robust_noise is not None and math.isfinite(float(robust_noise)) and float(robust_noise) > 0:
-        local_depth_snr = depth_center / float(robust_noise)
-    tls_snr = finite_number(detection.get("tls_snr"))
-    detection_snr = tls_snr if detection.get("period_method") == "TLS" and tls_snr is not None else local_depth_snr
-    tls_details = detection.get("tls") or {}
-    tls_odd_even_mismatch = finite_number(tls_details.get("odd_even_mismatch_sigma"))
+#MARK: transit checks
+def BuildCandidateDiagnostics(Transits, Detection, TimeReference=0.0, ObservedRanges=None):
+    HasWindowStates = any("state" in Item for Item in Transits)
+    EvidenceEvents = [Item for Item in Transits if not HasWindowStates or Item.get("state") == "supported_dip"]
+    Depths = FiniteValues([Item.get("depth") for Item in EvidenceEvents])
+    RadiusRatios = FiniteValues([Item.get("radius_ratio") for Item in EvidenceEvents])
+    PointCounts = FiniteValues([Item.get("points") for Item in EvidenceEvents])
+    #MARK: transit checks
+    # a missing event shouldn't flip which cycle is odd.
+    Epoch = FiniteNumber(Detection.get("period_epoch"))
+    Period = FiniteNumber(Detection.get("period"))
+    def Parity(Item, Index):
+        if Item.get("cycle_number") is not None:
+            return int(Item["cycle_number"]) % 2
+        if Epoch is not None and Period and Period > 0:
+            return int(round((Item["center"] + TimeReference - Epoch) / Period)) % 2
+        return Index % 2
+    OddDepths = FiniteValues([Item.get("depth") for I, Item in enumerate(EvidenceEvents) if Parity(Item, I) == 1])
+    EvenDepths = FiniteValues([Item.get("depth") for I, Item in enumerate(EvidenceEvents) if Parity(Item, I) == 0])
+    OddDepth = MedianOrNone(OddDepths)
+    EvenDepth = MedianOrNone(EvenDepths)
+    DepthCenter = MedianOrNone(Depths)
+    RobustNoise = Detection.get("robust_noise")
+    LocalDepthSnr = None
+    if DepthCenter is not None and RobustNoise is not None and Math.isfinite(float(RobustNoise)) and float(RobustNoise) > 0:
+        LocalDepthSnr = DepthCenter / float(RobustNoise)
+    TlsSnr = FiniteNumber(Detection.get("tls_snr"))
+    DetectionSnr = TlsSnr if Detection.get("period_method") == "TLS" and TlsSnr is not None else LocalDepthSnr
+    TlsDetails = Detection.get("tls") or {}
+    TlsOddEvenMismatch = FiniteNumber(TlsDetails.get("odd_even_mismatch_sigma"))
 
-    odd_even_depth_mismatch = None
-    if odd_depth is not None and even_depth is not None and max(odd_depth, even_depth) > 0:
-        odd_even_depth_mismatch = abs(odd_depth - even_depth) / max(odd_depth, even_depth)
+    OddEvenDepthMismatch = None
+    if OddDepth is not None and EvenDepth is not None and max(OddDepth, EvenDepth) > 0:
+        OddEvenDepthMismatch = abs(OddDepth - EvenDepth) / max(OddDepth, EvenDepth)
 
-    ephemeris = build_ephemeris_diagnostics(transits, detection, time_reference, observed_ranges)
-    usable_windows = [item for item in transits
-                      if item.get("state") in ("supported_dip", "unsupported_window")
-                      and finite_number(item.get("depth")) is not None
-                      and finite_number(item.get("depth_uncertainty")) is not None
-                      and item["depth_uncertainty"] > 0]
-    combined_depth = combined_error = combined_snr = None
-    if usable_windows:
-        signed = np.asarray([item["depth"] for item in usable_windows])
-        errors = np.asarray([item["depth_uncertainty"] for item in usable_windows])
-        weights = 1.0 / errors ** 2
-        # Per-event errors estimated from very few samples can be spuriously
-        # small. Cap their relative precision rather than allowing one shallow
+    Ephemeris = BuildEphemerisDiagnostics(Transits, Detection, TimeReference, ObservedRanges)
+    #MARK: dip funcs
+    # keep signed depths: a weak dip can help without being a detection by itself.
+    UsableWindows = [Item for Item in Transits
+                      if Item.get("state") in ("supported_dip", "unsupported_window")
+                      and FiniteNumber(Item.get("depth")) is not None
+                      and FiniteNumber(Item.get("depth_uncertainty")) is not None
+                      and Item["depth_uncertainty"] > 0]
+    CombinedDepth = CombinedError = CombinedSnr = None
+    if UsableWindows:
+        Signed = Np.asarray([Item["depth"] for Item in UsableWindows])
+        Errors = Np.asarray([Item["depth_uncertainty"] for Item in UsableWindows])
+        Weights = 1.0 / Errors ** 2
+        # per-event errors estimated from very few samples can be spuriously
+        # small. cap their relative precision rather than allowing one shallow
         # window to dominate the collective signal.
-        weights = np.minimum(weights, np.median(weights) * 2.0)
-        combined_depth = float(np.average(signed, weights=weights))
-        formal_error = float(1.0 / math.sqrt(np.sum(weights)))
-        empirical_error = float(np.std(signed, ddof=1) / math.sqrt(len(signed))) if len(signed) > 1 else formal_error
-        combined_error = max(formal_error, empirical_error)
-        combined_snr = combined_depth / combined_error if combined_error > 0 else None
-    positive_windows = sum(item["depth"] > 0 for item in usable_windows)
-    combined_support = (len(usable_windows) >= 3 and positive_windows >= 3
-                        and positive_windows / len(usable_windows) >= 0.6
-                        and combined_snr is not None and combined_snr >= 3.0
-                        and detection.get("period_method") == "TLS"
-                        and (finite_number(detection.get("period_sde")) or 0) >= 7.0
-                        and (tls_snr or 0) >= 5.0)
-    diagnostics = {
-        "detection_snr": detection_snr,
-        "local_depth_snr": local_depth_snr,
-        "tls_snr": tls_snr,
-        "tls_fap": finite_number(detection.get("tls_fap")),
-        "tls_odd_even_mismatch_sigma": tls_odd_even_mismatch,
-        "median_transit_points": median_or_none(point_counts),
-        "depth_scatter_ratio": coefficient_of_variation(depths),
-        "odd_depth": odd_depth,
-        "even_depth": even_depth,
-        "odd_even_depth_mismatch": odd_even_depth_mismatch,
-        "max_radius_ratio": max(radius_ratios) if radius_ratios else None,
-        "supported_event_count": len(evidence_events),
-        "combined_window_count": len(usable_windows),
-        "positive_window_count": positive_windows,
-        "combined_signed_depth": combined_depth,
-        "combined_depth_uncertainty": combined_error,
-        "combined_depth_snr": combined_snr,
-        "combined_signal_supported": bool(combined_support),
-        "predicted_window_count": len(transits),
-        "unsupported_window_count": sum(item.get("state") == "unsupported_window" for item in transits),
-        "insufficient_coverage_count": sum(item.get("state") == "insufficient_coverage" for item in transits),
-        "outside_observations_count": sum(item.get("state") == "outside_observations" for item in transits),
-        "odd_event_count": len(odd_depths), "even_event_count": len(even_depths),
-        **ephemeris,
+        Weights = Np.minimum(Weights, Np.median(Weights) * 2.0)
+        CombinedDepth = float(Np.average(Signed, weights=Weights))
+        FormalError = float(1.0 / Math.sqrt(Np.sum(Weights)))
+        EmpiricalError = float(Np.std(Signed, ddof=1) / Math.sqrt(len(Signed))) if len(Signed) > 1 else FormalError
+        CombinedError = max(FormalError, EmpiricalError)
+        CombinedSnr = CombinedDepth / CombinedError if CombinedError > 0 else None
+    PositiveWindows = sum(Item["depth"] > 0 for Item in UsableWindows)
+    CombinedSupport = (len(UsableWindows) >= 3 and PositiveWindows >= 3
+                        and PositiveWindows / len(UsableWindows) >= 0.6
+                        and CombinedSnr is not None and CombinedSnr >= 3.0
+                        and Detection.get("period_method") == "TLS"
+                        and (FiniteNumber(Detection.get("period_sde")) or 0) >= 7.0
+                        and (TlsSnr or 0) >= 5.0)
+    Diagnostics = {
+        "detection_snr": DetectionSnr,
+        "local_depth_snr": LocalDepthSnr,
+        "tls_snr": TlsSnr,
+        "tls_fap": FiniteNumber(Detection.get("tls_fap")),
+        "tls_odd_even_mismatch_sigma": TlsOddEvenMismatch,
+        "median_transit_points": MedianOrNone(PointCounts),
+        "depth_scatter_ratio": CoefficientOfVariation(Depths),
+        "odd_depth": OddDepth,
+        "even_depth": EvenDepth,
+        "odd_even_depth_mismatch": OddEvenDepthMismatch,
+        "max_radius_ratio": max(RadiusRatios) if RadiusRatios else None,
+        "supported_event_count": len(EvidenceEvents),
+        "combined_window_count": len(UsableWindows),
+        "positive_window_count": PositiveWindows,
+        "combined_signed_depth": CombinedDepth,
+        "combined_depth_uncertainty": CombinedError,
+        "combined_depth_snr": CombinedSnr,
+        "combined_signal_supported": bool(CombinedSupport),
+        "predicted_window_count": len(Transits),
+        "unsupported_window_count": sum(Item.get("state") == "unsupported_window" for Item in Transits),
+        "insufficient_coverage_count": sum(Item.get("state") == "insufficient_coverage" for Item in Transits),
+        "outside_observations_count": sum(Item.get("state") == "outside_observations" for Item in Transits),
+        "odd_event_count": len(OddDepths), "even_event_count": len(EvenDepths),
+        **Ephemeris,
     }
 
-    warnings = []
-    if not transits:
-        warnings.append({
+    #MARK: things worth checking
+    Warnings = []
+    if not Transits:
+        Warnings.append({
             "severity": "caution",
             "title": "No transit candidates",
             "detail": "Try lowering strictness or checking the input columns and flux units.",
         })
-    if 0 < len(transits) < 3:
-        warnings.append({
+    if 0 < len(Transits) < 3:
+        Warnings.append({
             "severity": "caution",
             "title": "Few observed transits",
             "detail": "A single event or pair of events is harder to separate from systematics.",
         })
-    if detection.get("period") is None:
-        warnings.append({
+    if Detection.get("period") is None:
+        Warnings.append({
             "severity": "caution",
             "title": "No stable period",
             "detail": "The app could not estimate a repeating orbital period.",
         })
-    if detection.get("period_method") and detection.get("period_method") != "BLS":
-        if detection.get("period_method") == "TLS":
-            warnings.append({
+    if Detection.get("period_method") and Detection.get("period_method") != "BLS":
+        if Detection.get("period_method") == "TLS":
+            Warnings.append({
                 "severity": "info",
                 "title": "Physical TLS search",
                 "detail": "The period was fitted with a limb-darkened transit template including ingress and egress.",
             })
-        elif detection.get("period_method") == "transit regularity":
-            warnings.append({
+        elif Detection.get("period_method") == "transit regularity":
+            Warnings.append({
                 "severity": "info",
                 "title": "Period selected by regularity",
                 "detail": "A shorter repeating transit-box cadence explained more detected events than the strongest BLS alias.",
             })
         else:
-            warnings.append({
+            Warnings.append({
                 "severity": "info",
                 "title": "Period is provisional",
-                "detail": f"Period came from {detection.get('period_method')}, not a BLS peak.",
+                "detail": f"Period came from {Detection.get('period_method')}, not a BLS peak.",
             })
-    p_value = detection.get("p_value")
-    if p_value is not None and math.isfinite(float(p_value)) and float(p_value) > 0.01:
-        warnings.append({
+    PValue = Detection.get("p_value")
+    if PValue is not None and Math.isfinite(float(PValue)) and float(PValue) > 0.01:
+        Warnings.append({
             "severity": "caution",
             "title": "Weak model significance",
             "detail": "The box model is not much better than a flat light curve by the current chi-squared estimate.",
         })
-    tls_fap = finite_number(detection.get("tls_fap"))
-    tls_sde = finite_number(detection.get("period_sde"))
-    if detection.get("period_method") == "TLS" and tls_sde is not None and tls_sde < 5:
-        warnings.append({
+    TlsFap = FiniteNumber(Detection.get("tls_fap"))
+    TlsSde = FiniteNumber(Detection.get("period_sde"))
+    if Detection.get("period_method") == "TLS" and TlsSde is not None and TlsSde < 5:
+        Warnings.append({
             "severity": "caution",
             "title": "TLS peak below candidate threshold",
-            "detail": f"TLS SDE is {tls_sde:.2f}; candidate review normally starts around SDE 5 and strong evidence around SDE 7.",
+            "detail": f"TLS SDE is {TlsSde:.2f}; candidate review normally starts around SDE 5 and strong evidence around SDE 7.",
         })
-    if detection.get("period_method") == "TLS" and tls_fap is not None and tls_fap > 0.01:
-        warnings.append({
+    if Detection.get("period_method") == "TLS" and TlsFap is not None and TlsFap > 0.01:
+        Warnings.append({
             "severity": "caution",
             "title": "Weak TLS false-alarm estimate",
-            "detail": f"TLS reports a white-noise false-alarm probability of about {tls_fap:.2%}; red noise can make this optimistic.",
+            "detail": f"TLS reports a white-noise false-alarm probability of about {TlsFap:.2%}; red noise can make this optimistic.",
         })
-    if detection_snr is not None and detection_snr < 7:
-        warnings.append({
+    if DetectionSnr is not None and DetectionSnr < 7:
+        Warnings.append({
             "severity": "caution",
-            "title": "Low search SNR" if detection.get("period_method") == "TLS" else "Low depth SNR",
+            "title": "Low search SNR" if Detection.get("period_method") == "TLS" else "Low depth SNR",
             "detail": (
-                f"TLS reports a combined transit SNR of {detection_snr:.2f}."
-                if detection.get("period_method") == "TLS"
-                else f"Median transit depth is about {detection_snr:.2f}x the robust noise."
+                f"TLS reports a combined transit SNR of {DetectionSnr:.2f}."
+                if Detection.get("period_method") == "TLS"
+                else f"Median transit depth is about {DetectionSnr:.2f}x the robust noise."
             ),
         })
-    if tls_odd_even_mismatch is not None and tls_odd_even_mismatch >= 5:
-        warnings.append({
+    if TlsOddEvenMismatch is not None and TlsOddEvenMismatch >= 5:
+        Warnings.append({
             "severity": "danger",
             "title": "TLS odd/even mismatch",
-            "detail": f"TLS measures an odd/even depth difference of {tls_odd_even_mismatch:.2f} sigma.",
+            "detail": f"TLS measures an odd/even depth difference of {TlsOddEvenMismatch:.2f} sigma.",
         })
-    if odd_even_depth_mismatch is not None and odd_even_depth_mismatch > 0.5 and len(odd_depths) >= 2 and len(even_depths) >= 2:
-        warnings.append({
+    if OddEvenDepthMismatch is not None and OddEvenDepthMismatch > 0.5 and len(OddDepths) >= 2 and len(EvenDepths) >= 2:
+        Warnings.append({
             "severity": "danger",
             "title": "Odd/even depth mismatch",
             "detail": "Alternating transit depths can indicate an eclipsing binary or blended source.",
         })
-    depth_uncertainties = finite_values([item.get("depth_uncertainty") for item in evidence_events])
-    inconsistent_three = (len(depths) >= 3 and len(depth_uncertainties) == len(depths)
-                          and max(depths) - min(depths) > 3 * math.hypot(max(depth_uncertainties), min(depth_uncertainties)))
-    if diagnostics["depth_scatter_ratio"] is not None and diagnostics["depth_scatter_ratio"] > 0.8 and (len(depths) >= 4 or inconsistent_three):
-        warnings.append({
+    DepthUncertainties = FiniteValues([Item.get("depth_uncertainty") for Item in EvidenceEvents])
+    InconsistentThree = (len(Depths) >= 3 and len(DepthUncertainties) == len(Depths)
+                          and max(Depths) - min(Depths) > 3 * Math.hypot(max(DepthUncertainties), min(DepthUncertainties)))
+    if Diagnostics["depth_scatter_ratio"] is not None and Diagnostics["depth_scatter_ratio"] > 0.8 and (len(Depths) >= 4 or InconsistentThree):
+        Warnings.append({
             "severity": "caution",
             "title": "Inconsistent transit depths",
             "detail": "Measured event depths disagree beyond their local uncertainty estimates. Review stellar variability, overlap, and systematics.",
         })
-    if has_window_states and len(evidence_events) < min(3, len(transits)):
-        warnings.append({"severity": "caution", "title": "Predicted windows lack local support",
-                         "detail": f"Only {len(evidence_events)} of {len(transits)} predicted windows have a positive local dip above 3-sigma with usable coverage."})
-    if len(odd_depths) < 2 or len(even_depths) < 2:
-        diagnostics["odd_even_comparison_state"] = "insufficient_events"
+    if HasWindowStates and len(EvidenceEvents) < min(3, len(Transits)):
+        Warnings.append({"severity": "caution", "title": "Predicted windows lack local support",
+                         "detail": f"Only {len(EvidenceEvents)} of {len(Transits)} predicted windows have a positive local dip above 3-sigma with usable coverage."})
+    if len(OddDepths) < 2 or len(EvenDepths) < 2:
+        Diagnostics["odd_even_comparison_state"] = "insufficient_events"
     else:
-        diagnostics["odd_even_comparison_state"] = "available"
-    duration_disagreement = finite_number(tls_details.get("duration_disagreement_fraction"))
-    if duration_disagreement is not None and duration_disagreement > 0.35:
-        warnings.append({"severity": "caution", "title": "Duration estimates disagree",
+        Diagnostics["odd_even_comparison_state"] = "available"
+    DurationDisagreement = FiniteNumber(TlsDetails.get("duration_disagreement_fraction"))
+    if DurationDisagreement is not None and DurationDisagreement > 0.35:
+        Warnings.append({"severity": "caution", "title": "Duration estimates disagree",
                          "detail": "Threshold-based width and physical template contacts differ by more than 35%; inspect the conditional fit and cadence."})
-    search_bounds = detection.get("period_search") or {}
-    selected_period = finite_number(detection.get("period"))
-    minimum = finite_number(search_bounds.get("min_period"))
-    maximum = finite_number(search_bounds.get("max_period"))
-    if selected_period is not None and minimum is not None and maximum is not None:
-        # A remote upper bound must not make an interior short-period peak
+    SearchBounds = Detection.get("period_search") or {}
+    SelectedPeriod = FiniteNumber(Detection.get("period"))
+    Minimum = FiniteNumber(SearchBounds.get("min_period"))
+    Maximum = FiniteNumber(SearchBounds.get("max_period"))
+    if SelectedPeriod is not None and Minimum is not None and Maximum is not None:
+        # a remote upper bound must not make an interior short-period peak
         # appear to lie on the lower edge of a very broad search.
-        period_uncertainty = finite_number(detection.get("period_uncertainty")) or 0.0
-        edge_margin = max(selected_period * 0.002, period_uncertainty * 3.0)
-        if min(abs(selected_period - minimum), abs(maximum - selected_period)) < edge_margin:
-            warnings.append({"severity": "caution", "title": "Period peak near search edge",
+        PeriodUncertainty = FiniteNumber(Detection.get("period_uncertainty")) or 0.0
+        EdgeMargin = max(SelectedPeriod * 0.002, PeriodUncertainty * 3.0)
+        if min(abs(SelectedPeriod - Minimum), abs(Maximum - SelectedPeriod)) < EdgeMargin:
+            Warnings.append({"severity": "caution", "title": "Period peak near search edge",
                              "detail": "The selected period is close to a search bound. Widen the bounds when baseline and minimum-transit constraints permit."})
-    strong_alternatives = [candidate for candidate in detection.get("period_candidates", [])
-                           if selected_period and finite_number(candidate.get("period"))
-                           and abs(candidate["period"] - selected_period) / selected_period > 0.02
-                           and finite_number(candidate.get("sde")) is not None
-                           and candidate["sde"] >= max(7.0, (finite_number(detection.get("period_sde")) or 0) * 0.85)]
-    if strong_alternatives:
-        diagnostics["strong_alias_periods"] = [candidate["period"] for candidate in strong_alternatives[:4]]
-        warnings.append({"severity": "caution", "title": "Strong alternative periods",
+    StrongAlternatives = [Candidate for Candidate in Detection.get("period_candidates", [])
+                           if SelectedPeriod and FiniteNumber(Candidate.get("period"))
+                           and abs(Candidate["period"] - SelectedPeriod) / SelectedPeriod > 0.02
+                           and FiniteNumber(Candidate.get("sde")) is not None
+                           and Candidate["sde"] >= max(7.0, (FiniteNumber(Detection.get("period_sde")) or 0) * 0.85)]
+    if StrongAlternatives:
+        Diagnostics["strong_alias_periods"] = [Candidate["period"] for Candidate in StrongAlternatives[:4]]
+        Warnings.append({"severity": "caution", "title": "Strong alternative periods",
                          "detail": "Other distinct period peaks have comparable strength. Inspect harmonics, aliases, and additional planets before choosing an ephemeris."})
     if (
-        len(transits) >= 3
-        and detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS")
-        and diagnostics["ephemeris_match_fraction"] is not None
+        len(Transits) >= 3
+        and Detection.get("period_method") in ("BLS", "binned BLS fallback", "transit regularity", "TLS")
+        and Diagnostics["ephemeris_match_fraction"] is not None
     ):
-        match_fraction = diagnostics["ephemeris_match_fraction"]
-        match_count = diagnostics["ephemeris_match_count"]
-        transit_count = len(transits)
-        event_count = diagnostics["ephemeris_event_match_count"]
-        expected_count = diagnostics["expected_transit_count"]
-        expected_coverage = diagnostics["expected_transit_coverage"]
-        well_covered_events = (
-            detection.get("period_method") in ("transit regularity", "TLS")
-            and event_count is not None
-            and event_count >= 3
+        MatchFraction = Diagnostics["ephemeris_match_fraction"]
+        MatchCount = Diagnostics["ephemeris_match_count"]
+        TransitCount = len(Transits)
+        EventCount = Diagnostics["ephemeris_event_match_count"]
+        ExpectedCount = Diagnostics["expected_transit_count"]
+        ExpectedCoverage = Diagnostics["expected_transit_coverage"]
+        WellCoveredEvents = (
+            Detection.get("period_method") in ("transit regularity", "TLS")
+            and EventCount is not None
+            and EventCount >= 3
             and (
                 (
-                    expected_coverage is not None
-                    and expected_coverage >= 0.65
+                    ExpectedCoverage is not None
+                    and ExpectedCoverage >= 0.65
                 )
-                or is_dense_regularity_match(
-                    match_count,
-                    event_count,
-                    expected_coverage,
-                    transit_count,
+                or IsDenseRegularityMatch(
+                    MatchCount,
+                    EventCount,
+                    ExpectedCoverage,
+                    TransitCount,
                 )
             )
         )
-        period_label = "BLS period" if detection.get("period_method") == "BLS" else "selected period"
-        if match_fraction < 0.55 and not well_covered_events:
-            warnings.append({
+        PeriodLabel = "BLS period" if Detection.get("period_method") == "BLS" else "selected period"
+        if MatchFraction < 0.55 and not WellCoveredEvents:
+            Warnings.append({
                 "severity": "danger",
                 "title": "Irregular transit timing",
-                "detail": f"Only {match_count} of {transit_count} detected dips align with the {period_label}.",
+                "detail": f"Only {MatchCount} of {TransitCount} detected dips align with the {PeriodLabel}.",
             })
-        elif match_fraction < 0.75 and not well_covered_events:
-            warnings.append({
+        elif MatchFraction < 0.75 and not WellCoveredEvents:
+            Warnings.append({
                 "severity": "caution",
                 "title": "Weak ephemeris agreement",
-                "detail": f"{match_count} of {transit_count} detected dips align with the {period_label}.",
+                "detail": f"{MatchCount} of {TransitCount} detected dips align with the {PeriodLabel}.",
             })
-        if well_covered_events and match_fraction < 0.65:
-            warnings.append({
+        if WellCoveredEvents and MatchFraction < 0.65:
+            Warnings.append({
                 "severity": "caution",
                 "title": "Noisy extra dips",
-                "detail": f"{int(event_count)} of {int(expected_count)} predicted events are covered, but extra off-period dips were also boxed.",
+                "detail": f"{int(EventCount)} of {int(ExpectedCount)} predicted events are covered, but extra off-period dips were also boxed.",
             })
 
-        off_count = diagnostics["off_ephemeris_transit_count"]
-        off_fraction = diagnostics["off_ephemeris_fraction"]
-        if off_count is not None and off_fraction is not None and off_count >= 3 and off_fraction >= 0.35:
-            if not well_covered_events:
-                warnings.append({
+        OffCount = Diagnostics["off_ephemeris_transit_count"]
+        OffFraction = Diagnostics["off_ephemeris_fraction"]
+        if OffCount is not None and OffFraction is not None and OffCount >= 3 and OffFraction >= 0.35:
+            if not WellCoveredEvents:
+                Warnings.append({
                     "severity": "caution",
                     "title": "Many off-period dips",
                     "detail": "Several detected dips do not land near the recovered period and may be systematics.",
                 })
-    if diagnostics["max_radius_ratio"] is not None and diagnostics["max_radius_ratio"] > 0.2:
-        warnings.append({
+    if Diagnostics["max_radius_ratio"] is not None and Diagnostics["max_radius_ratio"] > 0.2:
+        Warnings.append({
             "severity": "caution",
             "title": "Large radius ratio",
             "detail": "Rp/Rs above 0.2 is large for many planet candidates and deserves closer inspection.",
         })
-    if diagnostics["median_transit_points"] is not None and diagnostics["median_transit_points"] < 4:
-        warnings.append({
+    if Diagnostics["median_transit_points"] is not None and Diagnostics["median_transit_points"] < 4:
+        Warnings.append({
             "severity": "info",
             "title": "Sparse transit sampling",
             "detail": "Some events have very few points inside the detected box.",
         })
 
-    return diagnostics, warnings
+    return Diagnostics, Warnings
 
 
-def score_band(value, bands):
-    if value is None:
+#MARK: transit checks
+def ScoreBand(Value, Bands):
+    if Value is None:
         return None
-    for threshold, points, label, detail in bands:
-        if value >= threshold:
-            return points, label, detail
+    for Threshold, Points, Label, Detail in Bands:
+        if Value >= Threshold:
+            return Points, Label, Detail
     return None
 
 
-def build_planet_assessment(transits, detection, diagnostics, warnings):
-    local_event_count = int(diagnostics.get("supported_event_count", len(transits)))
-    combined_support = bool(diagnostics.get("combined_signal_supported"))
-    transit_count = max(local_event_count, int(diagnostics.get("positive_window_count", 0)) if combined_support else 0)
-    period = finite_number(detection.get("period"))
-    period_method = detection.get("period_method")
-    period_sde = finite_number(detection.get("period_sde"))
-    detection_snr = finite_number(diagnostics.get("detection_snr"))
-    tls_fap = finite_number(detection.get("tls_fap"))
-    p_value = finite_number(detection.get("p_value"))
-    depth_scatter_ratio = finite_number(diagnostics.get("depth_scatter_ratio"))
-    odd_even_mismatch = finite_number(diagnostics.get("odd_even_depth_mismatch"))
-    max_radius_ratio = finite_number(diagnostics.get("max_radius_ratio"))
-    median_transit_points = finite_number(diagnostics.get("median_transit_points"))
-    ephemeris_match_fraction = finite_number(diagnostics.get("ephemeris_match_fraction"))
-    ephemeris_match_count = finite_number(diagnostics.get("ephemeris_match_count"))
-    ephemeris_event_match_count = finite_number(diagnostics.get("ephemeris_event_match_count"))
-    off_ephemeris_count = finite_number(diagnostics.get("off_ephemeris_transit_count"))
-    off_ephemeris_fraction = finite_number(diagnostics.get("off_ephemeris_fraction"))
-    expected_transit_count = finite_number(diagnostics.get("expected_transit_count"))
-    expected_transit_coverage = finite_number(diagnostics.get("expected_transit_coverage"))
-    timing_residual_ratio = finite_number(diagnostics.get("timing_residual_ratio"))
-    ephemeris_period_methods = ("BLS", "binned BLS fallback", "transit regularity", "TLS")
-    period_label = "BLS period" if period_method == "BLS" else "selected period"
-    well_covered_ephemeris = (
-        period_method in ("transit regularity", "TLS")
-        and ephemeris_event_match_count is not None
-        and ephemeris_event_match_count >= 3
+#MARK: build planet assessment
+def BuildPlanetAssessment(Transits, Detection, Diagnostics, Warnings):
+    LocalEventCount = int(Diagnostics.get("supported_event_count", len(Transits)))
+    CombinedSupport = bool(Diagnostics.get("combined_signal_supported"))
+    TransitCount = max(LocalEventCount, int(Diagnostics.get("positive_window_count", 0)) if CombinedSupport else 0)
+    Period = FiniteNumber(Detection.get("period"))
+    PeriodMethod = Detection.get("period_method")
+    PeriodSde = FiniteNumber(Detection.get("period_sde"))
+    DetectionSnr = FiniteNumber(Diagnostics.get("detection_snr"))
+    TlsFap = FiniteNumber(Detection.get("tls_fap"))
+    PValue = FiniteNumber(Detection.get("p_value"))
+    DepthScatterRatio = FiniteNumber(Diagnostics.get("depth_scatter_ratio"))
+    OddEvenMismatch = FiniteNumber(Diagnostics.get("odd_even_depth_mismatch"))
+    MaxRadiusRatio = FiniteNumber(Diagnostics.get("max_radius_ratio"))
+    MedianTransitPoints = FiniteNumber(Diagnostics.get("median_transit_points"))
+    EphemerisMatchFraction = FiniteNumber(Diagnostics.get("ephemeris_match_fraction"))
+    EphemerisMatchCount = FiniteNumber(Diagnostics.get("ephemeris_match_count"))
+    EphemerisEventMatchCount = FiniteNumber(Diagnostics.get("ephemeris_event_match_count"))
+    OffEphemerisCount = FiniteNumber(Diagnostics.get("off_ephemeris_transit_count"))
+    OffEphemerisFraction = FiniteNumber(Diagnostics.get("off_ephemeris_fraction"))
+    ExpectedTransitCount = FiniteNumber(Diagnostics.get("expected_transit_count"))
+    ExpectedTransitCoverage = FiniteNumber(Diagnostics.get("expected_transit_coverage"))
+    TimingResidualRatio = FiniteNumber(Diagnostics.get("timing_residual_ratio"))
+    EphemerisPeriodMethods = ("BLS", "binned BLS fallback", "transit regularity", "TLS")
+    PeriodLabel = "BLS period" if PeriodMethod == "BLS" else "selected period"
+    WellCoveredEphemeris = (
+        PeriodMethod in ("transit regularity", "TLS")
+        and EphemerisEventMatchCount is not None
+        and EphemerisEventMatchCount >= 3
         and (
             (
-                expected_transit_coverage is not None
-                and expected_transit_coverage >= 0.65
+                ExpectedTransitCoverage is not None
+                and ExpectedTransitCoverage >= 0.65
             )
-            or is_dense_regularity_match(
-                ephemeris_match_count,
-                ephemeris_event_match_count,
-                expected_transit_coverage,
-                transit_count,
+            or IsDenseRegularityMatch(
+                EphemerisMatchCount,
+                EphemerisEventMatchCount,
+                ExpectedTransitCoverage,
+                TransitCount,
             )
         )
     )
 
-    score = 0.0
-    supporting_evidence = []
-    limiting_evidence = []
+    #MARK: transit checks
+    Score = 0.0
+    SupportingEvidence = []
+    LimitingEvidence = []
 
-    def support(title, detail, points):
-        nonlocal score
-        score += points
-        supporting_evidence.append({
-            "title": title,
-            "detail": detail,
-            "points": points,
+    def Support(Title, Detail, Points):
+        nonlocal Score
+        Score += Points
+        SupportingEvidence.append({
+            "title": Title,
+            "detail": Detail,
+            "points": Points,
         })
 
-    def limit(title, detail, points):
-        nonlocal score
-        score += points
-        limiting_evidence.append({
-            "title": title,
-            "detail": detail,
-            "points": points,
+    def Limit(Title, Detail, Points):
+        nonlocal Score
+        Score += Points
+        LimitingEvidence.append({
+            "title": Title,
+            "detail": Detail,
+            "points": Points,
         })
 
-    if combined_support and local_event_count < 3:
-        support("Coherent combined transit signal", f"{transit_count} windows have positive signed depth; combined local SNR is {diagnostics['combined_depth_snr']:.2f}. Individual windows remain tentative unless independently supported.", 20)
-    elif transit_count >= 3:
-        support("Repeated locally supported dips", f"{transit_count} windows contain positive measured dips with usable coverage.", 20)
-    elif transit_count > 0:
-        support("Locally supported dip", f"{transit_count} window{'s have' if transit_count != 1 else ' has'} local transit-like support.", 6)
-        limit("Too few events", "Fewer than three events is weak evidence for an orbital period.", -8)
+    if CombinedSupport and LocalEventCount < 3:
+        Support("Coherent combined transit signal", f"{TransitCount} windows have positive signed depth; combined local SNR is {Diagnostics['combined_depth_snr']:.2f}. Individual windows remain tentative unless independently supported.", 20)
+    elif TransitCount >= 3:
+        Support("Repeated locally supported dips", f"{TransitCount} windows contain positive measured dips with usable coverage.", 20)
+    elif TransitCount > 0:
+        Support("Locally supported dip", f"{TransitCount} window{'s have' if TransitCount != 1 else ' has'} local transit-like support.", 6)
+        Limit("Too few events", "Fewer than three events is weak evidence for an orbital period.", -8)
     else:
-        limit("No boxed transit events", "The detector did not find statistically strong local dips.", -28)
+        Limit("No boxed transit events", "The detector did not find statistically strong local dips.", -28)
 
-    if period is not None and period > 0 and period_method == "BLS":
-        support("Stable BLS period", f"Best period is {period:.6g} days from the BLS search.", 22)
-    elif period is not None and period > 0 and period_method == "TLS":
-        support("Physical TLS period", f"Best period is {period:.6g} days from the limb-darkened TLS search.", 22)
-    elif period is not None and period > 0 and period_method == "transit regularity":
-        support("Frequent transit regularity", f"Best repeating interval is {period:.6g} days from the boxed transit cadence.", 20)
-    elif period is not None and period > 0:
-        support("Provisional period", f"Estimated period is {period:.6g} days from {period_method or 'candidate spacing'}.", 10)
-        limit("Period is not a BLS peak", "The repeating period needs manual confirmation.", -4)
+    if Period is not None and Period > 0 and PeriodMethod == "BLS":
+        Support("Stable BLS period", f"Best period is {Period:.6g} days from the BLS search.", 22)
+    elif Period is not None and Period > 0 and PeriodMethod == "TLS":
+        Support("Physical TLS period", f"Best period is {Period:.6g} days from the limb-darkened TLS search.", 22)
+    elif Period is not None and Period > 0 and PeriodMethod == "transit regularity":
+        Support("Frequent transit regularity", f"Best repeating interval is {Period:.6g} days from the boxed transit cadence.", 20)
+    elif Period is not None and Period > 0:
+        Support("Provisional period", f"Estimated period is {Period:.6g} days from {PeriodMethod or 'candidate spacing'}.", 10)
+        Limit("Period is not a BLS peak", "The repeating period needs manual confirmation.", -4)
     else:
-        limit("No stable period", "A repeating orbital period was not recovered.", -18)
+        Limit("No stable period", "A repeating orbital period was not recovered.", -18)
 
-    sde_label = "TLS SDE" if period_method == "TLS" else "Period SDE"
-    sde_result = score_band(period_sde, (
-        (10.0, 22, "Very strong period peak", f"{sde_label} is {format_metric(period_sde)}."),
-        (7.0, 17, "Strong period peak", f"{sde_label} is {format_metric(period_sde)}."),
-        (5.0, 8, "Moderate period peak", f"{sde_label} is {format_metric(period_sde)}."),
+    SdeLabel = "TLS SDE" if PeriodMethod == "TLS" else "Period SDE"
+    SdeResult = ScoreBand(PeriodSde, (
+        (10.0, 22, "Very strong period peak", f"{SdeLabel} is {FormatMetric(PeriodSde)}."),
+        (7.0, 17, "Strong period peak", f"{SdeLabel} is {FormatMetric(PeriodSde)}."),
+        (5.0, 8, "Moderate period peak", f"{SdeLabel} is {FormatMetric(PeriodSde)}."),
     ))
-    if sde_result is not None:
-        points, title, detail = sde_result
-        support(title, detail, points)
-    elif period_sde is not None:
-        limit("Weak period peak", f"{sde_label} is only {period_sde:.2f}.", -10)
+    if SdeResult is not None:
+        Points, Title, Detail = SdeResult
+        Support(Title, Detail, Points)
+    elif PeriodSde is not None:
+        Limit("Weak period peak", f"{SdeLabel} is only {PeriodSde:.2f}.", -10)
 
-    snr_title = "TLS signal SNR" if period_method == "TLS" else "transit depth SNR"
-    snr_result = score_band(detection_snr, (
-        (10.0, 22, f"High {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
-        (7.0, 16, f"Good {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
-        (5.0, 8, f"Marginal {snr_title}", f"Search SNR is {format_metric(detection_snr)}."),
+    SnrTitle = "TLS signal SNR" if PeriodMethod == "TLS" else "transit depth SNR"
+    SnrResult = ScoreBand(DetectionSnr, (
+        (10.0, 22, f"High {SnrTitle}", f"Search SNR is {FormatMetric(DetectionSnr)}."),
+        (7.0, 16, f"Good {SnrTitle}", f"Search SNR is {FormatMetric(DetectionSnr)}."),
+        (5.0, 8, f"Marginal {SnrTitle}", f"Search SNR is {FormatMetric(DetectionSnr)}."),
     ))
-    if snr_result is not None:
-        points, title, detail = snr_result
-        support(title, detail, points)
-    elif detection_snr is not None:
-        limit(f"Low {snr_title}", f"Search SNR is only {detection_snr:.2f}.", -14)
+    if SnrResult is not None:
+        Points, Title, Detail = SnrResult
+        Support(Title, Detail, Points)
+    elif DetectionSnr is not None:
+        Limit(f"Low {SnrTitle}", f"Search SNR is only {DetectionSnr:.2f}.", -14)
 
-    if period_method == "TLS" and tls_fap is not None:
-        if tls_fap <= 0.001:
-            support("Low TLS false-alarm probability", f"White-noise FAP is {tls_fap:.3%}.", 10)
-        elif tls_fap <= 0.01:
-            support("Useful TLS false-alarm estimate", f"White-noise FAP is {tls_fap:.2%}.", 6)
+    if PeriodMethod == "TLS" and TlsFap is not None:
+        if TlsFap <= 0.001:
+            Support("Low TLS false-alarm probability", f"White-noise FAP is {TlsFap:.3%}.", 10)
+        elif TlsFap <= 0.01:
+            Support("Useful TLS false-alarm estimate", f"White-noise FAP is {TlsFap:.2%}.", 6)
         else:
-            limit("Weak TLS false-alarm estimate", f"White-noise FAP is {tls_fap:.2%}.", -10)
+            Limit("Weak TLS false-alarm estimate", f"White-noise FAP is {TlsFap:.2%}.", -10)
 
-    if p_value is not None:
-        if p_value <= 1e-6:
-            support("Very significant box model", "The transit model strongly beats a flat light curve.", 16)
-        elif p_value <= 1e-4:
-            support("Significant box model", "The transit model clearly beats a flat light curve.", 12)
-        elif p_value <= 0.01:
-            support("Useful box-model improvement", "The transit model improves over a flat light curve.", 8)
+    if PValue is not None:
+        if PValue <= 1e-6:
+            Support("Very significant box model", "The transit model strongly beats a flat light curve.", 16)
+        elif PValue <= 1e-4:
+            Support("Significant box model", "The transit model clearly beats a flat light curve.", 12)
+        elif PValue <= 0.01:
+            Support("Useful box-model improvement", "The transit model improves over a flat light curve.", 8)
         else:
-            limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
+            Limit("Weak box-model significance", "The transit model is not much better than a flat light curve.", -12)
 
-    # TLS windows are selected with an ephemeris, so their local centroids are
-    # conditional evidence. Report timing descriptively but award no circular
-    # timing bonus. Non-TLS dip searches can retain independent timing credit.
-    if period_method != "TLS" and period_method in ephemeris_period_methods and transit_count >= 3 and ephemeris_match_fraction is not None:
-        if ephemeris_match_fraction >= 0.8:
-            support("Detected dips follow the ephemeris", f"{int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", 16)
-        elif well_covered_ephemeris:
-            support(
+    # tls windows are selected with an ephemeris, so their local centroids are
+    # conditional evidence. report timing descriptively but award no circular
+    # timing bonus. non-tls dip searches can retain independent timing credit.
+    if PeriodMethod != "TLS" and PeriodMethod in EphemerisPeriodMethods and TransitCount >= 3 and EphemerisMatchFraction is not None:
+        if EphemerisMatchFraction >= 0.8:
+            Support("Detected dips follow the ephemeris", f"{int(EphemerisMatchCount)} of {TransitCount} dips align with the {PeriodLabel}.", 16)
+        elif WellCoveredEphemeris:
+            Support(
                 "Predicted events are covered",
-                f"{int(ephemeris_event_match_count)} of {int(expected_transit_count)} predicted events have matching dips.",
+                f"{int(EphemerisEventMatchCount)} of {int(ExpectedTransitCount)} predicted events have matching dips.",
                 12,
             )
-        elif ephemeris_match_fraction >= 0.65:
-            support("Partial ephemeris agreement", f"{int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", 5)
-            limit("Some off-period dips", "Several detected dips do not belong to the recovered period.", -6)
-        elif ephemeris_match_fraction < 0.55:
-            limit("Irregular transit timing", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", -34)
+        elif EphemerisMatchFraction >= 0.65:
+            Support("Partial ephemeris agreement", f"{int(EphemerisMatchCount)} of {TransitCount} dips align with the {PeriodLabel}.", 5)
+            Limit("Some off-period dips", "Several detected dips do not belong to the recovered period.", -6)
+        elif EphemerisMatchFraction < 0.55:
+            Limit("Irregular transit timing", f"Only {int(EphemerisMatchCount)} of {TransitCount} dips align with the {PeriodLabel}.", -34)
         else:
-            limit("Weak timing agreement", f"Only {int(ephemeris_match_count)} of {transit_count} dips align with the {period_label}.", -18)
+            Limit("Weak timing agreement", f"Only {int(EphemerisMatchCount)} of {TransitCount} dips align with the {PeriodLabel}.", -18)
 
     if (
-        off_ephemeris_count is not None
-        and off_ephemeris_fraction is not None
-        and off_ephemeris_count >= 3
-        and off_ephemeris_fraction >= 0.35
+        OffEphemerisCount is not None
+        and OffEphemerisFraction is not None
+        and OffEphemerisCount >= 3
+        and OffEphemerisFraction >= 0.35
     ):
-        if well_covered_ephemeris:
-            limit("Extra off-period dips", "The selected ephemeris repeats, but extra boxed dips may be noise or systematics.", -6)
+        if WellCoveredEphemeris:
+            Limit("Extra off-period dips", "The selected ephemeris repeats, but extra boxed dips may be noise or systematics.", -6)
         else:
-            limit("Many off-period dips", "The detector found too many transit-like dips away from the recovered ephemeris.", -24)
+            Limit("Many off-period dips", "The detector found too many transit-like dips away from the recovered ephemeris.", -24)
 
-    if expected_transit_coverage is not None and transit_count >= 3 and expected_transit_coverage < 0.5:
-        limit("Weak predicted-transit coverage", f"Only {expected_transit_coverage:.0%} of expected {period_label} events were matched.", -10)
+    if ExpectedTransitCoverage is not None and TransitCount >= 3 and ExpectedTransitCoverage < 0.5:
+        Limit("Weak predicted-transit coverage", f"Only {ExpectedTransitCoverage:.0%} of expected {PeriodLabel} events were matched.", -10)
 
-    if timing_residual_ratio is not None and timing_residual_ratio > 1.0 and transit_count >= 3 and not well_covered_ephemeris:
-        limit("Large timing residuals", "Detected dip centers are not tightly clustered around the recovered ephemeris.", -10)
+    if TimingResidualRatio is not None and TimingResidualRatio > 1.0 and TransitCount >= 3 and not WellCoveredEphemeris:
+        Limit("Large timing residuals", "Detected dip centers are not tightly clustered around the recovered ephemeris.", -10)
 
-    if depth_scatter_ratio is not None and transit_count >= 3:
-        if depth_scatter_ratio <= 0.35:
-            support("Consistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", 7)
-        elif depth_scatter_ratio > 0.8:
-            limit("Inconsistent transit depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", -12)
-        elif depth_scatter_ratio > 0.5:
-            limit("Moderately inconsistent depths", f"Depth scatter ratio is {depth_scatter_ratio:.2f}.", -6)
+    if DepthScatterRatio is not None and TransitCount >= 3:
+        if DepthScatterRatio <= 0.35:
+            Support("Consistent transit depths", f"Depth scatter ratio is {DepthScatterRatio:.2f}.", 7)
+        elif DepthScatterRatio > 0.8:
+            Limit("Inconsistent transit depths", f"Depth scatter ratio is {DepthScatterRatio:.2f}.", -12)
+        elif DepthScatterRatio > 0.5:
+            Limit("Moderately inconsistent depths", f"Depth scatter ratio is {DepthScatterRatio:.2f}.", -6)
 
-    if odd_even_mismatch is not None and diagnostics.get("odd_even_comparison_state", "available") == "available" and transit_count >= 4:
-        if odd_even_mismatch <= 0.25:
-            support("Odd/even depths agree", f"Odd/even mismatch is {odd_even_mismatch:.2f}.", 6)
-        elif odd_even_mismatch > 0.5:
-            limit("Odd/even depth mismatch", "Alternating depths can indicate an eclipsing binary or blend.", -18)
-        elif odd_even_mismatch > 0.35:
-            limit("Possible odd/even mismatch", f"Odd/even mismatch is {odd_even_mismatch:.2f}.", -8)
+    if OddEvenMismatch is not None and Diagnostics.get("odd_even_comparison_state", "available") == "available" and TransitCount >= 4:
+        if OddEvenMismatch <= 0.25:
+            Support("Odd/even depths agree", f"Odd/even mismatch is {OddEvenMismatch:.2f}.", 6)
+        elif OddEvenMismatch > 0.5:
+            Limit("Odd/even depth mismatch", "Alternating depths can indicate an eclipsing binary or blend.", -18)
+        elif OddEvenMismatch > 0.35:
+            Limit("Possible odd/even mismatch", f"Odd/even mismatch is {OddEvenMismatch:.2f}.", -8)
 
-    if max_radius_ratio is not None:
-        if max_radius_ratio <= 0.2:
-            support("Planet-sized radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", 4)
-        elif max_radius_ratio > 0.3:
-            limit("Very large radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", -16)
+    if MaxRadiusRatio is not None:
+        if MaxRadiusRatio <= 0.2:
+            Support("Planet-sized radius ratio", f"Maximum Rp/Rs estimate is {MaxRadiusRatio:.3f}.", 4)
+        elif MaxRadiusRatio > 0.3:
+            Limit("Very large radius ratio", f"Maximum Rp/Rs estimate is {MaxRadiusRatio:.3f}.", -16)
         else:
-            limit("Large radius ratio", f"Maximum Rp/Rs estimate is {max_radius_ratio:.3f}.", -8)
+            Limit("Large radius ratio", f"Maximum Rp/Rs estimate is {MaxRadiusRatio:.3f}.", -8)
 
-    if median_transit_points is not None:
-        if median_transit_points >= 8:
-            support("Well-sampled events", f"Median supported event has {median_transit_points:.0f} analysis samples.", 4)
-        elif median_transit_points < 4:
-            limit("Sparse transit sampling", f"Median supported event has only {median_transit_points:.0f} analysis samples.", -6)
+    if MedianTransitPoints is not None:
+        if MedianTransitPoints >= 8:
+            Support("Well-sampled events", f"Median supported event has {MedianTransitPoints:.0f} analysis samples.", 4)
+        elif MedianTransitPoints < 4:
+            Limit("Sparse transit sampling", f"Median supported event has only {MedianTransitPoints:.0f} analysis samples.", -6)
 
-    danger_count = sum(1 for warning in warnings if warning.get("severity") == "danger")
-    caution_count = sum(1 for warning in warnings if warning.get("severity") == "caution")
-    if danger_count:
-        score -= danger_count * 10
-    if caution_count >= 3:
-        score -= 6
+    DangerCount = sum(1 for Warning in Warnings if Warning.get("severity") == "danger")
+    CautionCount = sum(1 for Warning in Warnings if Warning.get("severity") == "caution")
+    if DangerCount:
+        Score -= DangerCount * 10
+    if CautionCount >= 3:
+        Score -= 6
 
-    raw_candidate_score = int(round(clamp(score, 0, 100)))
-    required_period_sde = 7 if period_method == "TLS" else 5
-    high_repeat_confidence = (
-        transit_count >= 5
-        and detection_snr is not None
-        and detection_snr >= 5
-        and period_sde is not None
-        and period_sde >= (7 if period_method == "TLS" else 8)
-        and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.85)
-        and (expected_transit_coverage is None or expected_transit_coverage >= 0.65)
-        and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.2)
+    #MARK: transit checks
+    RawCandidateScore = int(round(Clamp(Score, 0, 100)))
+    RequiredPeriodSde = 7 if PeriodMethod == "TLS" else 5
+    HighRepeatConfidence = (
+        TransitCount >= 5
+        and DetectionSnr is not None
+        and DetectionSnr >= 5
+        and PeriodSde is not None
+        and PeriodSde >= (7 if PeriodMethod == "TLS" else 8)
+        and (EphemerisMatchFraction is None or EphemerisMatchFraction >= 0.85)
+        and (ExpectedTransitCoverage is None or ExpectedTransitCoverage >= 0.65)
+        and (OffEphemerisFraction is None or OffEphemerisFraction <= 0.2)
     )
-    strong_requirements_met = (
-        transit_count >= 3
-        and period is not None
-        and period_method in ("BLS", "TLS")
-        and detection_snr is not None
-        and (detection_snr >= 7 or high_repeat_confidence)
-        and (period_sde is None or period_sde >= required_period_sde)
-        and (period_method != "TLS" or tls_fap is None or tls_fap <= 0.01)
-        and (ephemeris_match_fraction is None or ephemeris_match_fraction >= 0.75)
-        and (off_ephemeris_fraction is None or off_ephemeris_fraction <= 0.3)
-        and danger_count == 0
+    StrongRequirementsMet = (
+        TransitCount >= 3
+        and Period is not None
+        and PeriodMethod in ("BLS", "TLS")
+        and DetectionSnr is not None
+        and (DetectionSnr >= 7 or HighRepeatConfidence)
+        and (PeriodSde is None or PeriodSde >= RequiredPeriodSde)
+        and (PeriodMethod != "TLS" or TlsFap is None or TlsFap <= 0.01)
+        and (EphemerisMatchFraction is None or EphemerisMatchFraction >= 0.75)
+        and (OffEphemerisFraction is None or OffEphemerisFraction <= 0.3)
+        and DangerCount == 0
     )
-    severe_timing_mismatch = (
-        transit_count >= 3
-        and period_method in ephemeris_period_methods
-        and ephemeris_match_fraction is not None
-        and ephemeris_match_fraction < 0.55
-        and not well_covered_ephemeris
-        and off_ephemeris_count is not None
-        and off_ephemeris_count >= 2
+    SevereTimingMismatch = (
+        TransitCount >= 3
+        and PeriodMethod in EphemerisPeriodMethods
+        and EphemerisMatchFraction is not None
+        and EphemerisMatchFraction < 0.55
+        and not WellCoveredEphemeris
+        and OffEphemerisCount is not None
+        and OffEphemerisCount >= 2
     )
-    credible_tls_signal = (
-        period_method != "TLS"
+    CredibleTlsSignal = (
+        PeriodMethod != "TLS"
         or (
-            period_sde is not None
-            and period_sde >= 5
-            and detection_snr is not None
-            and detection_snr >= 5
+            PeriodSde is not None
+            and PeriodSde >= 5
+            and DetectionSnr is not None
+            and DetectionSnr >= 5
         )
     )
 
-    if transit_count == 0:
-        has_unboxed_period_signal = (
-            raw_candidate_score >= 35
-            and period_sde is not None
-            and period_sde >= 7
-            and (p_value is None or p_value <= 0.01)
+    if TransitCount == 0:
+        HasUnboxedPeriodSignal = (
+            RawCandidateScore >= 35
+            and PeriodSde is not None
+            and PeriodSde >= 7
+            and (PValue is None or PValue <= 0.01)
         )
-        if has_unboxed_period_signal:
-            status = "inconclusive"
-            title = "Period signal needs review"
-            short_label = "Inconclusive"
-            summary = (
+        if HasUnboxedPeriodSignal:
+            Status = "inconclusive"
+            Title = "Period signal needs review"
+            ShortLabel = "Inconclusive"
+            Summary = (
                 "The period search found some signal, but the local detector did not box credible transit events. "
                 "This needs manual review before calling it an exoplanet candidate."
             )
-            recommendation = "Inspect the phase-folded view and try adjusted duration/strictness bounds."
+            Recommendation = "Inspect the phase-folded view and try adjusted duration/strictness bounds."
         else:
-            status = "no_planet_like_signal"
-            title = "No planet-like transit detected"
-            short_label = "No credible signal"
-            summary = (
+            Status = "no_planet_like_signal"
+            Title = "No planet-like transit detected"
+            ShortLabel = "No credible signal"
+            Summary = (
                 "No statistically credible repeating transit signal was found. "
                 "This dataset may not contain a detectable transiting exoplanet at the current settings."
             )
-            recommendation = "Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve."
-    elif severe_timing_mismatch:
-        status = "no_planet_like_signal"
-        title = "Transit-like dips are not periodic"
-        short_label = "No credible signal"
-        summary = (
+            Recommendation = "Check the input columns, try lower strictness, or analyze a longer/higher-SNR light curve."
+    elif SevereTimingMismatch:
+        Status = "no_planet_like_signal"
+        Title = "Transit-like dips are not periodic"
+        ShortLabel = "No credible signal"
+        Summary = (
             "The detector found dip-shaped events, but most do not align with one repeating orbital schedule. "
             "That pattern is more consistent with irregular variability or systematics than a single transiting exoplanet."
         )
-        recommendation = "Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate."
-    elif raw_candidate_score >= 75 and strong_requirements_met:
-        status = "strong_candidate"
-        title = "Strong planet-like transit candidate"
-        short_label = "Strong candidate"
-        summary = (
+        Recommendation = "Inspect the off-period dips and try stricter duration/depth bounds before treating this as a candidate."
+    elif RawCandidateScore >= 75 and StrongRequirementsMet:
+        Status = "strong_candidate"
+        Title = "Strong planet-like transit candidate"
+        ShortLabel = "Strong candidate"
+        Summary = (
             "Repeated dips align with a stable period and pass the current signal-strength checks. "
             "This is a strong candidate, not a confirmed planet."
         )
-        recommendation = "Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed."
-    elif raw_candidate_score >= 45 and transit_count >= 2 and credible_tls_signal:
-        status = "possible_candidate"
-        title = "Possible transit candidate"
-        short_label = "Possible candidate"
-        summary = (
+        Recommendation = "Use the phase-folded view, exports, and follow-up vetting before treating this as confirmed."
+    elif RawCandidateScore >= 45 and TransitCount >= 2 and CredibleTlsSignal:
+        Status = "possible_candidate"
+        Title = "Possible transit candidate"
+        ShortLabel = "Possible candidate"
+        Summary = (
             "The dataset contains some planet-like transit evidence, but one or more checks are not strong enough "
             "for a confident candidate call."
         )
-        recommendation = "Review warnings, period aliases, and the phase-folded view."
+        Recommendation = "Review warnings, period aliases, and the phase-folded view."
     else:
-        status = "no_planet_like_signal"
-        title = "No credible planet-like signal"
-        short_label = "No credible signal"
-        summary = (
+        Status = "no_planet_like_signal"
+        Title = "No credible planet-like signal"
+        ShortLabel = "No credible signal"
+        Summary = (
             "Detected dips do not currently pass enough planet-likeness checks. "
             "This dataset may not contain a detectable transiting exoplanet."
         )
-        recommendation = "Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious."
+        Recommendation = "Inspect warnings and rerun with adjusted detection bounds if the light curve looks suspicious."
 
-    candidate_score = raw_candidate_score
-    if status == "possible_candidate":
-        candidate_score = min(candidate_score, 74)
-    elif status == "inconclusive":
-        candidate_score = min(candidate_score, 59)
-    elif status == "no_planet_like_signal":
-        candidate_score = min(candidate_score, 44)
+    CandidateScore = RawCandidateScore
+    if Status == "possible_candidate":
+        CandidateScore = min(CandidateScore, 74)
+    elif Status == "inconclusive":
+        CandidateScore = min(CandidateScore, 59)
+    elif Status == "no_planet_like_signal":
+        CandidateScore = min(CandidateScore, 44)
 
     return {
         "assessment_version": 2,
         "score_label": "Candidate score",
         "score_is_probability": False,
-        "status": status,
-        "title": title,
-        "short_label": short_label,
-        "candidate_score": candidate_score,
-        "summary": summary,
-        "recommendation": recommendation,
-        "supporting_evidence": supporting_evidence,
-        "limiting_evidence": limiting_evidence,
+        "status": Status,
+        "title": Title,
+        "short_label": ShortLabel,
+        "candidate_score": CandidateScore,
+        "summary": Summary,
+        "recommendation": Recommendation,
+        "supporting_evidence": SupportingEvidence,
+        "limiting_evidence": LimitingEvidence,
         "inputs": {
-            "transit_count": transit_count,
-            "locally_supported_event_count": local_event_count,
-            "evidence_basis": "combined periodic signal" if combined_support and local_event_count < 3 else "locally supported events",
-            "predicted_window_count": len(transits),
-            "period": period,
-            "period_method": period_method,
-            "period_sde": period_sde,
-            "detection_snr": detection_snr,
-            "tls_fap": tls_fap,
-            "p_value": p_value,
-            "depth_scatter_ratio": depth_scatter_ratio,
-            "odd_even_depth_mismatch": odd_even_mismatch,
-            "max_radius_ratio": max_radius_ratio,
-            "median_transit_points": median_transit_points,
-            "ephemeris_match_fraction": ephemeris_match_fraction,
-            "ephemeris_match_count": ephemeris_match_count,
-            "ephemeris_event_match_count": ephemeris_event_match_count,
-            "off_ephemeris_transit_count": off_ephemeris_count,
-            "off_ephemeris_fraction": off_ephemeris_fraction,
-            "expected_transit_count": expected_transit_count,
-            "expected_transit_coverage": expected_transit_coverage,
-            "timing_residual_ratio": timing_residual_ratio,
-            "warning_count": len(warnings),
-            "danger_warning_count": danger_count,
-            "caution_warning_count": caution_count,
+            "transit_count": TransitCount,
+            "locally_supported_event_count": LocalEventCount,
+            "evidence_basis": "combined periodic signal" if CombinedSupport and LocalEventCount < 3 else "locally supported events",
+            "predicted_window_count": len(Transits),
+            "period": Period,
+            "period_method": PeriodMethod,
+            "period_sde": PeriodSde,
+            "detection_snr": DetectionSnr,
+            "tls_fap": TlsFap,
+            "p_value": PValue,
+            "depth_scatter_ratio": DepthScatterRatio,
+            "odd_even_depth_mismatch": OddEvenMismatch,
+            "max_radius_ratio": MaxRadiusRatio,
+            "median_transit_points": MedianTransitPoints,
+            "ephemeris_match_fraction": EphemerisMatchFraction,
+            "ephemeris_match_count": EphemerisMatchCount,
+            "ephemeris_event_match_count": EphemerisEventMatchCount,
+            "off_ephemeris_transit_count": OffEphemerisCount,
+            "off_ephemeris_fraction": OffEphemerisFraction,
+            "expected_transit_count": ExpectedTransitCount,
+            "expected_transit_coverage": ExpectedTransitCoverage,
+            "timing_residual_ratio": TimingResidualRatio,
+            "warning_count": len(Warnings),
+            "danger_warning_count": DangerCount,
+            "caution_warning_count": CautionCount,
         },
     }
 
 
-def robust_flux_limits(values, sigma=4.0):
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    noise = max(1.4826 * mad, 1e-9)
-    low = median - sigma * noise
-    high = median + sigma * noise
-    pct_low, pct_high = np.percentile(values, [0.2, 99.8])
-    return float(min(low, pct_low)), float(max(high, pct_high))
+#MARK: plot stuffs
+def RobustFluxLimits(Values, Sigma=4.0):
+    Median = float(Np.median(Values))
+    Mad = float(Np.median(Np.abs(Values - Median)))
+    Noise = max(1.4826 * Mad, 1e-9)
+    Low = Median - Sigma * Noise
+    High = Median + Sigma * Noise
+    PctLow, PctHigh = Np.percentile(Values, [0.2, 99.8])
+    return float(min(Low, PctLow)), float(max(High, PctHigh))
 
 
-def domain_for(values, lower_percentile=0.5, upper_percentile=99.5):
-    low, high = np.percentile(values, [lower_percentile, upper_percentile])
-    padding = max((high - low) * 0.14, np.std(values) * 0.08, 1e-9)
-    return float(low - padding), float(high + padding)
+#MARK: plot stuffs
+def DomainFor(Values, LowerPercentile=0.5, UpperPercentile=99.5):
+    Low, High = Np.percentile(Values, [LowerPercentile, UpperPercentile])
+    Padding = max((High - Low) * 0.14, Np.std(Values) * 0.08, 1e-9)
+    return float(Low - Padding), float(High + Padding)
 
 
-def downsample_indices(flux, max_points=MAX_PLOT_POINTS):
-    n = len(flux)
-    if n <= max_points:
-        return np.arange(n, dtype=int)
+#MARK: plot stuffs
+def DownsampleIndices(Flux, MaxPoints=MAX_PLOT_POINTS):
+    N = len(Flux)
+    if N <= MaxPoints:
+        return Np.arange(N, dtype=int)
 
-    bucket_count = max_points // 2
-    edges = np.linspace(0, n, bucket_count + 1, dtype=int)
-    keep = []
-    for start, end in zip(edges[:-1], edges[1:]):
-        if end <= start:
+    BucketCount = MaxPoints // 2
+    Edges = Np.linspace(0, N, BucketCount + 1, dtype=int)
+    Keep = []
+    for Start, End in zip(Edges[:-1], Edges[1:]):
+        if End <= Start:
             continue
-        segment = flux[start:end]
-        min_i = start + int(np.argmin(segment))
-        max_i = start + int(np.argmax(segment))
-        keep.extend([min_i, max_i])
-    return np.asarray(sorted(set(keep)), dtype=int)
+        Segment = Flux[Start:End]
+        MinI = Start + int(Np.argmin(Segment))
+        MaxI = Start + int(Np.argmax(Segment))
+        Keep.extend([MinI, MaxI])
+    return Np.asarray(sorted(set(Keep)), dtype=int)
 
 
-def downsample_indices_for_series(series_values, max_points=MAX_PLOT_POINTS):
-    series = [np.asarray(values, dtype=float) for values in series_values if values is not None]
-    if not series:
-        return np.asarray([], dtype=int)
-    size = min(len(values) for values in series)
-    if size <= max_points:
-        return np.arange(size, dtype=int)
+#MARK: plot stuffs
+def DownsampleIndicesForSeries(SeriesValues, MaxPoints=MAX_PLOT_POINTS):
+    Series = [Np.asarray(Values, dtype=float) for Values in SeriesValues if Values is not None]
+    if not Series:
+        return Np.asarray([], dtype=int)
+    Size = min(len(Values) for Values in Series)
+    if Size <= MaxPoints:
+        return Np.arange(Size, dtype=int)
 
-    points_per_bucket = max(2, 2 * len(series))
-    bucket_count = max(1, (max_points - 2) // points_per_bucket)
-    edges = np.linspace(0, size, bucket_count + 1, dtype=int)
-    keep = {0, size - 1}
-    for start, end in zip(edges[:-1], edges[1:]):
-        if end <= start:
+    PointsPerBucket = max(2, 2 * len(Series))
+    BucketCount = max(1, (MaxPoints - 2) // PointsPerBucket)
+    Edges = Np.linspace(0, Size, BucketCount + 1, dtype=int)
+    Keep = {0, Size - 1}
+    for Start, End in zip(Edges[:-1], Edges[1:]):
+        if End <= Start:
             continue
-        for values in series:
-            bucket = values[start:end]
-            finite = np.isfinite(bucket)
-            if not np.any(finite):
+        for Values in Series:
+            Bucket = Values[Start:End]
+            Finite = Np.isfinite(Bucket)
+            if not Np.any(Finite):
                 continue
-            finite_indices = np.flatnonzero(finite)
-            finite_values = bucket[finite]
-            keep.add(start + int(finite_indices[int(np.argmin(finite_values))]))
-            keep.add(start + int(finite_indices[int(np.argmax(finite_values))]))
-    return np.asarray(sorted(keep), dtype=int)
+            FiniteIndices = Np.flatnonzero(Finite)
+            FiniteValues = Bucket[Finite]
+            Keep.add(Start + int(FiniteIndices[int(Np.argmin(FiniteValues))]))
+            Keep.add(Start + int(FiniteIndices[int(Np.argmax(FiniteValues))]))
+    return Np.asarray(sorted(Keep), dtype=int)
 
 
-def downsample_for_plot(time, flux, smooth_flux, max_points=MAX_PLOT_POINTS):
-    n = len(time)
-    keep = downsample_indices(smooth_flux if n > max_points else flux, max_points)
-    return time[keep], flux[keep], smooth_flux[keep]
+#MARK: plot stuffs
+def TrimPlotPoints(Time, Flux, SmoothFlux, MaxPoints=MAX_PLOT_POINTS):
+    N = len(Time)
+    Keep = DownsampleIndices(SmoothFlux if N > MaxPoints else Flux, MaxPoints)
+    return Time[Keep], Flux[Keep], SmoothFlux[Keep]
 
 
-def model_flux_at_observations(time, period, epoch, transit_model, exposure_seconds=None):
+#MARK: curve funcs
+def ModelFluxAtObservations(Time, Period, Epoch, TransitModel, ExposureSeconds=None):
     if (
-        transit_model is None
-        or period is None
-        or epoch is None
-        or not math.isfinite(float(period))
-        or float(period) <= 0
-        or not math.isfinite(float(epoch))
+        TransitModel is None
+        or Period is None
+        or Epoch is None
+        or not Math.isfinite(float(Period))
+        or float(Period) <= 0
+        or not Math.isfinite(float(Epoch))
     ):
         return None
 
-    model_phase = np.asarray(transit_model.get("folded_phase_days", []), dtype=float)
-    model_flux = np.asarray(transit_model.get("folded_flux", []), dtype=float)
-    size = min(model_phase.size, model_flux.size)
-    if size < 2:
+    ModelPhase = Np.asarray(TransitModel.get("folded_phase_days", []), dtype=float)
+    ModelFlux = Np.asarray(TransitModel.get("folded_flux", []), dtype=float)
+    Size = min(ModelPhase.size, ModelFlux.size)
+    if Size < 2:
         return None
-    model_phase = model_phase[:size]
-    model_flux = model_flux[:size]
-    valid = np.isfinite(model_phase) & np.isfinite(model_flux)
-    model_phase = model_phase[valid]
-    model_flux = model_flux[valid]
-    if model_phase.size < 2:
-        return None
-
-    order = np.argsort(model_phase)
-    model_phase = model_phase[order]
-    model_flux = model_flux[order]
-    model_phase, unique_indices = np.unique(model_phase, return_index=True)
-    model_flux = model_flux[unique_indices]
-    if model_phase.size < 2:
+    ModelPhase = ModelPhase[:Size]
+    ModelFlux = ModelFlux[:Size]
+    Valid = Np.isfinite(ModelPhase) & Np.isfinite(ModelFlux)
+    ModelPhase = ModelPhase[Valid]
+    ModelFlux = ModelFlux[Valid]
+    if ModelPhase.size < 2:
         return None
 
-    period = float(period)
-    phase = ((np.asarray(time, dtype=float) - float(epoch) + period / 2.0) % period) - period / 2.0
-    return exposure_integrated_template(phase, model_phase, model_flux, period, exposure_seconds)
-
-
-def build_phase_folded_plot(time, raw_flux, smooth_flux, period, epoch, duration, max_points=MAX_PLOT_POINTS):
-    if period is None or epoch is None:
-        return None
-    if not math.isfinite(period) or period <= 0 or not math.isfinite(epoch):
+    Order = Np.argsort(ModelPhase)
+    ModelPhase = ModelPhase[Order]
+    ModelFlux = ModelFlux[Order]
+    ModelPhase, UniqueIndices = Np.unique(ModelPhase, return_index=True)
+    ModelFlux = ModelFlux[UniqueIndices]
+    if ModelPhase.size < 2:
         return None
 
-    phase = ((time - epoch + period / 2.0) % period) - period / 2.0
-    order = np.argsort(phase)
-    phase = phase[order]
-    raw_flux = raw_flux[order]
-    smooth_flux = smooth_flux[order]
+    Period = float(Period)
+    Phase = ((Np.asarray(Time, dtype=float) - float(Epoch) + Period / 2.0) % Period) - Period / 2.0
+    return ExposureIntegratedTemplate(Phase, ModelPhase, ModelFlux, Period, ExposureSeconds)
 
-    keep = downsample_indices(smooth_flux if len(phase) > max_points else raw_flux, max_points)
-    point_phase = phase[keep]
-    point_raw = raw_flux[keep]
-    point_smooth = smooth_flux[keep]
 
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    duration_value = float(duration) if duration is not None and math.isfinite(duration) and duration > 0 else None
-    focus_half_width = max(period * 0.04, cadence * 30.0, 1.0)
-    if duration_value is not None:
-        focus_half_width = max(focus_half_width, duration_value * 4.0)
-    focus_half_width = min(period / 2.0, focus_half_width)
+#MARK: phase bins
+def MakePhasePlot(Time, RawFlux, SmoothFlux, Period, Epoch, Duration, MaxPoints=MAX_PLOT_POINTS):
+    if Period is None or Epoch is None:
+        return None
+    if not Math.isfinite(Period) or Period <= 0 or not Math.isfinite(Epoch):
+        return None
 
-    global_bin_count = int(max(60, min(280, len(phase) // 180)))
-    global_edges = np.linspace(-period / 2.0, period / 2.0, global_bin_count + 1)
-    focus_point_count = int(np.count_nonzero(np.abs(phase) <= focus_half_width))
-    if duration_value is not None:
-        target_focus_width = max(cadence, duration_value / 24.0)
+    Phase = ((Time - Epoch + Period / 2.0) % Period) - Period / 2.0
+    Order = Np.argsort(Phase)
+    Phase = Phase[Order]
+    RawFlux = RawFlux[Order]
+    SmoothFlux = SmoothFlux[Order]
+
+    Keep = DownsampleIndices(SmoothFlux if len(Phase) > MaxPoints else RawFlux, MaxPoints)
+    PointPhase = Phase[Keep]
+    PointRaw = RawFlux[Keep]
+    PointSmooth = SmoothFlux[Keep]
+
+    Cadence = float(Np.median(Np.diff(Time))) if len(Time) > 1 else 1.0
+    DurationValue = float(Duration) if Duration is not None and Math.isfinite(Duration) and Duration > 0 else None
+    FocusHalfWidth = max(Period * 0.04, Cadence * 30.0, 1.0)
+    if DurationValue is not None:
+        FocusHalfWidth = max(FocusHalfWidth, DurationValue * 4.0)
+    FocusHalfWidth = min(Period / 2.0, FocusHalfWidth)
+
+    GlobalBinCount = int(max(60, min(280, len(Phase) // 180)))
+    GlobalEdges = Np.linspace(-Period / 2.0, Period / 2.0, GlobalBinCount + 1)
+    FocusPointCount = int(Np.count_nonzero(Np.abs(Phase) <= FocusHalfWidth))
+    if DurationValue is not None:
+        TargetFocusWidth = max(Cadence, DurationValue / 24.0)
     else:
-        target_focus_width = max(cadence, focus_half_width / 80.0)
-    desired_focus_bins = int(math.ceil(2.0 * focus_half_width / target_focus_width))
-    data_limited_focus_bins = max(40, focus_point_count // 8)
-    focus_bin_count = int(max(
+        TargetFocusWidth = max(Cadence, FocusHalfWidth / 80.0)
+    DesiredFocusBins = int(Math.ceil(2.0 * FocusHalfWidth / TargetFocusWidth))
+    DataLimitedFocusBins = max(40, FocusPointCount // 8)
+    FocusBinCount = int(max(
         40,
-        min(600, desired_focus_bins, data_limited_focus_bins),
+        min(600, DesiredFocusBins, DataLimitedFocusBins),
     ))
-    focus_edges = np.linspace(-focus_half_width, focus_half_width, focus_bin_count + 1)
-    edges = np.unique(np.r_[
-        global_edges[global_edges < -focus_half_width],
-        focus_edges,
-        global_edges[global_edges > focus_half_width],
+    FocusEdges = Np.linspace(-FocusHalfWidth, FocusHalfWidth, FocusBinCount + 1)
+    Edges = Np.unique(Np.r_[
+        GlobalEdges[GlobalEdges < -FocusHalfWidth],
+        FocusEdges,
+        GlobalEdges[GlobalEdges > FocusHalfWidth],
     ])
-    bin_count = len(edges) - 1
-    bin_ids = np.digitize(phase, edges) - 1
-    binned_phase = []
-    binned_flux = []
-    binned_count = []
-    binned_uncertainty = []
-    binned_break_indices = []
-    last_bin = None
-    for bin_index in range(bin_count):
-        mask = bin_ids == bin_index
-        if not np.any(mask):
+    BinCount = len(Edges) - 1
+    BinIds = Np.digitize(Phase, Edges) - 1
+    BinnedPhase = []
+    BinnedFlux = []
+    BinnedCount = []
+    BinnedUncertainty = []
+    BinnedBreakIndices = []
+    LastBin = None
+    for BinIndex in range(BinCount):
+        Mask = BinIds == BinIndex
+        if not Np.any(Mask):
             continue
-        if last_bin is not None and bin_index > last_bin + 1:
-            binned_break_indices.append(len(binned_phase))
-        binned_phase.append(float((edges[bin_index] + edges[bin_index + 1]) / 2.0))
-        binned_flux.append(float(np.median(raw_flux[mask])))
-        binned_count.append(int(np.count_nonzero(mask)))
-        binned_uncertainty.append(robust_standard_error(raw_flux[mask]))
-        last_bin = bin_index
+        if LastBin is not None and BinIndex > LastBin + 1:
+            BinnedBreakIndices.append(len(BinnedPhase))
+        BinnedPhase.append(float((Edges[BinIndex] + Edges[BinIndex + 1]) / 2.0))
+        BinnedFlux.append(float(Np.median(RawFlux[Mask])))
+        BinnedCount.append(int(Np.count_nonzero(Mask)))
+        BinnedUncertainty.append(RobustStandardError(RawFlux[Mask]))
+        LastBin = BinIndex
 
-    binned_phase = np.asarray(binned_phase, dtype=float)
-    binned_flux = np.asarray(binned_flux, dtype=float)
+    BinnedPhase = Np.asarray(BinnedPhase, dtype=float)
+    BinnedFlux = Np.asarray(BinnedFlux, dtype=float)
 
-    if binned_flux.size >= 5:
-        flux_min, flux_max = domain_for(binned_flux, 0.0, 100.0)
+    if BinnedFlux.size >= 5:
+        FluxMin, FluxMax = DomainFor(BinnedFlux, 0.0, 100.0)
     else:
-        flux_min, flux_max = domain_for(raw_flux, 0.5, 99.5)
+        FluxMin, FluxMax = DomainFor(RawFlux, 0.5, 99.5)
 
-    focus_mask = (binned_phase >= -focus_half_width) & (binned_phase <= focus_half_width)
-    if np.count_nonzero(focus_mask) >= 5:
-        focus_flux_min, focus_flux_max = domain_for(binned_flux[focus_mask], 0.0, 100.0)
+    FocusMask = (BinnedPhase >= -FocusHalfWidth) & (BinnedPhase <= FocusHalfWidth)
+    if Np.count_nonzero(FocusMask) >= 5:
+        FocusFluxMin, FocusFluxMax = DomainFor(BinnedFlux[FocusMask], 0.0, 100.0)
     else:
-        raw_focus_mask = (phase >= -focus_half_width) & (phase <= focus_half_width)
-        focus_values = raw_flux[raw_focus_mask] if np.count_nonzero(raw_focus_mask) >= 2 else raw_flux
-        focus_flux_min, focus_flux_max = domain_for(focus_values, 0.5, 99.5)
+        RawFocusMask = (Phase >= -FocusHalfWidth) & (Phase <= FocusHalfWidth)
+        FocusValues = RawFlux[RawFocusMask] if Np.count_nonzero(RawFocusMask) >= 2 else RawFlux
+        FocusFluxMin, FocusFluxMax = DomainFor(FocusValues, 0.5, 99.5)
 
     return {
-        "phase": point_phase.tolist(),
-        "raw_flux": point_raw.tolist(),
-        "smooth_flux": point_smooth.tolist(),
-        "binned_phase": binned_phase.tolist(),
-        "binned_flux": binned_flux.tolist(),
-        "binned_count": binned_count,
-        "binned_uncertainty": binned_uncertainty,
-        "binned_break_indices": binned_break_indices,
+        "phase": PointPhase.tolist(),
+        "raw_flux": PointRaw.tolist(),
+        "smooth_flux": PointSmooth.tolist(),
+        "binned_phase": BinnedPhase.tolist(),
+        "binned_flux": BinnedFlux.tolist(),
+        "binned_count": BinnedCount,
+        "binned_uncertainty": BinnedUncertainty,
+        "binned_break_indices": BinnedBreakIndices,
         "representation": "normalized observations (global phase check)",
-        "period": float(period),
-        "epoch": float(epoch),
-        "duration": duration_value,
+        "period": float(Period),
+        "epoch": float(Epoch),
+        "duration": DurationValue,
         "domain": {
-            "time_min": float(-period / 2.0),
-            "time_max": float(period / 2.0),
-            "flux_min": flux_min,
-            "flux_max": flux_max,
+            "time_min": float(-Period / 2.0),
+            "time_max": float(Period / 2.0),
+            "flux_min": FluxMin,
+            "flux_max": FluxMax,
         },
         "focus_domain": {
-            "time_min": float(-focus_half_width),
-            "time_max": float(focus_half_width),
-            "flux_min": focus_flux_min,
-            "flux_max": focus_flux_max,
+            "time_min": float(-FocusHalfWidth),
+            "time_max": float(FocusHalfWidth),
+            "flux_min": FocusFluxMin,
+            "flux_max": FocusFluxMax,
         },
     }
 
 
-def build_transit_stack(time, smooth_flux, transits, period, duration, max_trace_points=320):
+#MARK: transit stack
+def BuildTransitStack(Time, SmoothFlux, Transits, Period, Duration, MaxTracePoints=320):
     """Align and locally normalize individual events for display-only inspection."""
-    time = np.asarray(time, dtype=float)
-    smooth_flux = np.asarray(smooth_flux, dtype=float)
-    if time.size < 3 or time.size != smooth_flux.size or not transits:
+    Time = Np.asarray(Time, dtype=float)
+    SmoothFlux = Np.asarray(SmoothFlux, dtype=float)
+    if Time.size < 3 or Time.size != SmoothFlux.size or not Transits:
         return None
 
-    duration_value = finite_number(duration)
-    if duration_value is None or duration_value <= 0:
-        durations = finite_values([item.get("duration") for item in transits])
-        duration_value = float(np.median(durations)) if durations else None
-    if duration_value is None or duration_value <= 0:
+    DurationValue = FiniteNumber(Duration)
+    if DurationValue is None or DurationValue <= 0:
+        Durations = FiniteValues([Item.get("duration") for Item in Transits])
+        DurationValue = float(Np.median(Durations)) if Durations else None
+    if DurationValue is None or DurationValue <= 0:
         return None
 
-    finite_time = time[np.isfinite(time)]
-    if finite_time.size < 3:
+    FiniteTime = Time[Np.isfinite(Time)]
+    if FiniteTime.size < 3:
         return None
-    positive_steps = np.diff(np.sort(finite_time))
-    positive_steps = positive_steps[positive_steps > 0]
-    cadence = float(np.median(positive_steps)) if positive_steps.size else duration_value / 20.0
-    half_window = max(duration_value * 3.0, cadence * 12.0)
-    period_value = finite_number(period)
-    if period_value is not None and period_value > 0:
-        half_window = min(half_window, period_value * 0.35)
-    half_window = max(half_window, duration_value * 1.5, cadence * 4.0)
+    PositiveSteps = Np.diff(Np.sort(FiniteTime))
+    PositiveSteps = PositiveSteps[PositiveSteps > 0]
+    Cadence = float(Np.median(PositiveSteps)) if PositiveSteps.size else DurationValue / 20.0
+    HalfWindow = max(DurationValue * 3.0, Cadence * 12.0)
+    PeriodValue = FiniteNumber(Period)
+    if PeriodValue is not None and PeriodValue > 0:
+        HalfWindow = min(HalfWindow, PeriodValue * 0.35)
+    HalfWindow = max(HalfWindow, DurationValue * 1.5, Cadence * 4.0)
 
-    traces = []
-    combined_phase = []
-    combined_flux = []
-    segments = observing_segments(time)
-    for index, transit in enumerate(transits):
-        center = finite_number(transit.get("center"))
-        if center is None:
+    Traces = []
+    CombinedPhase = []
+    CombinedFlux = []
+    Segments = ObservingSegments(Time)
+    for Index, Transit in enumerate(Transits):
+        Center = FiniteNumber(Transit.get("center"))
+        if Center is None:
             continue
-        mask = (
-            np.isfinite(time)
-            & np.isfinite(smooth_flux)
-            & (time >= center - half_window)
-            & (time <= center + half_window)
+        Mask = (
+            Np.isfinite(Time)
+            & Np.isfinite(SmoothFlux)
+            & (Time >= Center - HalfWindow)
+            & (Time <= Center + HalfWindow)
         )
-        segment = next(((a, b) for a, b in segments if time[a] <= center <= time[b - 1]), None)
-        if segment is None:
+        Segment = next(((A, B) for A, B in Segments if Time[A] <= Center <= Time[B - 1]), None)
+        if Segment is None:
             continue
-        segment_mask = np.zeros(len(time), dtype=bool)
-        segment_mask[segment[0]:segment[1]] = True
-        mask &= segment_mask
-        if np.count_nonzero(mask) < 3:
+        SegmentMask = Np.zeros(len(Time), dtype=bool)
+        SegmentMask[Segment[0]:Segment[1]] = True
+        Mask &= SegmentMask
+        if Np.count_nonzero(Mask) < 3:
             continue
 
-        offsets = time[mask] - center
-        values = smooth_flux[mask]
-        order = np.argsort(offsets)
-        offsets = offsets[order]
-        values = values[order]
+        Offsets = Time[Mask] - Center
+        Values = SmoothFlux[Mask]
+        Order = Np.argsort(Offsets)
+        Offsets = Offsets[Order]
+        Values = Values[Order]
 
-        baseline_mask = np.abs(offsets) >= duration_value * 0.75
-        if np.count_nonzero(baseline_mask) >= 6:
-            slope, intercept = np.polyfit(offsets[baseline_mask], values[baseline_mask], 1)
-            baseline_curve = slope * offsets + intercept
-            if not np.all(np.isfinite(baseline_curve)) or np.any(baseline_curve <= 0):
-                baseline_curve = np.full_like(values, float(np.median(values[baseline_mask])))
+        BaselineMask = Np.abs(Offsets) >= DurationValue * 0.75
+        if Np.count_nonzero(BaselineMask) >= 6:
+            Slope, Intercept = Np.polyfit(Offsets[BaselineMask], Values[BaselineMask], 1)
+            BaselineCurve = Slope * Offsets + Intercept
+            if not Np.all(Np.isfinite(BaselineCurve)) or Np.any(BaselineCurve <= 0):
+                BaselineCurve = Np.full_like(Values, float(Np.median(Values[BaselineMask])))
         else:
-            baseline_values = values[baseline_mask] if np.any(baseline_mask) else values
-            baseline_curve = np.full_like(values, float(np.median(baseline_values)))
-        valid_baseline = np.isfinite(baseline_curve) & (baseline_curve > 0)
-        if np.count_nonzero(valid_baseline) < 3:
+            BaselineValues = Values[BaselineMask] if Np.any(BaselineMask) else Values
+            BaselineCurve = Np.full_like(Values, float(Np.median(BaselineValues)))
+        ValidBaseline = Np.isfinite(BaselineCurve) & (BaselineCurve > 0)
+        if Np.count_nonzero(ValidBaseline) < 3:
             continue
-        offsets = offsets[valid_baseline]
-        values = values[valid_baseline]
-        baseline_curve = baseline_curve[valid_baseline]
-        normalized = values / baseline_curve
+        Offsets = Offsets[ValidBaseline]
+        Values = Values[ValidBaseline]
+        BaselineCurve = BaselineCurve[ValidBaseline]
+        Normalized = Values / BaselineCurve
 
-        combined_phase.append(offsets)
-        combined_flux.append(normalized)
-        keep = downsample_indices_for_series([normalized], max_trace_points)
-        traces.append({
-            "transit_index": index + 1,
-            "center": float(center),
-            "phase_days": offsets[keep].tolist(),
-            "flux": normalized[keep].tolist(),
-            "point_count": int(offsets.size),
-            "baseline": float(np.median(baseline_curve)),
-            "cycle_number": transit.get("cycle_number", index),
-            "state": transit.get("state", "legacy_event"),
-            "depth": transit.get("signed_depth", transit.get("depth")),
-            "depth_uncertainty": transit.get("depth_uncertainty"),
-            "local_snr": transit.get("local_snr"),
-            "coverage_fraction": transit.get("coverage_fraction"),
-            "timing_residual": None if transit.get("measured_center") is None else transit["measured_center"] - center,
-            "timing_uncertainty": transit.get("timing_uncertainty"),
+        CombinedPhase.append(Offsets)
+        CombinedFlux.append(Normalized)
+        Keep = DownsampleIndicesForSeries([Normalized], MaxTracePoints)
+        Traces.append({
+            "transit_index": Index + 1,
+            "center": float(Center),
+            "phase_days": Offsets[Keep].tolist(),
+            "flux": Normalized[Keep].tolist(),
+            "point_count": int(Offsets.size),
+            "baseline": float(Np.median(BaselineCurve)),
+            "cycle_number": Transit.get("cycle_number", Index),
+            "state": Transit.get("state", "legacy_event"),
+            "depth": Transit.get("signed_depth", Transit.get("depth")),
+            "depth_uncertainty": Transit.get("depth_uncertainty"),
+            "local_snr": Transit.get("local_snr"),
+            "coverage_fraction": Transit.get("coverage_fraction"),
+            "timing_residual": None if Transit.get("measured_center") is None else Transit["measured_center"] - Center,
+            "timing_uncertainty": Transit.get("timing_uncertainty"),
         })
 
-    if not traces:
+    if not Traces:
         return None
 
-    all_phase = np.concatenate(combined_phase)
-    all_flux = np.concatenate(combined_flux)
-    target_bin_width = max(cadence, duration_value / 36.0)
-    bin_count = int(max(48, min(400, math.ceil(2.0 * half_window / target_bin_width))))
-    edges = np.linspace(-half_window, half_window, bin_count + 1)
-    bin_ids = np.digitize(all_phase, edges) - 1
-    median_phase = []
-    median_flux = []
-    for bin_index in range(bin_count):
-        mask = bin_ids == bin_index
-        if not np.any(mask):
+    AllPhase = Np.concatenate(CombinedPhase)
+    AllFlux = Np.concatenate(CombinedFlux)
+    TargetBinWidth = max(Cadence, DurationValue / 36.0)
+    BinCount = int(max(48, min(400, Math.ceil(2.0 * HalfWindow / TargetBinWidth))))
+    Edges = Np.linspace(-HalfWindow, HalfWindow, BinCount + 1)
+    BinIds = Np.digitize(AllPhase, Edges) - 1
+    MedianPhase = []
+    MedianFlux = []
+    for BinIndex in range(BinCount):
+        Mask = BinIds == BinIndex
+        if not Np.any(Mask):
             continue
-        median_phase.append(float(np.median(all_phase[mask])))
-        median_flux.append(float(np.median(all_flux[mask])))
+        MedianPhase.append(float(Np.median(AllPhase[Mask])))
+        MedianFlux.append(float(Np.median(AllFlux[Mask])))
 
-    domain_values = np.r_[all_flux, np.asarray(median_flux, dtype=float)]
-    flux_min, flux_max = domain_for(domain_values, 0.2, 99.8)
+    DomainValues = Np.r_[AllFlux, Np.asarray(MedianFlux, dtype=float)]
+    FluxMin, FluxMax = DomainFor(DomainValues, 0.2, 99.8)
     return {
-        "traces": traces,
-        "median_phase_days": median_phase,
-        "median_flux": median_flux,
-        "duration": float(duration_value),
-        "window_half_width": float(half_window),
+        "traces": Traces,
+        "median_phase_days": MedianPhase,
+        "median_flux": MedianFlux,
+        "duration": float(DurationValue),
+        "window_half_width": float(HalfWindow),
         "representation": "locally detrended normalized observations (event consistency)",
         "domain": {
-            "time_min": float(-half_window),
-            "time_max": float(half_window),
-            "flux_min": flux_min,
-            "flux_max": flux_max,
+            "time_min": float(-HalfWindow),
+            "time_max": float(HalfWindow),
+            "flux_min": FluxMin,
+            "flux_max": FluxMax,
         },
     }
 
 
-def exploratory_local_dips(time, flux, options, time_reference, max_items=500):
+#MARK: extra signals
+def ExploratoryLocalDips(Time, Flux, Options, TimeReference, MaxItems=500):
     """Reuse the local morphology detector as an explicitly unvalidated layer."""
-    candidates = []
-    for start, end in observing_segments(time):
-        if end - start < 10:
+    Candidates = []
+    for Start, End in ObservingSegments(Time):
+        if End - Start < 10:
             continue
-        segment_baseline = float(np.median(flux[start:end]))
-        prominence = detect_transits_by_prominence(time[start:end], flux[start:end], segment_baseline, options)
-        threshold = detect_transits_by_threshold(time[start:end], flux[start:end], segment_baseline, options)
-        local_events = prune_overlapping_transits((prominence or {}).get("transits", []) + (threshold or {}).get("transits", []))
-        for transit in local_events:
-            event = dict(transit)
-            add_depth_metrics(event, float(np.median(flux[start:end])))
-            for key in ("start", "end", "center"):
-                event[key] -= time_reference
-            event.update(role="exploratory", validated=False, source="local prominence/threshold detectors",
+        SegmentBaseline = float(Np.median(Flux[Start:End]))
+        Prominence = DetectTransitsByProminence(Time[Start:End], Flux[Start:End], SegmentBaseline, Options)
+        Threshold = DetectTransitsByThreshold(Time[Start:End], Flux[Start:End], SegmentBaseline, Options)
+        LocalEvents = PruneOverlappingTransits((Prominence or {}).get("transits", []) + (Threshold or {}).get("transits", []))
+        for Transit in LocalEvents:
+            Event = dict(Transit)
+            AddDepthMetrics(Event, float(Np.median(Flux[Start:End])))
+            for Key in ("start", "end", "center"):
+                Event[Key] -= TimeReference
+            Event.update(role="exploratory", validated=False, source="local prominence/threshold detectors",
                          matched_signal_ids=[], assignment="unassigned")
-            candidates.append(event)
-    total = len(candidates)
-    if total > max_items:
-        candidates = sorted(candidates, key=lambda item: item.get("depth", 0) * math.sqrt(item.get("points", 1)), reverse=True)[:max_items]
-    candidates.sort(key=lambda item: item["center"])
-    for index, candidate in enumerate(candidates):
-        candidate["dip_id"] = f"dip-{index + 1}"
-    return candidates, {"method": "existing local prominence/threshold detectors, applied within observing segments",
-                        "total_before_display_cap": total, "display_cap": max_items,
+            Candidates.append(Event)
+    Total = len(Candidates)
+    if Total > MaxItems:
+        Candidates = sorted(Candidates, key=lambda Item: Item.get("depth", 0) * Math.sqrt(Item.get("points", 1)), reverse=True)[:MaxItems]
+    Candidates.sort(key=lambda Item: Item["center"])
+    for Index, Candidate in enumerate(Candidates):
+        Candidate["dip_id"] = f"dip-{Index + 1}"
+    return Candidates, {"method": "existing local prominence/threshold detectors, applied within observing segments",
+                        "total_before_display_cap": Total, "display_cap": MaxItems,
                         "interpretation": "Unvalidated local features; not planets, not independent confirmations, and never added to the candidate score."}
 
 
-def tag_exploratory_assignments(result, signals):
-    for dip in result.get("exploratory_dips", []):
-        absolute_center = dip["center"] + result["time_reference"]
-        matches = []
-        for index, signal in enumerate(signals):
-            relative_center = absolute_center - signal["time_reference"]
-            if any(event["start"] <= relative_center <= event["end"] for event in signal.get("predicted_windows", signal.get("transits", []))):
-                matches.append(signal.get("signal_id", f"signal-{index + 1}"))
-        dip["matched_signal_ids"] = matches
-        dip["assignment"] = "overlaps_predicted_window" if matches else "unassigned"
+#MARK: tag exploratory assignments
+def TagExploratoryAssignments(Result, Signals):
+    for Dip in Result.get("exploratory_dips", []):
+        AbsoluteCenter = Dip["center"] + Result["time_reference"]
+        Matches = []
+        for Index, Signal in enumerate(Signals):
+            RelativeCenter = AbsoluteCenter - Signal["time_reference"]
+            if any(Event["start"] <= RelativeCenter <= Event["end"] for Event in Signal.get("predicted_windows", Signal.get("transits", []))):
+                Matches.append(Signal.get("signal_id", f"signal-{Index + 1}"))
+        Dip["matched_signal_ids"] = Matches
+        Dip["assignment"] = "overlaps_predicted_window" if Matches else "unassigned"
 
 
-def joint_template_amplitudes(time, search_flux, signals, uncertainty=None, exposure_seconds=None):
+#MARK: model shape
+def JointTemplateAmplitudes(Time, SearchFlux, Signals, Uncertainty=None, ExposureSeconds=None):
     """Fit simultaneous depths and one baseline with orbital templates fixed.
 
     This handles additive small-planet flux deficits at overlapping timestamps.
     It does not infer orbital parameters or model overlapping silhouettes.
     """
-    if len(signals) < 2:
+    if len(Signals) < 2:
         return None
     try:
-        from scipy.optimize import least_squares
+        from scipy.optimize import least_squares as LeastSquares
     except ImportError:
         return None
-    time, values = np.asarray(time, dtype=float), np.asarray(search_flux, dtype=float)
-    shapes, prior_depths = [], []
-    for signal in signals:
-        model = signal.get("transit_model") or {}
-        folded_flux = np.asarray(model.get("folded_flux", []), dtype=float)
-        if folded_flux.size < 3:
+    Time, Values = Np.asarray(Time, dtype=float), Np.asarray(SearchFlux, dtype=float)
+    Shapes, PriorDepths = [], []
+    for Signal in Signals:
+        Model = Signal.get("transit_model") or {}
+        FoldedFlux = Np.asarray(Model.get("folded_flux", []), dtype=float)
+        if FoldedFlux.size < 3:
             return None
-        baseline = float(np.max(folded_flux))
-        depth = float(baseline - np.min(folded_flux))
-        if depth <= 0:
+        Baseline = float(Np.max(FoldedFlux))
+        Depth = float(Baseline - Np.min(FoldedFlux))
+        if Depth <= 0:
             return None
-        aligned = model_flux_at_observations(time, signal["period"], signal["period_epoch"], model, exposure_seconds)
-        if aligned is None:
+        Aligned = ModelFluxAtObservations(Time, Signal["period"], Signal["period_epoch"], Model, ExposureSeconds)
+        if Aligned is None:
             return None
-        shapes.append(np.maximum(0.0, (baseline - aligned) / depth))
-        prior_depths.append(depth)
-    design = np.column_stack([np.ones(len(time))] + [-shape for shape in shapes])
-    sigma = max(1.4826 * float(np.median(np.abs(values - np.median(values)))), 1e-8)
-    errors = np.full(len(time), sigma)
-    if uncertainty is not None:
-        supplied = np.asarray(uncertainty, dtype=float)
-        if len(supplied) == len(time) and np.all(np.isfinite(supplied)) and np.all(supplied > 0):
-            errors = supplied
-    initial = [float(np.median(values)), *prior_depths]
-    fit = least_squares(lambda pars: (design @ pars - values) / errors, initial,
-                        jac=lambda pars: design / errors[:, None], loss="soft_l1",
-                        bounds=([0.5] + [0.0] * len(signals), [1.5] + [0.5] * len(signals)), max_nfev=60)
-    if not fit.success or not np.all(np.isfinite(fit.x)):
+        Shapes.append(Np.maximum(0.0, (Baseline - Aligned) / Depth))
+        PriorDepths.append(Depth)
+    Design = Np.column_stack([Np.ones(len(Time))] + [-Shape for Shape in Shapes])
+    Sigma = max(1.4826 * float(Np.median(Np.abs(Values - Np.median(Values)))), 1e-8)
+    Errors = Np.full(len(Time), Sigma)
+    if Uncertainty is not None:
+        Supplied = Np.asarray(Uncertainty, dtype=float)
+        if len(Supplied) == len(Time) and Np.all(Np.isfinite(Supplied)) and Np.all(Supplied > 0):
+            Errors = Supplied
+    Initial = [float(Np.median(Values)), *PriorDepths]
+    Fit = LeastSquares(lambda Pars: (Design @ Pars - Values) / Errors, Initial,
+                        jac=lambda Pars: Design / Errors[:, None], loss="soft_l1",
+                        bounds=([0.5] + [0.0] * len(Signals), [1.5] + [0.5] * len(Signals)), max_nfev=60)
+    if not Fit.success or not Np.all(Np.isfinite(Fit.x)):
         return None
-    degrees = max(len(values) - len(fit.x), 1)
-    residual_variance = float(np.sum(fit.fun ** 2) / degrees)
+    Degrees = max(len(Values) - len(Fit.x), 1)
+    ResidualVariance = float(Np.sum(Fit.fun ** 2) / Degrees)
     try:
-        covariance = np.linalg.pinv(fit.jac.T @ fit.jac) * max(1.0, residual_variance)
-        errors_on_parameters = np.sqrt(np.maximum(0.0, np.diag(covariance)))
-    except np.linalg.LinAlgError:
-        errors_on_parameters = np.full(len(fit.x), np.nan)
-    fitted = design @ fit.x
+        Covariance = Np.linalg.pinv(Fit.jac.T @ Fit.jac) * max(1.0, ResidualVariance)
+        ErrorsOnParameters = Np.sqrt(Np.maximum(0.0, Np.diag(Covariance)))
+    except Np.linalg.LinAlgError:
+        ErrorsOnParameters = Np.full(len(Fit.x), Np.nan)
+    Fitted = Design @ Fit.x
     return {
-        "baseline": float(fit.x[0]), "depths": fit.x[1:].tolist(),
-        "depth_uncertainties": [float(value) if np.isfinite(value) else None for value in errors_on_parameters[1:]],
-        "model_flux": fitted, "residual_flux": values - fitted,
-        "components": [1.0 - depth * shape for depth, shape in zip(fit.x[1:], shapes)],
+        "baseline": float(Fit.x[0]), "depths": Fit.x[1:].tolist(),
+        "depth_uncertainties": [float(Value) if Np.isfinite(Value) else None for Value in ErrorsOnParameters[1:]],
+        "model_flux": Fitted, "residual_flux": Values - Fitted,
+        "components": [1.0 - Depth * Shape for Depth, Shape in zip(Fit.x[1:], Shapes)],
         "metadata": {"method": "robust simultaneous additive template amplitude and baseline fit",
                      "fixed_parameters": ["period", "epoch", "duration", "template shape"],
                      "fitted_parameters": ["per-signal flux deficit", "shared baseline"],
                      "overlap_model": "sum of flux deficits; overlapping planet silhouettes are not modeled geometrically",
                      "uncertainty_basis": "conditional local Jacobian with residual-variance inflation; not an orbital posterior",
-                     "reduced_chi_squared": residual_variance,
-                     "overlapping_sample_count": int(np.count_nonzero(np.sum(np.asarray(shapes) > .001, axis=0) > 1))},
+                     "reduced_chi_squared": ResidualVariance,
+                     "overlapping_sample_count": int(Np.count_nonzero(Np.sum(Np.asarray(Shapes) > .001, axis=0) > 1))},
     }
 
 
-def update_signal_joint_depth(signal, depth, uncertainty):
+#MARK: extra signals
+def UpdateSignalJointDepth(Signal, Depth, Uncertainty):
     """Keep component model payloads consistent with a conditional joint depth."""
-    model = signal.get("transit_model") or {}
-    folded_flux = np.asarray(model.get("folded_flux", []), dtype=float)
-    if folded_flux.size < 3:
+    Model = Signal.get("transit_model") or {}
+    FoldedFlux = Np.asarray(Model.get("folded_flux", []), dtype=float)
+    if FoldedFlux.size < 3:
         return
-    baseline = float(np.max(folded_flux))
-    previous_depth = float(baseline - np.min(folded_flux))
-    if previous_depth <= 0:
+    Baseline = float(Np.max(FoldedFlux))
+    PrevDepth = float(Baseline - Np.min(FoldedFlux))
+    if PrevDepth <= 0:
         return
-    signal["transit_model"] = {**model,
-        "folded_flux": (1.0 - (baseline - folded_flux) * depth / previous_depth).tolist(),
-        "flux": (1.0 - (baseline - np.asarray(model.get("flux", []))) * depth / previous_depth).tolist(),
+    Signal["transit_model"] = {**Model,
+        "folded_flux": (1.0 - (Baseline - FoldedFlux) * Depth / PrevDepth).tolist(),
+        "flux": (1.0 - (Baseline - Np.asarray(Model.get("flux", []))) * Depth / PrevDepth).tolist(),
         "depth_source": "conditional joint template amplitude", "component_baseline": 1.0,
     }
-    if signal.get("tls"):
-        signal["tls"] = {**signal["tls"], "engine_depth_fraction": signal["tls"].get("engine_depth_fraction", signal["tls"].get("depth_fraction")),
-                         "depth_fraction": float(depth), "depth_uncertainty": uncertainty,
+    if Signal.get("tls"):
+        Signal["tls"] = {**Signal["tls"], "engine_depth_fraction": Signal["tls"].get("engine_depth_fraction", Signal["tls"].get("depth_fraction")),
+                         "depth_fraction": float(Depth), "depth_uncertainty": Uncertainty,
                          "depth_source": "conditional joint template amplitude"}
-    comparison = signal.get("model_comparison")
-    if comparison:
-        old = np.asarray(comparison["model_flux"])
-        updated = 1.0 - (baseline - old) * depth / previous_depth
-        signal["model_comparison"] = {**comparison, "model_flux": updated.tolist(),
-                                      "residual_flux": (np.asarray(comparison["search_flux"]) - updated).tolist()}
-    signal["joint_depth_refinement"] = {"depth_fraction": float(depth), "uncertainty": uncertainty,
+    Comparison = Signal.get("model_comparison")
+    if Comparison:
+        Old = Np.asarray(Comparison["model_flux"])
+        Updated = 1.0 - (Baseline - Old) * Depth / PrevDepth
+        Signal["model_comparison"] = {**Comparison, "model_flux": Updated.tolist(),
+                                      "residual_flux": (Np.asarray(Comparison["search_flux"]) - Updated).tolist()}
+    Signal["joint_depth_refinement"] = {"depth_fraction": float(Depth), "uncertainty": Uncertainty,
                                         "parameters_held_fixed": ["period", "epoch", "duration", "template shape"]}
 
 
-def analyze(time, flux, options=None, progress_callback=None):
-    def report_progress(stage, stage_label, details=None):
-        if callable(progress_callback):
-            if details is None:
-                progress_callback(stage, stage_label)
-            else:
-                progress_callback(stage, stage_label, details)
-
-    if options is None:
-        options = dict(DEFAULT_DETECTION_OPTIONS)
+#MARK: curve funcs
+def _PrepCurve(Time, Flux, Options):
+    if Options is None:
+        Options = dict(DEFAULT_DETECTION_OPTIONS)
     else:
-        options = {**DEFAULT_DETECTION_OPTIONS, **options}
-    time, flux = np.asarray(time, dtype=float), np.asarray(flux, dtype=float)
-    if len(time) < 3 or len(time) != len(flux) or not np.isfinite(time).all() or not np.isfinite(flux).all():
+        Options = {**DEFAULT_DETECTION_OPTIONS, **Options}
+    Time, Flux = Np.asarray(Time, dtype=float), Np.asarray(Flux, dtype=float)
+    if (
+        len(Time) < 3
+        or len(Time) != len(Flux)
+        or not Np.isfinite(Time).all()
+        or not Np.isfinite(Flux).all()
+    ):
         raise ValueError("Analysis requires matching finite time/flux samples.")
-    if np.any(np.diff(time) <= 0):
+    if Np.any(Np.diff(Time) <= 0):
         raise ValueError("Analysis timestamps must be sorted, unique, and span more than zero days.")
-    explicit_exposure = options.get("exposure_seconds")
-    if explicit_exposure is not None and (not math.isfinite(float(explicit_exposure)) or not 0 <= float(explicit_exposure) <= 86400):
+
+    # exposure isn't the same as the gap between samples.
+    ExplicitExposure = Options.get("exposure_seconds")
+    if ExplicitExposure is not None and (
+        not Math.isfinite(float(ExplicitExposure))
+        or not 0 <= float(ExplicitExposure) <= 86400
+    ):
         raise ValueError("Exposure override must be between zero and 86400 seconds; leave blank when unknown.")
-    exposures = exposure_array_seconds(explicit_exposure if explicit_exposure is not None else options.get("_exposure_seconds"), len(time))
-    options["_exposure_seconds"] = exposures
-    known_exposures = exposures[np.isfinite(exposures)]
-    exposure_metadata = {"source": "explicit per-file override" if explicit_exposure is not None else
-        ((options.get("_input_metadata") or {}).get("exposure") or {}).get("source", "supplied array" if known_exposures.size else "unknown"),
-        "unit": "seconds", "known_rows": int(known_exposures.size), "unknown_rows": int(len(time) - known_exposures.size),
-        "minimum_seconds": float(np.min(known_exposures)) if known_exposures.size else None,
-        "maximum_seconds": float(np.max(known_exposures)) if known_exposures.size else None,
-        "cadence_is_exposure": False, "timestamps_assumed": "exposure midpoints",
-        "unknown_policy": "instantaneous template approximation; unknown exposure smearing uncertainty is not included",
-        "scope": "conditional duration/depth refit and observation-aligned model; reference TLS search is unchanged"}
-    report_progress("preparing", "Preparing light curve")
-    normalization_plan = flux_normalization_plan(flux)
-    analysis_flux, segments = normalize_flux_by_segments(time, flux)
-    normalized_uncertainty = None
-    uncertainty_complete = False
-    if options.get("_flux_uncertainty") is not None:
-        supplied_uncertainty = np.asarray(options["_flux_uncertainty"], dtype=float)
-        if len(supplied_uncertainty) == len(time):
-            normalized_uncertainty = supplied_uncertainty.copy()
-            for start, end in segments:
-                residual_scale = normalization_plan.get("residual_scale")
-                scale = abs(float(np.median(flux[start:end])) + (residual_scale or 0.0))
-                if scale > 0:
-                    normalized_uncertainty[start:end] /= scale
-            uncertainty_complete = bool(np.all(np.isfinite(normalized_uncertainty)) and np.all(normalized_uncertainty > 0))
-            if uncertainty_complete:
-                options = {**options, "_normalized_flux_uncertainty": normalized_uncertainty}
-    search_mode = options.get("search_mode", DEFAULT_DETECTION_OPTIONS["search_mode"])
-    if search_mode == "tls":
-        report_progress("tls_search", "Searching periods with TLS")
+    ExposureInput = ExplicitExposure if ExplicitExposure is not None else Options.get("_exposure_seconds")
+    Exposures = ExposureArraySeconds(ExposureInput, len(Time))
+    Options["_exposure_seconds"] = Exposures
+    KnownExposures = Exposures[Np.isfinite(Exposures)]
+    if ExplicitExposure is not None:
+        ExposureSource = "explicit per-file override"
     else:
-        report_progress("bls_search", "Searching periods with BLS")
-    detection = detect_transits(time, analysis_flux, options,
-                                progress_callback=lambda details: report_progress(
-                                    "tls_finalizing" if details.get("search_complete") else "tls_search",
-                                    "Finalizing TLS model" if details.get("search_complete") else "Searching periods with TLS", details))
-    report_progress("building", "Building transit model and plots")
-    time_reference = float(time[0])
-    display_time = time - time_reference
-    raw_low, raw_high = robust_flux_limits(analysis_flux, sigma=4.0)
-    raw_clipped = np.clip(analysis_flux, raw_low, raw_high)
-
-    transit_model = detection.get("transit_model")
-    base_smooth_width = int(max(25, min(251, len(analysis_flux) // 300)))
-    smooth_width = odd_window_width(base_smooth_width, float(options["smoothing"]), 5, 601)
-    cadence = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    period_sde = finite_number(detection.get("period_sde"))
-    if transit_model is not None and period_sde is not None and period_sde >= 5.0:
-        smooth_width = transit_preserving_smoothing_width(
-            smooth_width,
-            cadence,
-            detection.get("period_duration"),
-        )
-    smooth_flux = moving_average_by_segments(raw_clipped, smooth_width, segments)
-
-    observed_model_flux = model_flux_at_observations(
-        time,
-        detection.get("period"),
-        detection.get("period_epoch"),
-        transit_model,
-        exposures,
-    )
-    display_model_flux = None
-    if observed_model_flux is not None:
-        display_model_flux = moving_average_by_segments(observed_model_flux, smooth_width, segments)
-
-    plot_keep = downsample_indices_for_series(
-        [analysis_flux, smooth_flux, display_model_flux] if display_model_flux is not None else [analysis_flux, smooth_flux],
-        MAX_PLOT_POINTS,
-    )
-    plot_keep = np.unique(np.r_[plot_keep, [index for start, end in segments for index in (start, end - 1)]]).astype(int)
-    plot_time = display_time[plot_keep]
-    plot_raw = analysis_flux[plot_keep]
-    plot_smooth = smooth_flux[plot_keep]
-    raw_flux_min, raw_flux_max = domain_for(raw_clipped, 0.5, 99.5)
-    clean_domain_values = (
-        np.r_[smooth_flux, display_model_flux]
-        if display_model_flux is not None
-        else smooth_flux
-    )
-    clean_flux_min, clean_flux_max = domain_for(clean_domain_values, 0.2, 99.8)
-    phase_folded = build_phase_folded_plot(
-        time,
-        raw_clipped,
-        smooth_flux,
-        detection["period"],
-        detection["period_epoch"],
-        detection["period_duration"],
-    )
-    transit_stack = build_transit_stack(
-        time,
-        analysis_flux,
-        [event for event in detection["transits"] if event.get("points", 1) > 0],
-        detection["period"],
-        detection["period_duration"],
-    )
-
-    if transit_model is not None and display_model_flux is not None:
-        transit_model = {
-            **transit_model,
-            "time": plot_time.tolist(),
-            "flux": display_model_flux[plot_keep].tolist(),
-            "time_series_representation": "observation-aligned and plot-smoothed",
-            "plot_smooth_points": smooth_width,
-        }
-        detection = {**detection, "transit_model": transit_model}
-
-    display_transits = []
-    for transit in detection["transits"]:
-        display_transit = dict(transit)
-        add_depth_metrics(display_transit, transit.get("local_baseline", detection["median_flux"]))
-        for key in ("predicted_center", "measured_center"):
-            if transit.get(key) is not None:
-                display_transit[key] = float(transit[key] - time_reference)
-        display_transit["start"] = float(transit["start"] - time_reference)
-        display_transit["center"] = float(transit["center"] - time_reference)
-        display_transit["end"] = float(transit["end"] - time_reference)
-        local = (time >= transit["start"]) & (time <= transit["end"])
-        display_extents = {}
-        for name, values in (("raw", analysis_flux), ("clean", smooth_flux)):
-            local_values = values[local]
-            if name == "clean" and display_model_flux is not None:
-                local_values = np.r_[local_values, display_model_flux[local]]
-            if local_values.size:
-                low, high = np.percentile(local_values, [5, 95])
-                baseline = transit.get("local_baseline")
-                if baseline is not None:
-                    high = max(high, baseline)
-                padding = max((high - low) * 0.12, 1e-6)
-                display_extents[name] = {"flux_min": float(low - padding), "flux_max": float(high + padding),
-                                         "low": float(low - padding), "high": float(high + padding)}
-        display_transit["display_extents"] = display_extents
-        if transit_model is not None and display_model_flux is not None:
-            display_start, display_end = smoothed_transit_display_bounds(
-                display_transit["start"],
-                display_transit["end"],
-                cadence,
-                smooth_width,
-                float(display_time[0]),
-                float(display_time[-1]),
-            )
-            display_transit["display_start"] = display_start
-            display_transit["display_end"] = display_end
-        display_transits.append(display_transit)
-    observed_ranges = [
-        (float(time[start] - time_reference), float(time[end - 1] - time_reference))
-        for start, end in segments
-    ]
-    report_progress("vetting", "Calculating diagnostics")
-    diagnostics, warnings = build_candidate_diagnostics(display_transits, detection, time_reference, observed_ranges)
-    if search_mode == "tls" and exposure_metadata["unknown_rows"]:
-        warnings.append({"severity": "info", "title": "Unknown exposure duration",
-                         "detail": "Some or all sample exposure durations are unknown. Template refinement uses an instantaneous approximation for those rows; cadence is not treated as exposure, and duration uncertainty excludes this systematic. Supply an exposure in seconds when known."})
-    if normalized_uncertainty is not None and not uncertainty_complete:
-        warnings.append({"severity": "info", "title": "Partial measurement uncertainties",
-                         "detail": "Some flux errors are missing or invalid. They remain null in plots/exports; TLS uses its unweighted fallback for this file and local checks use empirical noise."})
-    planet_assessment = build_planet_assessment(display_transits, detection, diagnostics, warnings)
-    exploratory_dips, exploratory_metadata = ([], None)
-    if not options.get("_skip_local_inspection"):
-        exploratory_dips, exploratory_metadata = exploratory_local_dips(time, analysis_flux, options, time_reference)
-    fit_accepted = planet_assessment["status"] in ("strong_candidate", "possible_candidate")
-    fit_quality = {"state": "accepted" if fit_accepted else "tentative",
-                   "label": "Candidate model" if fit_accepted else "Tentative fit - below candidate threshold",
-                   "reason_codes": [warning["title"].lower().replace(" ", "_") for warning in warnings if warning.get("severity") in ("caution", "danger")]}
-    search_flux = None
-    if search_mode == "tls":
-        search_flux, _ = normalized_flux_for_tls(time, analysis_flux)
-    comparison = None
-    if search_flux is not None and observed_model_flux is not None:
-        comparison = {"time": plot_time.tolist(), "search_flux": search_flux[plot_keep].tolist(),
-                      "model_flux": observed_model_flux[plot_keep].tolist(),
-                      "residual_flux": (search_flux - observed_model_flux)[plot_keep].tolist(),
-                      "representation": "search-detrended observations and physical template on identical timestamps",
-                      "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]]}
-
-    zoom_domain = None
-    if display_transits:
-        first = display_transits[0]
-        last = display_transits[-1]
-        median_duration = float(np.median([item["duration"] for item in display_transits]))
-        if len(display_transits) == 1:
-            pad = max(first["duration"] * 2.8, (time[-1] - time[0]) * 0.015, 1.0)
-        else:
-            pad = max(median_duration * 3.0, (time[-1] - time[0]) * 0.02, 1.0)
-        zoom_time_min = float(max(0.0, first["start"] - pad))
-        zoom_time_max = float(min(display_time[-1], last["end"] + pad))
-        zoom_mask = (display_time >= zoom_time_min) & (display_time <= zoom_time_max)
-        zoom_values = smooth_flux[zoom_mask]
-        if display_model_flux is not None:
-            zoom_values = np.r_[zoom_values, display_model_flux[zoom_mask]]
-        zoom_flux_min, zoom_flux_max = domain_for(zoom_values, 0.0, 100.0)
-        zoom_domain = {
-            "time_min": zoom_time_min,
-            "time_max": zoom_time_max,
-            "flux_min": zoom_flux_min,
-            "flux_max": zoom_flux_max,
-        }
-
-    report_progress("finalizing", "Finalizing results")
-    public_options = {key: value for key, value in options.items() if not key.startswith("_")}
-    result = {
-        "total_points": int(len(time)),
-        "time_reference": time_reference,
-        "time_unit": "Days since first observation",
-        "flux_unit": "relative flux",
-        "normalization": {
-            "method": normalization_plan["method"],
-            "input_representation": normalization_plan["input_representation"],
-            "residual_scale": normalization_plan["residual_scale"],
-            "segment_count": len(segments),
-            "segment_time_ranges": [
-                {
-                    "start_day": float(time[start] - time_reference),
-                    "end_day": float(time[end - 1] - time_reference),
-                    "median_flux": float(np.median(flux[start:end])),
-                }
-                for start, end in segments
-            ],
-        },
-        "plot": {
-            "time": plot_time.tolist(),
-            "raw_flux": plot_raw.tolist(),
-            "smooth_flux": plot_smooth.tolist(),
-            "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]],
-            "raw_representation": "unclipped segment-normalized flux at retained plot samples",
-            "clean_representation": "display-clipped, segment-smoothed observations",
-        },
-        "domain": {
-            "time_min": 0.0,
-            "time_max": float(display_time[-1]),
-        },
-        "raw_domain": {"flux_min": raw_flux_min, "flux_max": raw_flux_max},
-        "clean_domain": {"flux_min": clean_flux_min, "flux_max": clean_flux_max},
-        "zoom_domain": zoom_domain,
-        "phase_folded": phase_folded,
-        "transit_stack": transit_stack,
-        "plot_smooth_points": smooth_width,
-        "diagnostics": diagnostics,
-        "warnings": warnings,
-        "planet_assessment": planet_assessment,
-        "fit_quality": fit_quality,
-        "model_comparison": comparison,
-        "predicted_windows": display_transits,
-        "observed_events": [event for event in display_transits if event.get("state", "supported_dip") == "supported_dip"],
-        "exploratory_dips": exploratory_dips,
-        "exploratory_dips_metadata": exploratory_metadata,
-        "cleaning_report": options.get("_cleaning_report"),
-        "input_metadata": options.get("_input_metadata", {"time_format": "unspecified", "time_standard": "unspecified"}),
-        "exposure_metadata": exposure_metadata,
-        "preprocessing": {"normalized": "per-observing-segment median", "search": "segment-local trend removal; downward samples retained", "display": "segment-local moving average", "stack": "per-event linear baseline, no automatic recentering"},
-        "significance_metadata": {"p_value": "Approximate fixed-model-versus-flat chi-squared comparison after selecting the period; not search-wide false alarm or planet probability.",
-                                  "tls_fap": "Reference TLS white-noise lookup; correlated noise and selection effects can make it optimistic.",
-                                  "candidate_score": "Heuristic review score, not a calibrated probability."},
-        "effective_settings": {**public_options, "stellar_priors": (detection.get("tls") or {}).get("effective_stellar_priors"),
-                               "exposure": exposure_metadata,
-                               "local_dip_settings": {key: public_options.get(key) for key in ("strictness", "smoothing", "min_depth", "min_duration", "max_duration")},
-                               "search_bounds": {**(detection.get("period_search") or {}), "min_transits": options.get("tls_min_transits"),
-                                                 "duration_policy": "Physical TLS stellar-prior/template grid; explicit local dip duration bounds are not applied to TLS." if search_mode == "tls" else "Explicit or cadence-derived BLS duration bounds.",
-                                                 "bounds_reason": ("Upper period limited by observed baseline / minimum transit count; explicit bounds also applied." if search_mode == "tls" else "Cadence, baseline and explicit period/duration bounds applied to BLS.")}},
-        "detection_snr": diagnostics["detection_snr"],
-        "odd_even_depth_mismatch": diagnostics["odd_even_depth_mismatch"],
-        "depth_scatter_ratio": diagnostics["depth_scatter_ratio"],
-        **{**detection, "transits": [event for event in display_transits if event.get("points", 1) > 0], "detection_options": public_options},
+        SuppliedMetadata = (Options.get("_input_metadata") or {}).get("exposure") or {}
+        ExposureSource = SuppliedMetadata.get("source", "supplied array" if KnownExposures.size else "unknown")
+    ExposureMetadata = {
+        "source": ExposureSource,
+        "unit": "seconds",
+        "known_rows": int(KnownExposures.size),
+        "unknown_rows": int(len(Time) - KnownExposures.size),
+        "minimum_seconds": float(Np.min(KnownExposures)) if KnownExposures.size else None,
+        "maximum_seconds": float(Np.max(KnownExposures)) if KnownExposures.size else None,
+        "cadence_is_exposure": False,
+        "timestamps_assumed": "exposure midpoints",
+        "unknown_policy": "instantaneous template approximation; unknown exposure smearing uncertainty is not included",
+        "scope": "conditional duration/depth refit and observation-aligned model; reference TLS search is unchanged",
     }
-    if normalized_uncertainty is not None:
-        result["plot"]["flux_uncertainty"] = [float(value) if np.isfinite(value) and value > 0 else None for value in normalized_uncertainty[plot_keep]]
-        result["uncertainty_usage"] = ("Normalized input uncertainties supplied to TLS; local event estimates additionally use empirical correlated-noise errors." if uncertainty_complete
-                                       else "Incomplete errors retained as null; TLS uses unweighted fallback and local checks use empirical correlated-noise errors.")
-    if known_exposures.size:
-        result["plot"]["exposure_seconds"] = [float(value) if np.isfinite(value) else None for value in exposures[plot_keep]]
-    max_signals = int(options.get("tls_max_signals", options.get("max_signals", 1)))
-    if search_mode == "tls" and max_signals > 1:
-        signals = [{"signal_id": "signal-1", "label": "Signal 1", **result}]
-        retained = np.ones(len(time), dtype=bool)
-        stop_reason = "requested_signal_limit"
-        for signal_index in range(1, min(max_signals, 5)):
-            previous = signals[-1]
-            if previous["planet_assessment"]["status"] != "strong_candidate":
-                stop_reason = "Previous signal lacks strong support; no tentative model was masked."
-                break
-            supported = previous.get("observed_events", [])
-            if len(supported) < 3:
-                stop_reason = "Fewer than three locally supported events; residual search stopped."
-                break
-            for event in supported:
-                center = event["center"] + previous["time_reference"]
-                retained &= np.abs(time - center) > event["duration"] * 0.65
-            if np.count_nonzero(retained) < 50:
-                stop_reason = "Too few unmasked observations remain."
-                break
-            report_progress("tls_search", f"Searching residual observations for signal {signal_index + 1}")
-            next_options = {**options, "tls_max_signals": 1, "max_signals": 1, "_skip_local_inspection": True}
-            if options.get("_flux_uncertainty") is not None:
-                next_options["_flux_uncertainty"] = np.asarray(options["_flux_uncertainty"])[retained]
-                next_options.pop("_normalized_flux_uncertainty", None)
-            next_options["_exposure_seconds"] = exposures[retained]
-            candidate = analyze(time[retained], flux[retained], next_options, progress_callback)
-            # Do not present another optimizer noise pattern as a recovered planet.
-            if candidate["planet_assessment"]["status"] not in ("strong_candidate", "possible_candidate"):
-                result["residual_search_attempt"] = {"period": candidate.get("period"), "sde": candidate.get("period_sde"), "fit_quality": candidate.get("fit_quality")}
-                stop_reason = "No additional credible periodic signal in the residual observations."
-                break
-            candidate.update(signal_id=f"signal-{signal_index + 1}", label=f"Signal {signal_index + 1}",
-                             search_context={"method": "iterative conservative transit masking", "masked_samples": int(np.count_nonzero(~retained)), "joint_refit": False})
-            signals.append(candidate)
-        result["signals"] = signals
-        result["multi_signal_search"] = {"requested": max_signals, "recovered": sum(signal["planet_assessment"]["status"] in ("strong_candidate", "possible_candidate") for signal in signals),
-                                         "attempted_signals": len(signals), "stop_reason": stop_reason,
-                                         "method": "conservative supported-event masking; conditional residual searches", "joint_refit": False,
-                                         "limitation": "Overlapping events and period aliases still require joint follow-up vetting."}
-        if len(signals) >= 2 and search_flux is not None:
-            report_progress("building", "Refining overlapping transit amplitudes together")
-            joint = joint_template_amplitudes(time, search_flux, signals,
-                                               normalized_uncertainty if uncertainty_complete else None, exposures)
-            if joint is not None:
-                for signal, depth, depth_error in zip(signals, joint["depths"], joint["depth_uncertainties"]):
-                    update_signal_joint_depth(signal, depth, depth_error)
-                    signal["search_context"] = {**signal.get("search_context", {}), "joint_refit": True,
-                                                 "joint_scope": "amplitudes and shared baseline; orbital parameters held fixed"}
-                for field in ("transit_model", "tls", "model_comparison", "joint_depth_refinement"):
-                    result[field] = signals[0][field]
-                result["joint_model_comparison"] = {
-                    "time": plot_time.tolist(), "search_flux": search_flux[plot_keep].tolist(),
-                    "model_flux": joint["model_flux"][plot_keep].tolist(), "residual_flux": joint["residual_flux"][plot_keep].tolist(),
-                    "break_indices": [int(np.searchsorted(plot_keep, start)) for start, _ in segments[1:]],
-                    "representation": "original search-detrended observations with simultaneous fixed-template signal amplitudes",
-                    "components": [{"signal_id": signal["signal_id"], "label": signal["label"], "flux": component[plot_keep].tolist()}
-                                   for signal, component in zip(signals, joint["components"])],
-                }
-                result["multi_signal_search"].update(joint_refit=True, joint_fit=joint["metadata"],
-                                                      limitation="Joint amplitudes and baseline fitted; orbital parameters and transit shapes remain conditional and require follow-up vetting.")
-    tag_exploratory_assignments(result, result.get("signals") or [result])
-    return result
+    return Time, Flux, Options, Exposures, ExposureMetadata
+
+
+#MARK: flux errors
+def _ScaleFluxErrors(Flux, Segments, NormalizationPlan, Uncertainties):
+    if Uncertainties is None:
+        return None, False
+    Supplied = Np.asarray(Uncertainties, dtype=float)
+    if len(Supplied) != len(Flux):
+        return None, False
+
+    # scale the errors along with the flux.
+    Normalized = Supplied.copy()
+    for Start, End in Segments:
+        ResidualScale = NormalizationPlan.get("residual_scale")
+        Scale = abs(float(Np.median(Flux[Start:End])) + (ResidualScale or 0.0))
+        if Scale > 0:
+            Normalized[Start:End] /= Scale
+    Complete = bool(Np.all(Np.isfinite(Normalized)) and Np.all(Normalized > 0))
+    return Normalized, Complete
+
+
+#MARK: plot stuffs
+def _TransitBoxLimits(Time, Transit, RawFlux, CleanFlux, ModelFlux):
+    InWindow = (Time >= Transit["start"]) & (Time <= Transit["end"])
+    Extents = {}
+    for Name, Values in (("raw", RawFlux), ("clean", CleanFlux)):
+        LocalValues = Values[InWindow]
+        if Name == "clean" and ModelFlux is not None:
+            LocalValues = Np.r_[LocalValues, ModelFlux[InWindow]]
+        if not LocalValues.size:
+            continue
+        # one noisy point shouldn't stretch the whole box.
+        Low, High = Np.percentile(LocalValues, [5, 95])
+        Baseline = Transit.get("local_baseline")
+        if Baseline is not None:
+            High = max(High, Baseline)
+        Padding = max((High - Low) * 0.12, 1e-6)
+        Extents[Name] = {
+            "flux_min": float(Low - Padding),
+            "flux_max": float(High + Padding),
+            "low": float(Low - Padding),
+            "high": float(High + Padding),
+        }
+    return Extents
+
+
+#MARK: plot stuffs
+def _MakePlotThing(PlotTime, SearchFlux, ModelFlux, Keep, Breaks, Representation):
+    return {
+        "time": PlotTime.tolist(),
+        "search_flux": SearchFlux[Keep].tolist(),
+        "model_flux": ModelFlux[Keep].tolist(),
+        "residual_flux": (SearchFlux - ModelFlux)[Keep].tolist(),
+        "representation": Representation,
+        "break_indices": Breaks.copy(),
+    }
+
+
+#MARK: analysis settings
+def _PackSettingsThing(Options, Detection, ExposureMetadata, SearchMode):
+    if SearchMode == "tls":
+        DurationPolicy = "Physical TLS stellar-prior/template grid; explicit local dip duration bounds are not applied to TLS."
+        BoundsReason = "Upper period limited by observed baseline / minimum transit count; explicit bounds also applied."
+    else:
+        DurationPolicy = "Explicit or cadence-derived BLS duration bounds."
+        BoundsReason = "Cadence, baseline and explicit period/duration bounds applied to BLS."
+    return {
+        **Options,
+        "stellar_priors": (Detection.get("tls") or {}).get("effective_stellar_priors"),
+        "exposure": ExposureMetadata,
+        "local_dip_settings": {
+            Key: Options.get(Key)
+            for Key in ("strictness", "smoothing", "min_depth", "min_duration", "max_duration")
+        },
+        "search_bounds": {
+            **(Detection.get("period_search") or {}),
+            "min_transits": Options.get("tls_min_transits"),
+            "duration_policy": DurationPolicy,
+            "bounds_reason": BoundsReason,
+        },
+    }
+
+
+
+
+#MARK: old calls
+def analyze(time, flux, options=None, progress_callback=None):
+    return RunCurve(time, flux, options, ProgressCallback=progress_callback)
+
+
+def parse_detection_options(form):
+    return ParseDetectionOptions(form)
+
+
+def normalized_flux_for_tls(time, flux):
+    return NormalizedFluxForTls(time, flux)
+
+
+#MARK: tls funcs
+def estimate_period_with_tls(time, flux, options=None, progress_callback=None):
+    return EstimatePeriodWithTls(time, flux, options, ProgressCallback=progress_callback)

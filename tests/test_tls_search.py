@@ -1,67 +1,68 @@
-import json
+import json as Json
 from pathlib import Path
-import sys
+import sys as Sys
 from types import SimpleNamespace
-import unittest
-from unittest import mock
+import unittest as Unittest
+from unittest import mock as Mock
 
-import numpy as np
+import numpy as Np
 
 
 APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
-sys.path.insert(0, str(APP_DIR))
+Sys.path.insert(0, str(APP_DIR))
 
-import analysis  # noqa: E402
-import tls_search  # noqa: E402
+import analysis as Analysis  # noqa: E402
+import tls_search as TlsSearch  # noqa: E402
 
 
+#MARK: form item
 class FormItem:
-    def __init__(self, value):
-        self.value = value
+    def __init__(self, Value):
+        self.value = Value
 
 
-def tls_options(**overrides):
-    options = dict(analysis.DEFAULT_DETECTION_OPTIONS)
-    options.update({
+#MARK: tls funcs
+def TlsOptions(**Overrides):
+    Options = dict(Analysis.DEFAULT_DETECTION_OPTIONS)
+    Options.update({
         "search_mode": "tls",
         "min_period": 1.5,
         "max_period": 3.5,
         "tls_oversampling": 2,
         "tls_threads": 1,
     })
-    options.update(overrides)
-    return options
+    Options.update(Overrides)
+    return Options
 
 
-def synthetic_light_curve(seed=4, depth=0.006):
-    time = np.linspace(2459000.0, 2459012.0, 1200)
-    period = 2.4
-    epoch = 2459000.7
-    duration = 0.14
-    phase = ((time - epoch + period / 2.0) % period) - period / 2.0
-    triangular_core = np.clip(1.0 - np.abs(phase) / (duration / 2.0), 0.0, 1.0)
-    transit_shape = (0.25 + 0.75 * triangular_core) * (np.abs(phase) < duration / 2.0)
-    flux = 1.0 - depth * transit_shape
-    flux += np.random.default_rng(seed).normal(0.0, 0.0008, len(time))
-    return time, flux, period
+#MARK: synthetic light curve
+def SyntheticLightCurve(Seed=4, Depth=0.006):
+    Time = Np.linspace(2459000.0, 2459012.0, 1200)
+    Period = 2.4
+    Epoch = 2459000.7
+    Duration = 0.14
+    Phase = ((Time - Epoch + Period / 2.0) % Period) - Period / 2.0
+    TriangularCore = Np.clip(1.0 - Np.abs(Phase) / (Duration / 2.0), 0.0, 1.0)
+    TransitShape = (0.25 + 0.75 * TriangularCore) * (Np.abs(Phase) < Duration / 2.0)
+    Flux = 1.0 - Depth * TransitShape
+    Flux += Np.random.default_rng(Seed).normal(0.0, 0.0008, len(Time))
+    return Time, Flux, Period
 
 
-class TLSOptionTests(unittest.TestCase):
-    def test_tls_and_four_workers_are_defaults(self):
-        options = analysis.parse_detection_options({})
+#MARK: tls funcs
+class TLSOptionTests(Unittest.TestCase):
+    def testTlsAndFourWorkersAreDefaults(self):
+        Options = Analysis.ParseDetectionOptions({})
 
-        self.assertEqual(options["search_mode"], "tls")
-        self.assertEqual(options["tls_threads"], 4)
+        self.assertEqual(Options["search_mode"], "tls")
+        self.assertEqual(Options["tls_threads"], 4)
 
-        index_html = (APP_DIR / "static" / "index.html").read_text()
-        app_js = (APP_DIR / "static" / "app.js").read_text()
-        self.assertIn('<option value="tls" selected>Physical TLS</option>', index_html)
-        self.assertIn('id="tlsThreadsInput" type="number" min="1" max="8" step="1" value="4"', index_html)
-        self.assertIn("searchModeInput.value = 'tls';", app_js)
-        self.assertIn("tlsThreadsInput.value = '4';", app_js)
+        IndexHtml = (APP_DIR / "static" / "index.html").read_text()
+        self.assertIn('<option value="tls" selected>Physical TLS</option>', IndexHtml)
+        self.assertIn('id="TlsThreadsInput" type="number" min="1" max="8" step="1" value="4"', IndexHtml)
 
-    def test_parses_physical_tls_options(self):
-        options = analysis.parse_detection_options({
+    def testParsesPhysicalTlsOptions(self):
+        Options = Analysis.ParseDetectionOptions({
             "searchMode": FormItem("tls"),
             "tlsTemplate": FormItem("grazing"),
             "stellarRadius": FormItem("0.82"),
@@ -74,209 +75,210 @@ class TLSOptionTests(unittest.TestCase):
             "tlsMinDepthPpm": FormItem("25"),
             "tlsDurationGridStep": FormItem("1.08"),
         })
-        self.assertEqual(options["search_mode"], "tls")
-        self.assertEqual(options["tls_template"], "grazing")
-        self.assertEqual(options["tls_oversampling"], 4)
-        self.assertEqual(options["tls_min_transits"], 2)
-        self.assertAlmostEqual(options["stellar_radius"], 0.82)
-        self.assertAlmostEqual(options["limb_darkening_u2"], 0.18)
+        self.assertEqual(Options["search_mode"], "tls")
+        self.assertEqual(Options["tls_template"], "grazing")
+        self.assertEqual(Options["tls_oversampling"], 4)
+        self.assertEqual(Options["tls_min_transits"], 2)
+        self.assertAlmostEqual(Options["stellar_radius"], 0.82)
+        self.assertAlmostEqual(Options["limb_darkening_u2"], 0.18)
 
-    def test_requires_both_limb_darkening_coefficients(self):
+    def testRequiresBothLimbDarkeningCoefficients(self):
         with self.assertRaisesRegex(ValueError, "Both limbDarkening"):
-            analysis.parse_detection_options({
+            Analysis.ParseDetectionOptions({
                 "searchMode": FormItem("tls"),
                 "limbDarkeningU1": FormItem("0.4"),
             })
 
-    def test_transit_stack_view_replaces_manual_box_editor(self):
-        index_html = (APP_DIR / "static" / "index.html").read_text()
-        app_js = (APP_DIR / "static" / "app.js").read_text()
+    def testTransitStackViewReplacesManualBoxEditor(self):
+        IndexHtml = (APP_DIR / "static" / "index.html").read_text()
+        AppJs = (APP_DIR / "static" / "app.js").read_text()
 
-        self.assertIn('data-view="stack">Transit stack</button>', index_html)
-        self.assertIn("function drawTransitStackChart(geo)", app_js)
-        self.assertNotIn("Edit boxes", index_html)
-        self.assertNotIn("editBoxesButton", app_js)
+        self.assertIn('data-view="stack">Transit stack</button>', IndexHtml)
+        self.assertIn("function DrawTransitStackChart(Geo)", AppJs)
+        self.assertNotIn("Edit boxes", IndexHtml)
+        self.assertNotIn("editBoxesButton", AppJs)
 
 
-class TLSSearchTests(unittest.TestCase):
-    def test_transit_stack_aligns_and_normalizes_individual_events(self):
-        time = np.linspace(0.0, 8.0, 4001)
-        period = 2.0
-        duration = 0.16
-        centers = [1.0, 3.0, 5.0, 7.0]
-        flux = 1.0 + 0.0004 * (time - 4.0)
-        for center in centers:
-            phase = np.abs(time - center)
-            shape = np.clip(1.0 - phase / (duration / 2.0), 0.0, 1.0)
-            flux -= 0.012 * shape
-        transits = [
+#MARK: tls funcs
+class TLSSearchTests(Unittest.TestCase):
+    def testTransitStackAlignsAndNormalizesIndividualEvents(self):
+        Time = Np.linspace(0.0, 8.0, 4001)
+        Period = 2.0
+        Duration = 0.16
+        Centers = [1.0, 3.0, 5.0, 7.0]
+        Flux = 1.0 + 0.0004 * (Time - 4.0)
+        for Center in Centers:
+            Phase = Np.abs(Time - Center)
+            Shape = Np.clip(1.0 - Phase / (Duration / 2.0), 0.0, 1.0)
+            Flux -= 0.012 * Shape
+        Transits = [
             {
-                "center": center,
-                "start": center - duration / 2.0,
-                "end": center + duration / 2.0,
-                "duration": duration,
+                "center": Center,
+                "start": Center - Duration / 2.0,
+                "end": Center + Duration / 2.0,
+                "duration": Duration,
             }
-            for center in centers
+            for Center in Centers
         ]
 
-        stack = analysis.build_transit_stack(time, flux, transits, period, duration)
+        Stack = Analysis.BuildTransitStack(Time, Flux, Transits, Period, Duration)
 
-        self.assertIsNotNone(stack)
-        self.assertEqual(len(stack["traces"]), len(centers))
-        self.assertTrue(all(trace["point_count"] > 100 for trace in stack["traces"]))
+        self.assertIsNotNone(Stack)
+        self.assertEqual(len(Stack["traces"]), len(Centers))
+        self.assertTrue(all(Trace["point_count"] > 100 for Trace in Stack["traces"]))
         self.assertTrue(all(
-            min(trace["phase_days"]) < 0 < max(trace["phase_days"])
-            for trace in stack["traces"]
+            min(Trace["phase_days"]) < 0 < max(Trace["phase_days"])
+            for Trace in Stack["traces"]
         ))
-        median_phase = np.asarray(stack["median_phase_days"])
-        median_flux = np.asarray(stack["median_flux"])
-        self.assertLess(float(np.min(median_flux[np.abs(median_phase) < 0.02])), 0.99)
-        shoulder = median_flux[np.abs(median_phase) > duration]
-        self.assertAlmostEqual(float(np.median(shoulder)), 1.0, delta=0.001)
-        self.assertGreater(stack["window_half_width"], duration)
-        json.dumps(stack)
+        MedianPhase = Np.asarray(Stack["median_phase_days"])
+        MedianFlux = Np.asarray(Stack["median_flux"])
+        self.assertLess(float(Np.min(MedianFlux[Np.abs(MedianPhase) < 0.02])), 0.99)
+        Shoulder = MedianFlux[Np.abs(MedianPhase) > Duration]
+        self.assertAlmostEqual(float(Np.median(Shoulder)), 1.0, delta=0.001)
+        self.assertGreater(Stack["window_half_width"], Duration)
+        Json.dumps(Stack)
 
-    def test_zero_centered_ppm_flux_is_converted_before_segment_normalization(self):
-        time_values = np.linspace(0.0, 20.0, 2001)
-        residual_ppm = np.random.default_rng(14).normal(3.0, 110.0, len(time_values))
-        residual_ppm[995:1006] -= 450.0
+    def testZeroCenteredPpmFluxIsConvertedBeforeSegmentNormalization(self):
+        TimeValues = Np.linspace(0.0, 20.0, 2001)
+        ResidualPpm = Np.random.default_rng(14).normal(3.0, 110.0, len(TimeValues))
+        ResidualPpm[995:1006] -= 450.0
 
-        normalized, segments = analysis.normalize_flux_by_segments(
-            time_values,
-            residual_ppm,
+        Normalized, Segments = Analysis.NormalizeFluxBySegments(
+            TimeValues,
+            ResidualPpm,
         )
-        plan = analysis.flux_normalization_plan(residual_ppm)
-        tls_flux, _ = analysis.normalized_flux_for_tls(time_values, residual_ppm)
+        Plan = Analysis.FluxNormalizationPlan(ResidualPpm)
+        TlsFlux, _ = Analysis.NormalizedFluxForTls(TimeValues, ResidualPpm)
 
-        self.assertEqual(segments, [(0, len(time_values))])
-        self.assertEqual(plan["input_representation"], "zero-centered residual flux (ppm)")
-        self.assertEqual(plan["residual_scale"], 1000000.0)
-        self.assertAlmostEqual(float(np.median(normalized)), 1.0, delta=1e-12)
-        self.assertGreater(float(np.min(normalized)), 0.999)
-        self.assertLess(float(np.max(normalized)), 1.001)
-        self.assertAlmostEqual(float(np.median(tls_flux)), 1.0, delta=1e-12)
-        self.assertGreater(float(np.min(tls_flux)), 0.999)
-        self.assertLess(float(np.max(tls_flux)), 1.001)
+        self.assertEqual(Segments, [(0, len(TimeValues))])
+        self.assertEqual(Plan["input_representation"], "zero-centered residual flux (ppm)")
+        self.assertEqual(Plan["residual_scale"], 1000000.0)
+        self.assertAlmostEqual(float(Np.median(Normalized)), 1.0, delta=1e-12)
+        self.assertGreater(float(Np.min(Normalized)), 0.999)
+        self.assertLess(float(Np.max(Normalized)), 1.001)
+        self.assertAlmostEqual(float(Np.median(TlsFlux)), 1.0, delta=1e-12)
+        self.assertGreater(float(Np.min(TlsFlux)), 0.999)
+        self.assertLess(float(Np.max(TlsFlux)), 1.001)
 
-    def test_absolute_relative_flux_keeps_fractional_transit_depth(self):
-        time_values = np.linspace(0.0, 10.0, 1001)
-        relative_flux = np.ones_like(time_values)
-        relative_flux[495:506] = 0.99
+    def testAbsoluteRelativeFluxKeepsFractionalTransitDepth(self):
+        TimeValues = Np.linspace(0.0, 10.0, 1001)
+        RelativeFlux = Np.ones_like(TimeValues)
+        RelativeFlux[495:506] = 0.99
 
-        normalized, _ = analysis.normalize_flux_by_segments(
-            time_values,
-            relative_flux,
+        Normalized, _ = Analysis.NormalizeFluxBySegments(
+            TimeValues,
+            RelativeFlux,
         )
-        plan = analysis.flux_normalization_plan(relative_flux)
+        Plan = Analysis.FluxNormalizationPlan(RelativeFlux)
 
-        self.assertEqual(plan["input_representation"], "absolute or relative flux")
-        self.assertIsNone(plan["residual_scale"])
-        self.assertAlmostEqual(float(np.median(normalized)), 1.0)
-        self.assertAlmostEqual(float(np.min(normalized)), 0.99)
+        self.assertEqual(Plan["input_representation"], "absolute or relative flux")
+        self.assertIsNone(Plan["residual_scale"])
+        self.assertAlmostEqual(float(Np.median(Normalized)), 1.0)
+        self.assertAlmostEqual(float(Np.min(Normalized)), 0.99)
 
-    def test_recovers_transit_with_reference_tls(self):
-        time, flux, injected_period = synthetic_light_curve()
-        result = analysis.analyze(time, flux, tls_options())
+    def testRecoversTransitWithReferenceTls(self):
+        Time, Flux, InjectedPeriod = SyntheticLightCurve()
+        Result = Analysis.RunCurve(Time, Flux, TlsOptions())
 
-        self.assertEqual(result["period_method"], "TLS")
-        self.assertAlmostEqual(result["period"], injected_period, delta=0.02)
-        self.assertGreaterEqual(result["period_sde"], 7.0)
-        self.assertLessEqual(result["tls_fap"], 0.01)
-        self.assertGreaterEqual(len(result["transits"]), 4)
-        self.assertTrue(all(item.get("source") == "TLS model" for item in result["transits"]))
-        self.assertGreater(len(result["transit_model"]["folded_phase_days"]), 100)
-        self.assertEqual(result["planet_assessment"]["status"], "strong_candidate")
-        json.dumps(result)
+        self.assertEqual(Result["period_method"], "TLS")
+        self.assertAlmostEqual(Result["period"], InjectedPeriod, delta=0.02)
+        self.assertGreaterEqual(Result["period_sde"], 7.0)
+        self.assertLessEqual(Result["tls_fap"], 0.01)
+        self.assertGreaterEqual(len(Result["transits"]), 4)
+        self.assertTrue(all(Item.get("source") == "TLS model" for Item in Result["transits"]))
+        self.assertGreater(len(Result["transit_model"]["folded_phase_days"]), 100)
+        self.assertEqual(Result["planet_assessment"]["status"], "strong_candidate")
+        Json.dumps(Result)
 
-    def test_noise_does_not_become_candidate(self):
-        time = np.linspace(2459000.0, 2459012.0, 1200)
-        flux = 1.0 + np.random.default_rng(41).normal(0.0, 0.0008, len(time))
-        result = analysis.analyze(time, flux, tls_options())
+    def testNoiseDoesNotBecomeCandidate(self):
+        Time = Np.linspace(2459000.0, 2459012.0, 1200)
+        Flux = 1.0 + Np.random.default_rng(41).normal(0.0, 0.0008, len(Time))
+        Result = Analysis.RunCurve(Time, Flux, TlsOptions())
 
-        self.assertLess(result["period_sde"], 5.0)
-        self.assertEqual(result["planet_assessment"]["status"], "no_planet_like_signal")
-        self.assertLessEqual(result["planet_assessment"]["candidate_score"], 44)
+        self.assertLess(Result["period_sde"], 5.0)
+        self.assertEqual(Result["planet_assessment"]["status"], "no_planet_like_signal")
+        self.assertLessEqual(Result["planet_assessment"]["candidate_score"], 44)
 
-    def test_bls_runtime_failure_uses_binned_fallback(self):
+    def testBlsRuntimeFailureUsesBinnedFallback(self):
         class BrokenBLS:
-            def __init__(self, *args, **kwargs):
+            def __init__(self, *Args, **Kwargs):
                 pass
 
-            def power(self, *args, **kwargs):
+            def power(self, *Args, **Kwargs):
                 raise RuntimeError("forced BLS failure")
 
-        sentinel = {"method": "binned BLS fallback", "period": 2.0}
-        time = np.linspace(0.0, 10.0, 100)
-        flux = np.ones_like(time)
-        with mock.patch.object(analysis, "BoxLeastSquares", BrokenBLS), mock.patch.object(
-            analysis,
-            "estimate_period_with_binned_bls",
-            return_value=sentinel,
-        ) as fallback:
-            result = analysis.estimate_period_with_bls(time, flux)
+        Sentinel = {"method": "binned BLS fallback", "period": 2.0}
+        Time = Np.linspace(0.0, 10.0, 100)
+        Flux = Np.ones_like(Time)
+        with Mock.patch.object(Analysis, "BoxLeastSquares", BrokenBLS), Mock.patch.object(
+            Analysis,
+            "EstimatePeriodWithBinnedBls",
+            return_value=Sentinel,
+        ) as Fallback:
+            Result = Analysis.EstimatePeriodWithBls(Time, Flux)
 
-        self.assertIs(result, sentinel)
-        fallback.assert_called_once()
+        self.assertIs(Result, Sentinel)
+        Fallback.assert_called_once()
 
-    def test_model_compaction_preserves_narrow_transit_bottoms(self):
-        time_values = np.arange(200000, dtype=float)
-        flux_values = np.ones_like(time_values)
-        transit_indices = np.arange(1000, 199000, 5000)
-        flux_values[transit_indices] = 0.975
+    def testModelCompactionPreservesNarrowTransitBottoms(self):
+        TimeValues = Np.arange(200000, dtype=float)
+        FluxValues = Np.ones_like(TimeValues)
+        TransitIndices = Np.arange(1000, 199000, 5000)
+        FluxValues[TransitIndices] = 0.975
 
-        compact_time, compact_flux = tls_search.compact_model(
-            time_values,
-            flux_values,
-            max_points=2000,
+        CompactTime, CompactFlux = TlsSearch.CompactModel(
+            TimeValues,
+            FluxValues,
+            MaxPoints=2000,
         )
 
-        kept_times = set(np.asarray(compact_time, dtype=int).tolist())
-        self.assertTrue(set(transit_indices.tolist()).issubset(kept_times))
-        self.assertEqual(min(compact_flux), 0.975)
-        self.assertLessEqual(len(compact_time), 2000)
+        KeptTimes = set(Np.asarray(CompactTime, dtype=int).tolist())
+        self.assertTrue(set(TransitIndices.tolist()).issubset(KeptTimes))
+        self.assertEqual(min(CompactFlux), 0.975)
+        self.assertLessEqual(len(CompactTime), 2000)
 
-    def test_duration_is_measured_from_folded_physical_model(self):
-        phase = np.linspace(-0.5, 0.5, 10001)
-        flux = np.ones_like(phase)
-        flux[np.abs(phase) <= 0.02] = 0.98
+    def testDurationIsMeasuredFromFoldedPhysicalModel(self):
+        Phase = Np.linspace(-0.5, 0.5, 10001)
+        Flux = Np.ones_like(Phase)
+        Flux[Np.abs(Phase) <= 0.02] = 0.98
 
-        duration = tls_search.duration_from_folded_model(phase, flux, period=1.0)
+        Duration = TlsSearch.DurationFromFoldedModel(Phase, Flux, Period=1.0)
 
-        self.assertAlmostEqual(duration, 0.04, delta=0.0003)
+        self.assertAlmostEqual(Duration, 0.04, delta=0.0003)
 
-    def test_unfolded_tls_model_restores_gap_compressed_duration(self):
-        period = 1.0
-        centers = np.arange(0.5, 4.0, period)
-        model_time = np.concatenate([
-            np.linspace(center - period / 2.0, center + period / 2.0, 1001)
-            for center in centers
+    def testUnfoldedTlsModelRestoresGapCompressedDuration(self):
+        Period = 1.0
+        Centers = Np.arange(0.5, 4.0, Period)
+        ModelTime = Np.concatenate([
+            Np.linspace(Center - Period / 2.0, Center + Period / 2.0, 1001)
+            for Center in Centers
         ])
-        model_flux = np.concatenate([
-            np.where(
-                np.abs(np.linspace(-period / 2.0, period / 2.0, 1001)) <= 0.05,
+        ModelFlux = Np.concatenate([
+            Np.where(
+                Np.abs(Np.linspace(-Period / 2.0, Period / 2.0, 1001)) <= 0.05,
                 0.98,
                 1.0,
             )
-            for _ in centers
+            for _ in Centers
         ])
-        folded_phase = np.linspace(0.0, 1.0, 1001)
-        compressed_folded_flux = np.where(np.abs(folded_phase - 0.5) <= 0.025, 0.98, 1.0)
-        fake_result = SimpleNamespace(
-            period=period,
+        FoldedPhase = Np.linspace(0.0, 1.0, 1001)
+        CompressedFoldedFlux = Np.where(Np.abs(FoldedPhase - 0.5) <= 0.025, 0.98, 1.0)
+        FakeResult = SimpleNamespace(
+            period=Period,
             duration=0.05,
-            T0=centers[0],
-            periods=np.asarray([0.9, period, 1.1]),
-            power=np.asarray([1.0, 9.0, 1.0]),
-            power_raw=np.asarray([1.0, 9.0, 1.0]),
-            model_lightcurve_time=model_time,
-            model_lightcurve_model=model_flux,
-            model_folded_phase=folded_phase,
-            model_folded_model=compressed_folded_flux,
-            transit_times=centers,
-            transit_depths=np.full(len(centers), 0.98),
-            per_transit_count=np.full(len(centers), 100),
-            transit_count=len(centers),
-            distinct_transit_count=len(centers),
+            T0=Centers[0],
+            periods=Np.asarray([0.9, Period, 1.1]),
+            power=Np.asarray([1.0, 9.0, 1.0]),
+            power_raw=Np.asarray([1.0, 9.0, 1.0]),
+            model_lightcurve_time=ModelTime,
+            model_lightcurve_model=ModelFlux,
+            model_folded_phase=FoldedPhase,
+            model_folded_model=CompressedFoldedFlux,
+            transit_times=Centers,
+            transit_depths=Np.full(len(Centers), 0.98),
+            per_transit_count=Np.full(len(Centers), 100),
+            transit_count=len(Centers),
+            distinct_transit_count=len(Centers),
             empty_transit_count=0,
             depth=0.98,
             SDE=9.0,
@@ -284,17 +286,17 @@ class TLSSearchTests(unittest.TestCase):
             FAP=0.001,
             snr=20.0,
         )
-        fake_model = mock.Mock()
-        fake_model.power.return_value = fake_result
-        observed_time = np.r_[
-            np.linspace(0.0, 1.0, 1001),
-            np.linspace(3.0, 4.0, 1001),
+        FakeModel = Mock.Mock()
+        FakeModel.power.return_value = FakeResult
+        ObservedTime = Np.r_[
+            Np.linspace(0.0, 1.0, 1001),
+            Np.linspace(3.0, 4.0, 1001),
         ]
 
-        with mock.patch.object(tls_search, "transitleastsquares", return_value=fake_model):
-            result = tls_search.run_tls_search(
-                observed_time,
-                np.ones_like(observed_time),
+        with Mock.patch.object(TlsSearch, "Transitleastsquares", return_value=FakeModel):
+            Result = TlsSearch.RunTlsSearch(
+                ObservedTime,
+                Np.ones_like(ObservedTime),
                 {
                     "period_min": 0.8,
                     "period_max": 1.2,
@@ -302,176 +304,176 @@ class TLSSearchTests(unittest.TestCase):
                 },
             )
 
-        self.assertAlmostEqual(result["folded_engine_duration"], 0.05, delta=0.002)
-        self.assertAlmostEqual(result["duration"], 0.10, delta=0.002)
-        self.assertAlmostEqual(result["unfolded_model_duration"], 0.10, delta=0.002)
-        self.assertAlmostEqual(result["sampling_fill_factor"], 0.5, delta=0.002)
-        self.assertAlmostEqual(result["uncompressed_duration"], 0.10, delta=0.002)
+        self.assertAlmostEqual(Result["folded_engine_duration"], 0.05, delta=0.002)
+        self.assertAlmostEqual(Result["duration"], 0.10, delta=0.002)
+        self.assertAlmostEqual(Result["unfolded_model_duration"], 0.10, delta=0.002)
+        self.assertAlmostEqual(Result["sampling_fill_factor"], 0.5, delta=0.002)
+        self.assertAlmostEqual(Result["uncompressed_duration"], 0.10, delta=0.002)
         self.assertEqual(
-            result["duration_source"],
+            Result["duration_source"],
             "TLS duration with sampling-gap compression removed",
         )
-        folded_phase = np.asarray(result["model"]["folded_phase_days"])
-        folded_flux = np.asarray(result["model"]["folded_flux"])
-        contact_indices = np.flatnonzero(
-            np.isclose(np.abs(folded_phase), result["duration"] / 2.0)
+        FoldedPhase = Np.asarray(Result["model"]["folded_phase_days"])
+        FoldedFlux = Np.asarray(Result["model"]["folded_flux"])
+        ContactIndices = Np.flatnonzero(
+            Np.isclose(Np.abs(FoldedPhase), Result["duration"] / 2.0)
         )
-        self.assertEqual(contact_indices.size, 2)
-        self.assertTrue(np.allclose(folded_flux[contact_indices], 1.0))
+        self.assertEqual(ContactIndices.size, 2)
+        self.assertTrue(Np.allclose(FoldedFlux[ContactIndices], 1.0))
 
-    def test_observed_duration_refinement_covers_ingress_and_egress(self):
-        time_values = np.linspace(0.0, 8.0, 8001)
-        period = 1.0
-        epoch = 0.5
-        phase = ((time_values - epoch + period / 2.0) % period) - period / 2.0
-        flux_values = np.ones_like(time_values)
-        flux_values[np.abs(phase) <= 0.05] = 0.98
-        flux_values += np.random.default_rng(91).normal(0.0, 0.0001, len(flux_values))
+    def testObservedDurationRefinementCoversIngressAndEgress(self):
+        TimeValues = Np.linspace(0.0, 8.0, 8001)
+        Period = 1.0
+        Epoch = 0.5
+        Phase = ((TimeValues - Epoch + Period / 2.0) % Period) - Period / 2.0
+        FluxValues = Np.ones_like(TimeValues)
+        FluxValues[Np.abs(Phase) <= 0.05] = 0.98
+        FluxValues += Np.random.default_rng(91).normal(0.0, 0.0001, len(FluxValues))
 
-        refinement = tls_search.observed_phase_folded_duration(
-            time_values,
-            flux_values,
-            period,
-            epoch,
-            seed_duration=0.06,
+        Refinement = TlsSearch.ObservedPhaseFoldedDuration(
+            TimeValues,
+            FluxValues,
+            Period,
+            Epoch,
+            SeedDuration=0.06,
         )
 
-        self.assertIsNotNone(refinement)
-        self.assertLessEqual(refinement["measured_start"], -0.049)
-        self.assertGreaterEqual(refinement["measured_end"], 0.049)
-        self.assertGreaterEqual(refinement["duration"], 0.10)
-        self.assertLess(refinement["duration"], 0.13)
+        self.assertIsNotNone(Refinement)
+        self.assertLessEqual(Refinement["measured_start"], -0.049)
+        self.assertGreaterEqual(Refinement["measured_end"], 0.049)
+        self.assertGreaterEqual(Refinement["duration"], 0.10)
+        self.assertLess(Refinement["duration"], 0.13)
 
-    def test_rescaled_folded_model_is_centered_inside_duration_box(self):
-        phase = np.linspace(-0.5, 0.5, 1001)
-        shifted_model = np.where(
-            (phase >= -0.07) & (phase <= 0.03),
+    def testRescaledFoldedModelIsCenteredInsideDurationBox(self):
+        Phase = Np.linspace(-0.5, 0.5, 1001)
+        ShiftedModel = Np.where(
+            (Phase >= -0.07) & (Phase <= 0.03),
             0.98,
             1.0,
         )
 
-        scaled_phase, scaled_flux = tls_search.rescale_folded_model_duration(
-            phase,
-            shifted_model,
-            target_duration=0.06,
-            period=1.0,
+        ScaledPhase, ScaledFlux = TlsSearch.RescaleFoldedModelDuration(
+            Phase,
+            ShiftedModel,
+            TargetDuration=0.06,
+            Period=1.0,
         )
-        support = scaled_phase[scaled_flux < 0.999]
-        left_contact = int(np.argmin(np.abs(scaled_phase + 0.03)))
-        right_contact = int(np.argmin(np.abs(scaled_phase - 0.03)))
+        Support = ScaledPhase[ScaledFlux < 0.999]
+        LeftContact = int(Np.argmin(Np.abs(ScaledPhase + 0.03)))
+        RightContact = int(Np.argmin(Np.abs(ScaledPhase - 0.03)))
 
-        self.assertAlmostEqual(float(scaled_phase[left_contact]), -0.03, delta=1e-9)
-        self.assertAlmostEqual(float(scaled_phase[right_contact]), 0.03, delta=1e-9)
-        self.assertAlmostEqual(float(scaled_flux[left_contact]), 1.0)
-        self.assertAlmostEqual(float(scaled_flux[right_contact]), 1.0)
-        self.assertGreater(float(np.min(support)), -0.03)
-        self.assertLess(float(np.max(support)), 0.03)
+        self.assertAlmostEqual(float(ScaledPhase[LeftContact]), -0.03, delta=1e-9)
+        self.assertAlmostEqual(float(ScaledPhase[RightContact]), 0.03, delta=1e-9)
+        self.assertAlmostEqual(float(ScaledFlux[LeftContact]), 1.0)
+        self.assertAlmostEqual(float(ScaledFlux[RightContact]), 1.0)
+        self.assertGreater(float(Np.min(Support)), -0.03)
+        self.assertLess(float(Np.max(Support)), 0.03)
 
-    def test_observation_aligned_model_keeps_every_visible_transit(self):
-        time_values = np.linspace(0.0, 10.0, 10001)
-        period = 1.0
-        epoch = 0.2
-        folded_phase = np.linspace(-0.5, 0.5, 2001)
-        transit_shape = np.clip(1.0 - np.abs(folded_phase) / 0.025, 0.0, 1.0)
-        folded_flux = 1.0 - 0.02 * transit_shape
-        model = {
-            "folded_phase_days": folded_phase.tolist(),
-            "folded_flux": folded_flux.tolist(),
+    def testObservationAlignedModelKeepsEveryVisibleTransit(self):
+        TimeValues = Np.linspace(0.0, 10.0, 10001)
+        Period = 1.0
+        Epoch = 0.2
+        FoldedPhase = Np.linspace(-0.5, 0.5, 2001)
+        TransitShape = Np.clip(1.0 - Np.abs(FoldedPhase) / 0.025, 0.0, 1.0)
+        FoldedFlux = 1.0 - 0.02 * TransitShape
+        Model = {
+            "folded_phase_days": FoldedPhase.tolist(),
+            "folded_flux": FoldedFlux.tolist(),
         }
 
-        aligned = analysis.model_flux_at_observations(
-            time_values,
-            period,
-            epoch,
-            model,
+        Aligned = Analysis.ModelFluxAtObservations(
+            TimeValues,
+            Period,
+            Epoch,
+            Model,
         )
-        smoothed = analysis.moving_average_by_segments(
-            aligned,
+        Smoothed = Analysis.MovingAverageBySegments(
+            Aligned,
             21,
-            [(0, len(time_values))],
+            [(0, len(TimeValues))],
         )
-        keep = analysis.downsample_indices_for_series(
-            [np.ones_like(smoothed), smoothed],
-            max_points=400,
+        Keep = Analysis.DownsampleIndicesForSeries(
+            [Np.ones_like(Smoothed), Smoothed],
+            MaxPoints=400,
         )
-        compact_time = time_values[keep]
-        compact_flux = smoothed[keep]
+        CompactTime = TimeValues[Keep]
+        CompactFlux = Smoothed[Keep]
 
-        for center in np.arange(epoch, time_values[-1], period):
-            nearby = np.abs(compact_time - center) <= 0.03
-            self.assertTrue(np.any(nearby), f"missing model samples near {center}")
-            self.assertLess(float(np.min(compact_flux[nearby])), 0.99)
+        for Center in Np.arange(Epoch, TimeValues[-1], Period):
+            Nearby = Np.abs(CompactTime - Center) <= 0.03
+            self.assertTrue(Np.any(Nearby), f"missing model samples near {Center}")
+            self.assertLess(float(Np.min(CompactFlux[Nearby])), 0.99)
 
-    def test_plot_smoothing_cannot_average_over_whole_transit(self):
-        cadence = 2.0 / (24.0 * 60.0)
-        duration = 0.0232
+    def testPlotSmoothingCannotAverageOverWholeTransit(self):
+        Cadence = 2.0 / (24.0 * 60.0)
+        Duration = 0.0232
 
-        width = analysis.transit_preserving_smoothing_width(
-            requested_width=95,
-            cadence=cadence,
-            duration=duration,
-        )
-
-        self.assertEqual(width, 5)
-        self.assertLess(width * cadence, duration / 2.0)
-
-    def test_smoothed_tls_box_bounds_cover_filter_radius(self):
-        display_start, display_end = analysis.smoothed_transit_display_bounds(
-            start=1.0,
-            end=1.1,
-            cadence=0.01,
-            smooth_width=5,
-            domain_min=0.0,
-            domain_max=2.0,
+        Width = Analysis.TransitPreservingSmoothingWidth(
+            RequestedWidth=95,
+            Cadence=Cadence,
+            Duration=Duration,
         )
 
-        self.assertAlmostEqual(display_start, 0.98)
-        self.assertAlmostEqual(display_end, 1.12)
+        self.assertEqual(Width, 5)
+        self.assertLess(Width * Cadence, Duration / 2.0)
 
-    def test_phase_folded_bins_preserve_individual_transit_shape(self):
-        cadence = 10.0 / (24.0 * 60.0)
-        time_values = np.arange(0.0, 60.0, cadence)
-        period = 3.5
-        epoch = 1.2
-        duration = 0.15
-        phase = ((time_values - epoch + period / 2.0) % period) - period / 2.0
-        absolute_phase = np.abs(phase)
-        transit_profile = np.zeros_like(phase)
-        transit_profile[absolute_phase <= 0.045] = 1.0
-        ingress = (absolute_phase > 0.045) & (absolute_phase < duration / 2.0)
-        transit_profile[ingress] = (
-            duration / 2.0 - absolute_phase[ingress]
-        ) / (duration / 2.0 - 0.045)
-        flux_values = 1.0 - 0.016 * transit_profile
-
-        folded = analysis.build_phase_folded_plot(
-            time_values,
-            flux_values,
-            flux_values,
-            period,
-            epoch,
-            duration,
+    def testSmoothedTlsBoxBoundsCoverFilterRadius(self):
+        DisplayStart, DisplayEnd = Analysis.SmoothedTransitDisplayBounds(
+            Start=1.0,
+            End=1.1,
+            Cadence=0.01,
+            SmoothWidth=5,
+            DomainMin=0.0,
+            DomainMax=2.0,
         )
-        binned_phase = np.asarray(folded["binned_phase"])
-        binned_flux = np.asarray(folded["binned_flux"])
-        in_transit_bins = np.abs(binned_phase) <= duration / 2.0
-        outside_transit = (np.abs(binned_phase) >= 0.11) & (np.abs(binned_phase) <= 0.18)
 
-        self.assertGreaterEqual(np.count_nonzero(in_transit_bins), 16)
-        self.assertLess(float(np.min(binned_flux[in_transit_bins])), 0.985)
-        self.assertGreater(float(np.min(binned_flux[outside_transit])), 0.999)
+        self.assertAlmostEqual(DisplayStart, 0.98)
+        self.assertAlmostEqual(DisplayEnd, 1.12)
 
-    def test_segment_smoothing_does_not_bridge_observation_gaps(self):
-        values = np.r_[np.zeros(20), np.ones(20)]
-        smoothed = analysis.moving_average_by_segments(
-            values,
+    def testPhaseFoldedBinsPreserveIndividualTransitShape(self):
+        Cadence = 10.0 / (24.0 * 60.0)
+        TimeValues = Np.arange(0.0, 60.0, Cadence)
+        Period = 3.5
+        Epoch = 1.2
+        Duration = 0.15
+        Phase = ((TimeValues - Epoch + Period / 2.0) % Period) - Period / 2.0
+        AbsolutePhase = Np.abs(Phase)
+        TransitProfile = Np.zeros_like(Phase)
+        TransitProfile[AbsolutePhase <= 0.045] = 1.0
+        Ingress = (AbsolutePhase > 0.045) & (AbsolutePhase < Duration / 2.0)
+        TransitProfile[Ingress] = (
+            Duration / 2.0 - AbsolutePhase[Ingress]
+        ) / (Duration / 2.0 - 0.045)
+        FluxValues = 1.0 - 0.016 * TransitProfile
+
+        Folded = Analysis.MakePhasePlot(
+            TimeValues,
+            FluxValues,
+            FluxValues,
+            Period,
+            Epoch,
+            Duration,
+        )
+        BinnedPhase = Np.asarray(Folded["binned_phase"])
+        BinnedFlux = Np.asarray(Folded["binned_flux"])
+        InTransitBins = Np.abs(BinnedPhase) <= Duration / 2.0
+        OutsideTransit = (Np.abs(BinnedPhase) >= 0.11) & (Np.abs(BinnedPhase) <= 0.18)
+
+        self.assertGreaterEqual(Np.count_nonzero(InTransitBins), 16)
+        self.assertLess(float(Np.min(BinnedFlux[InTransitBins])), 0.985)
+        self.assertGreater(float(Np.min(BinnedFlux[OutsideTransit])), 0.999)
+
+    def testSegmentSmoothingDoesNotBridgeObservationGaps(self):
+        Values = Np.r_[Np.zeros(20), Np.ones(20)]
+        Smoothed = Analysis.MovingAverageBySegments(
+            Values,
             9,
             [(0, 20), (20, 40)],
         )
 
-        self.assertTrue(np.allclose(smoothed[:20], 0.0))
-        self.assertTrue(np.allclose(smoothed[20:], 1.0))
+        self.assertTrue(Np.allclose(Smoothed[:20], 0.0))
+        self.assertTrue(Np.allclose(Smoothed[20:], 1.0))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    Unittest.RunApp()

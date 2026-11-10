@@ -1,136 +1,139 @@
 """Exercise real upload/job/cache HTTP boundaries with isolated temporary state."""
-import contextlib
+import contextlib as Contextlib
 from http.server import ThreadingHTTPServer
-import io
-import json
+import io as Io
+import json as Json
 from pathlib import Path
-import sys
-import tempfile
-import threading
-import time
-import unittest
+import sys as Sys
+import tempfile as Tempfile
+import threading as Threading
+import time as Time
+import unittest as Unittest
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen as Urlopen
 
-import numpy as np
+import numpy as Np
 
 APP_DIR = Path(__file__).resolve().parents[1] / 'Exoplanet data parsing tool'
-sys.path.insert(0, str(APP_DIR))
+Sys.path.insert(0, str(APP_DIR))
 from analysis_jobs import AnalysisJobManager
 from main import TransitRequestHandler
 from session_cache import SessionCacheManager
 
 
+#MARK: quiet handler
 class QuietHandler(TransitRequestHandler):
-    def log_message(self, *args):
+    def log_message(self, *Args):
         pass
 
 
-def multipart(fields, filename='injected.csv', content=None):
-    boundary = 'transit-integration-boundary'
-    if content is None:
-        t = np.linspace(2459000, 2459010, 1000)
-        phase = ((t - 2459000.7 + 1) % 2) - 1
-        f = 1 - .009 * (np.abs(phase) < .06)
-        f += np.random.default_rng(623).normal(0, .0003, len(t))
-        content = 'Time,Flux,Flux_err\n' + '\n'.join(f'{a:.10f},{b:.10f},0.0003' for a,b in zip(t,f))
-    pieces = []
-    for name, value in fields.items():
-        pieces.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n')
-    pieces.append(f'--{boundary}\r\nContent-Disposition: form-data; name="datafile"; filename="{filename}"\r\nContent-Type: text/csv\r\n\r\n{content}\r\n--{boundary}--\r\n')
-    return ''.join(pieces).encode(), f'multipart/form-data; boundary={boundary}'
+#MARK: multipart
+def Multipart(Fields, Filename='injected.csv', Content=None):
+    Boundary = 'transit-integration-boundary'
+    if Content is None:
+        T = Np.linspace(2459000, 2459010, 1000)
+        Phase = ((T - 2459000.7 + 1) % 2) - 1
+        F = 1 - .009 * (Np.abs(Phase) < .06)
+        F += Np.random.default_rng(623).normal(0, .0003, len(T))
+        Content = 'Time,Flux,Flux_err\n' + '\n'.join(f'{A:.10f},{B:.10f},0.0003' for A,B in zip(T,F))
+    Pieces = []
+    for Name, Value in Fields.items():
+        Pieces.append(f'--{Boundary}\r\nContent-Disposition: form-data; name="{Name}"\r\n\r\n{Value}\r\n')
+    Pieces.append(f'--{Boundary}\r\nContent-Disposition: form-data; name="datafile"; filename="{Filename}"\r\nContent-Type: text/csv\r\n\r\n{Content}\r\n--{Boundary}--\r\n')
+    return ''.join(Pieces).encode(), f'multipart/form-data; boundary={Boundary}'
 
 
-class HTTPIntegrationTests(unittest.TestCase):
+#MARK: web stuffs
+class HTTPIntegrationTests(Unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.directory = tempfile.TemporaryDirectory(prefix='transit-http-')
+        cls.Directory = Tempfile.TemporaryDirectory(prefix='transit-http-')
         cls.server = ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
-        cls.server.analysis_jobs = AnalysisJobManager()
-        cls.server.session_cache = SessionCacheManager(default_directory=cls.directory.name)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.base = f'http://127.0.0.1:{cls.server.server_port}'
+        cls.server.AnalysisJobs = AnalysisJobManager()
+        cls.server.RunCache = SessionCacheManager(DefaultDirectory=cls.Directory.name)
+        cls.Thread = Threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.Thread.start()
+        cls.Base = f'http://127.0.0.1:{cls.server.server_port}'
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
-        cls.server.analysis_jobs.shutdown()
+        cls.server.AnalysisJobs.shutdown()
         cls.server.server_close()
-        cls.thread.join(timeout=3)
-        cls.directory.cleanup()
+        cls.Thread.join(timeout=3)
+        cls.Directory.cleanup()
 
-    def request(self, path, method='GET', data=None, content_type='application/json'):
-        request = Request(self.base + path, method=method, data=data,
-                          headers={'Content-Type':content_type})
+    def HttpRequest(self, FilePath, Method='GET', Data=None, ContentType='application/json'):
+        HttpRequest = Request(self.Base + FilePath, method=Method, data=Data,
+                          headers={'Content-Type':ContentType})
         try:
-            response = urlopen(request, timeout=20)
-        except HTTPError as exc:
-            response = exc
-        with response:
-            return response.status, response.read(), response.headers
+            Response = Urlopen(HttpRequest, timeout=20)
+        except HTTPError as Exc:
+            Response = Exc
+        with Response:
+            return Response.status, Response.read(), Response.headers
 
-    def test_upload_job_reconnect_and_cache_round_trip(self):
-        fields = dict(searchMode='bls', minPeriod='1.8', maxPeriod='2.2',
+    def testUploadJobReconnectAndCacheRoundTrip(self):
+        Fields = dict(searchMode='bls', minPeriod='1.8', maxPeriod='2.2',
                       analysisRequestId='http-review-623', batchId='http-batch-623',
                       csvTimeFormat='jd', csvTimeScale='tdb', exposureSeconds='0')
-        body, mime = multipart(fields)
-        status, raw, _ = self.request('/analysis-jobs','POST',body,mime)
-        self.assertEqual(status,202,raw)
-        submitted=json.loads(raw)
-        _, second, _ = self.request('/analysis-jobs','POST',body,mime)
-        self.assertEqual(json.loads(second)['job_id'],submitted['job_id'])
-        status, recovered, _ = self.request('/analysis-jobs?request_id=http-review-623')
-        self.assertEqual(status,200,recovered)
-        self.assertEqual(json.loads(recovered)['job_id'],submitted['job_id'])
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            _, raw, _=self.request('/analysis-jobs/'+submitted['job_id'])
-            job=json.loads(raw)
-            if job['status'] in ('completed','failed','cancelled'):
+        Body, Mime = Multipart(Fields)
+        Status, Raw, _ = self.HttpRequest('/analysis-jobs','POST',Body,Mime)
+        self.assertEqual(Status,202,Raw)
+        Submitted=Json.loads(Raw)
+        _, Second, _ = self.HttpRequest('/analysis-jobs','POST',Body,Mime)
+        self.assertEqual(Json.loads(Second)['job_id'],Submitted['job_id'])
+        Status, Recovered, _ = self.HttpRequest('/analysis-jobs?request_id=http-review-623')
+        self.assertEqual(Status,200,Recovered)
+        self.assertEqual(Json.loads(Recovered)['job_id'],Submitted['job_id'])
+        Deadline=Time.monotonic()+20
+        while Time.monotonic()<Deadline:
+            _, Raw, _=self.HttpRequest('/analysis-jobs/'+Submitted['job_id'])
+            Job=Json.loads(Raw)
+            if Job['status'] in ('completed','failed','cancelled'):
                 break
-            time.sleep(.25)
-        self.assertEqual(job['status'],'completed',job)
-        result=job['result']
-        self.assertAlmostEqual(result['period'],2,delta=.05)
-        self.assertEqual(result['result_schema_version'],2)
-        self.assertIsNotNone(result['provenance']['analyzed_at'])
-        self.assertEqual(result['cleaning']['retained_rows'],1000)
-        self.assertEqual(result['input_metadata']['time_scale'],'TDB')
-        self.assertEqual(result['exposure_metadata']['source'],'explicit per-file override')
-        self.assertEqual(result['exposure_metadata']['known_rows'],1000)
-        self.assertEqual(result['exposure_metadata']['minimum_seconds'],0)
-        self.assertEqual(result['execution'],job['execution'])
-        self.assertGreater(result['execution']['elapsed_seconds'],0)
-        state=dict(results=[dict(file_name='injected.csv',result=result,error=None)],
+            Time.sleep(.25)
+        self.assertEqual(Job['status'],'completed',Job)
+        Result=Job['result']
+        self.assertAlmostEqual(Result['period'],2,delta=.05)
+        self.assertEqual(Result['result_schema_version'],2)
+        self.assertIsNotNone(Result['provenance']['analyzed_at'])
+        self.assertEqual(Result['cleaning']['retained_rows'],1000)
+        self.assertEqual(Result['input_metadata']['time_scale'],'TDB')
+        self.assertEqual(Result['exposure_metadata']['source'],'explicit per-file override')
+        self.assertEqual(Result['exposure_metadata']['known_rows'],1000)
+        self.assertEqual(Result['exposure_metadata']['minimum_seconds'],0)
+        self.assertEqual(Result['execution'],Job['execution'])
+        self.assertGreater(Result['execution']['elapsed_seconds'],0)
+        State=dict(results=[dict(file_name='injected.csv',result=Result,error=None)],
                    current_batch_index=0,current_view='phase',active_job_id=None)
-        status, raw, _=self.request('/analysis-sessions/http_review_623','POST',json.dumps(state).encode())
-        self.assertEqual(status,200,raw)
-        status, raw, _=self.request('/analysis-sessions/http_review_623')
-        self.assertEqual(status,200,raw)
-        restored=json.loads(raw)['state']['results'][0]['result']
-        self.assertEqual(restored['provenance'],result['provenance'])
-        self.assertEqual(restored['planet_assessment'],result['planet_assessment'])
-        self.assertEqual(restored['exposure_metadata'],result['exposure_metadata'])
-        self.assertEqual(restored['execution'],result['execution'])
+        Status, Raw, _=self.HttpRequest('/analysis-sessions/http_review_623','POST',Json.dumps(State).encode())
+        self.assertEqual(Status,200,Raw)
+        Status, Raw, _=self.HttpRequest('/analysis-sessions/http_review_623')
+        self.assertEqual(Status,200,Raw)
+        Restored=Json.loads(Raw)['state']['results'][0]['result']
+        self.assertEqual(Restored['provenance'],Result['provenance'])
+        self.assertEqual(Restored['planet_assessment'],Result['planet_assessment'])
+        self.assertEqual(Restored['exposure_metadata'],Result['exposure_metadata'])
+        self.assertEqual(Restored['execution'],Result['execution'])
 
-    def test_invalid_cache_returns_recoverable_error_without_overwriting(self):
-        path=Path(self.directory.name)/'session-bad_cache_623.json'
-        original=b'{broken'
-        path.write_bytes(original)
-        status, raw, _=self.request('/analysis-sessions/bad_cache_623')
-        self.assertEqual(status,400)
-        self.assertIn('error',json.loads(raw))
-        self.assertEqual(path.read_bytes(),original)
-        self.assertEqual(self.request('/')[0],200)
+    def testInvalidCacheReturnsRecoverableErrorWithoutOverwriting(self):
+        FilePath=Path(self.Directory.name)/'session-bad_cache_623.json'
+        Original=b'{broken'
+        FilePath.write_bytes(Original)
+        Status, Raw, _=self.HttpRequest('/analysis-sessions/bad_cache_623')
+        self.assertEqual(Status,400)
+        self.assertIn('error',Json.loads(Raw))
+        self.assertEqual(FilePath.read_bytes(),Original)
+        self.assertEqual(self.HttpRequest('/')[0],200)
 
-    def test_static_assets_are_served_with_expected_content_types(self):
-        for path, expected in [('/', 'text/html'),('/static/app.js','application/javascript'),('/static/styles.css','text/css')]:
-            status, data, headers=self.request(path)
-            self.assertEqual(status,200)
-            self.assertGreater(len(data),100)
-            self.assertIn(expected,headers['Content-Type'])
+    def testStaticAssetsAreServedWithExpectedContentTypes(self):
+        for FilePath, Expected in [('/', 'text/html'),('/static/app.js','application/javascript'),('/static/styles.css','text/css')]:
+            Status, Data, Headers=self.HttpRequest(FilePath)
+            self.assertEqual(Status,200)
+            self.assertGreater(len(Data),100)
+            self.assertIn(Expected,Headers['Content-Type'])
 
 
 if __name__=='__main__':
-    unittest.main()
+    Unittest.RunApp()

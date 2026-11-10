@@ -1,182 +1,184 @@
-import json
+import json as Json
 from pathlib import Path
-import sys
-import unittest
+import sys as Sys
+import unittest as Unittest
 
-import numpy as np
+import numpy as Np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"))
-import analysis
-import tls_search
+Sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"))
+import analysis as Analysis
+import tls_search as TlsSearch
 
 
-class EventEvidenceTests(unittest.TestCase):
-    def test_search_edge_warning_uses_local_period_scale(self):
-        for period, lower, upper, sigma, expected in [
+#MARK: transit checks
+class EventEvidenceTests(Unittest.TestCase):
+    def testSearchEdgeWarningUsesLocalPeriodScale(self):
+        for Period, Lower, Upper, Sigma, Expected in [
             (.81347, .5, 245, .000026, False),
             (1.3382, .5, 253, .000074, False),
             (.50001, .5, 245, .000001, True),
             (244.99, .5, 245, .000001, True),
             (2.18, 1, 2.2, .01, True),
         ]:
-            with self.subTest(period=period, bounds=(lower, upper)):
-                _, warnings = analysis.build_candidate_diagnostics([], {
-                    "period": period, "period_method": "TLS", "period_uncertainty": sigma,
-                    "period_search": {"min_period": lower, "max_period": upper},
+            with self.subTest(period=Period, bounds=(Lower, Upper)):
+                _, Warnings = Analysis.BuildCandidateDiagnostics([], {
+                    "period": Period, "period_method": "TLS", "period_uncertainty": Sigma,
+                    "period_search": {"min_period": Lower, "max_period": Upper},
                 })
-                self.assertEqual(any(w["title"] == "Period peak near search edge" for w in warnings), expected)
+                self.assertEqual(any(W["title"] == "Period peak near search edge" for W in Warnings), Expected)
 
-    def windows(self, time, flux, centers=(1.0, 3.0, 5.0), duration=0.2):
-        return analysis.transits_from_tls_result(time, flux, {
-            "period": 2.0, "duration": duration, "transit_time": 1.0,
-            "tls_result": {"transit_times": centers, "per_transit_count": [0, 0, 0],
+    def windows(self, Time, Flux, Centers=(1.0, 3.0, 5.0), Duration=0.2):
+        return Analysis.TransitsFromTlsResult(Time, Flux, {
+            "period": 2.0, "duration": Duration, "transit_time": 1.0,
+            "tls_result": {"transit_times": Centers, "per_transit_count": [0, 0, 0],
                            "transit_depth_fractions": [0.02, 0.02, 0.02]},
         })
 
-    def test_flat_ephemeris_windows_do_not_become_observed_events(self):
-        time = np.linspace(0, 6, 3001)
-        windows = self.windows(time, np.ones(len(time)))
+    def testFlatEphemerisWindowsDoNotBecomeObservedEvents(self):
+        Time = Np.linspace(0, 6, 3001)
+        windows = self.windows(Time, Np.ones(len(Time)))
         self.assertEqual(len(windows), 3)
-        self.assertTrue(all(w["state"] == "unsupported_window" for w in windows))
-        self.assertTrue(all(w["depth"] == 0 and w["measured_center"] is None for w in windows))
-        detection = {"period": 2, "period_epoch": 1, "period_method": "TLS", "period_duration": .2,
+        self.assertTrue(all(W["state"] == "unsupported_window" for W in windows))
+        self.assertTrue(all(W["depth"] == 0 and W["measured_center"] is None for W in windows))
+        Detection = {"period": 2, "period_epoch": 1, "period_method": "TLS", "period_duration": .2,
                      "period_sde": 9, "tls_snr": 20, "tls_fap": None, "tls": {}}
-        diagnostics, warnings = analysis.build_candidate_diagnostics(windows, detection)
-        assessment = analysis.build_planet_assessment(windows, detection, diagnostics, warnings)
-        self.assertEqual(diagnostics["supported_event_count"], 0)
-        self.assertIsNone(diagnostics["ephemeris_match_fraction"])
-        self.assertNotEqual(assessment["status"], "strong_candidate")
-        self.assertFalse(any("ephemeris" in item["title"].lower() for item in assessment["supporting_evidence"]))
-        self.assertFalse(any("false-alarm" in item["title"].lower() for item in assessment["supporting_evidence"]))
+        Diagnostics, Warnings = Analysis.BuildCandidateDiagnostics(windows, Detection)
+        Assessment = Analysis.BuildPlanetAssessment(windows, Detection, Diagnostics, Warnings)
+        self.assertEqual(Diagnostics["supported_event_count"], 0)
+        self.assertIsNone(Diagnostics["ephemeris_match_fraction"])
+        self.assertNotEqual(Assessment["status"], "strong_candidate")
+        self.assertFalse(any("ephemeris" in Item["title"].lower() for Item in Assessment["supporting_evidence"]))
+        self.assertFalse(any("false-alarm" in Item["title"].lower() for Item in Assessment["supporting_evidence"]))
 
-    def test_final_window_counts_and_negative_depth_are_measured(self):
-        time = np.linspace(0, 6, 3001)
-        flux = np.ones(len(time))
-        flux[np.abs(time - 1) <= .1] += .01
-        windows = self.windows(time, flux)
-        first = windows[0]
-        self.assertGreaterEqual(first["points"], 99)
-        self.assertLess(first["signed_depth"], 0)
-        self.assertEqual(first["state"], "unsupported_window")
+    def testFinalWindowCountsAndNegativeDepthAreMeasured(self):
+        Time = Np.linspace(0, 6, 3001)
+        Flux = Np.ones(len(Time))
+        Flux[Np.abs(Time - 1) <= .1] += .01
+        windows = self.windows(Time, Flux)
+        First = windows[0]
+        self.assertGreaterEqual(First["points"], 99)
+        self.assertLess(First["signed_depth"], 0)
+        self.assertEqual(First["state"], "unsupported_window")
 
-    def test_local_centroid_is_not_copied_from_ephemeris(self):
-        time = np.linspace(0, 6, 6001)
-        flux = 1 + np.random.default_rng(201).normal(0, .0002, len(time))
-        for center in (1.025, 3.025, 5.025):
-            flux -= .01 * np.clip(1 - np.abs(time - center) / .055, 0, 1)
-        windows = self.windows(time, flux)
-        self.assertTrue(all(w["state"] == "supported_dip" for w in windows))
-        for window in windows:
-            self.assertAlmostEqual(window["measured_center"] - window["center"], .025, delta=.008)
-            self.assertGreater(window["timing_uncertainty"], 0)
+    def testLocalCentroidIsNotCopiedFromEphemeris(self):
+        Time = Np.linspace(0, 6, 6001)
+        Flux = 1 + Np.random.default_rng(201).normal(0, .0002, len(Time))
+        for Center in (1.025, 3.025, 5.025):
+            Flux -= .01 * Np.clip(1 - Np.abs(Time - Center) / .055, 0, 1)
+        windows = self.windows(Time, Flux)
+        self.assertTrue(all(W["state"] == "supported_dip" for W in windows))
+        for Window in windows:
+            self.assertAlmostEqual(Window["measured_center"] - Window["center"], .025, delta=.008)
+            self.assertGreater(Window["timing_uncertainty"], 0)
 
-    def test_cycle_parity_survives_a_missing_cycle(self):
-        windows = [{"center": c, "cycle_number": n, "depth": d, "points": 30,
+    def testCycleParitySurvivesAMissingCycle(self):
+        windows = [{"center": C, "cycle_number": N, "depth": D, "points": 30,
                     "duration": .1, "state": "supported_dip"}
-                   for c, n, d in [(1, 0, .01), (3, 1, .02), (7, 3, .02), (9, 4, .01)]]
-        diagnostics, _ = analysis.build_candidate_diagnostics(windows, {"period": 2, "period_epoch": 1})
-        self.assertEqual(diagnostics["odd_depth"], .02)
-        self.assertEqual(diagnostics["even_depth"], .01)
+                   for C, N, D in [(1, 0, .01), (3, 1, .02), (7, 3, .02), (9, 4, .01)]]
+        Diagnostics, _ = Analysis.BuildCandidateDiagnostics(windows, {"period": 2, "period_epoch": 1})
+        self.assertEqual(Diagnostics["odd_depth"], .02)
+        self.assertEqual(Diagnostics["even_depth"], .01)
 
-    def test_gap_separates_trends_and_local_baselines(self):
-        time = np.r_[np.linspace(0, 2, 300), np.linspace(10, 12, 300)]
-        flux = np.r_[np.ones(300), np.ones(300) * 1.05]
-        flattened = analysis.flattened_flux_for_period_search(time, flux)
-        self.assertLess(np.max(np.abs(flattened)), 1e-12)
-        windows = self.windows(time, flux, centers=(1.95, 6.0, 10.05))
+    def testGapSeparatesTrendsAndLocalBaselines(self):
+        Time = Np.r_[Np.linspace(0, 2, 300), Np.linspace(10, 12, 300)]
+        Flux = Np.r_[Np.ones(300), Np.ones(300) * 1.05]
+        Flattened = Analysis.FlattenedFluxForPeriodSearch(Time, Flux)
+        self.assertLess(Np.max(Np.abs(Flattened)), 1e-12)
+        windows = self.windows(Time, Flux, Centers=(1.95, 6.0, 10.05))
         self.assertEqual(windows[1]["state"], "outside_observations")
         self.assertAlmostEqual(windows[0]["local_baseline"], 1.0)
         self.assertAlmostEqual(windows[2]["local_baseline"], 1.05)
 
-    def test_phase_bins_include_counts_and_uncertainties(self):
-        time = np.linspace(0, 6, 1201)
-        flux = 1 + np.random.default_rng(8).normal(0, .001, len(time))
-        plot = analysis.build_phase_folded_plot(time, flux, flux, 2.0, 1.0, .1)
-        self.assertEqual(sum(plot["binned_count"]), len(time))
-        self.assertEqual(len(plot["binned_uncertainty"]), len(plot["binned_flux"]))
-        json.dumps(plot, allow_nan=False)
+    def testPhaseBinsIncludeCountsAndUncertainties(self):
+        Time = Np.linspace(0, 6, 1201)
+        Flux = 1 + Np.random.default_rng(8).normal(0, .001, len(Time))
+        Plot = Analysis.MakePhasePlot(Time, Flux, Flux, 2.0, 1.0, .1)
+        self.assertEqual(sum(Plot["binned_count"]), len(Time))
+        self.assertEqual(len(Plot["binned_uncertainty"]), len(Plot["binned_flux"]))
+        Json.dumps(Plot, allow_nan=False)
 
-    def test_two_transit_option_changes_automatic_search_bounds(self):
-        _, maximum = analysis.period_search_bounds(.001, 24, {"tls_min_transits": 2})
-        self.assertEqual(maximum, 12)
+    def testTwoTransitOptionChangesAutomaticSearchBounds(self):
+        _, Maximum = Analysis.PeriodSearchBounds(.001, 24, {"tls_min_transits": 2})
+        self.assertEqual(Maximum, 12)
 
-    def test_exploratory_local_features_keep_unassigned_dips_without_scoring_them(self):
-        time = np.r_[np.linspace(0, 2, 1001), np.linspace(10, 12, 1001)]
-        flux = 1 + np.random.default_rng(18).normal(0, .0001, len(time))
-        for center in (.8, 10.8):
-            flux -= .02 * np.clip(1 - np.abs(time - center) / .05, 0, 1)
-        dips, metadata = analysis.exploratory_local_dips(time, flux, analysis.DEFAULT_DETECTION_OPTIONS, 0.0)
-        self.assertGreaterEqual(len(dips), 2)
-        result = {"time_reference": 0.0, "exploratory_dips": dips,
+    def testExploratoryLocalFeaturesKeepUnassignedDipsWithoutScoringThem(self):
+        Time = Np.r_[Np.linspace(0, 2, 1001), Np.linspace(10, 12, 1001)]
+        Flux = 1 + Np.random.default_rng(18).normal(0, .0001, len(Time))
+        for Center in (.8, 10.8):
+            Flux -= .02 * Np.clip(1 - Np.abs(Time - Center) / .05, 0, 1)
+        Dips, Metadata = Analysis.ExploratoryLocalDips(Time, Flux, Analysis.DEFAULT_DETECTION_OPTIONS, 0.0)
+        self.assertGreaterEqual(len(Dips), 2)
+        Result = {"time_reference": 0.0, "exploratory_dips": Dips,
                   "planet_assessment": {"candidate_score": 12},
                   "predicted_windows": [{"start": .7, "end": .9}]}
-        analysis.tag_exploratory_assignments(result, [result])
-        self.assertTrue(any(dip["assignment"] == "unassigned" for dip in dips))
-        self.assertTrue(any(dip["assignment"] == "overlaps_predicted_window" for dip in dips))
-        self.assertTrue(all(dip["validated"] is False for dip in dips))
-        self.assertEqual(result["planet_assessment"]["candidate_score"], 12)
-        self.assertIn("never", metadata["interpretation"])
+        Analysis.TagExploratoryAssignments(Result, [Result])
+        self.assertTrue(any(Dip["assignment"] == "unassigned" for Dip in Dips))
+        self.assertTrue(any(Dip["assignment"] == "overlaps_predicted_window" for Dip in Dips))
+        self.assertTrue(all(Dip["validated"] is False for Dip in Dips))
+        self.assertEqual(Result["planet_assessment"]["candidate_score"], 12)
+        self.assertIn("never", Metadata["interpretation"])
 
 
-class ConditionalDurationTests(unittest.TestCase):
-    def test_joint_amplitudes_recover_overlapping_seeded_templates(self):
-        time = np.linspace(0, 12, 6001)
-        phase = np.linspace(-1.5, 1.5, 3001)
-        shape = np.clip(1 - np.abs(phase) / .08, 0, 1)
-        signals = []
-        evaluated_shapes = []
-        for index, (period, prior_depth) in enumerate([(2.0, .015), (3.0, .010)]):
-            signal = {"signal_id": f"signal-{index + 1}", "label": f"Signal {index + 1}",
-                      "period": period, "period_epoch": 1.0,
-                      "transit_model": {"folded_phase_days": phase.tolist(), "folded_flux": (1 - prior_depth * shape).tolist()}}
-            aligned = analysis.model_flux_at_observations(time, period, 1.0, signal["transit_model"])
-            evaluated_shapes.append((1 - aligned) / prior_depth)
-            signals.append(signal)
-        flux = 1.001 - .006 * evaluated_shapes[0] - .003 * evaluated_shapes[1]
-        flux += np.random.default_rng(20261105).normal(0, .0002, len(time))
-        joint = analysis.joint_template_amplitudes(time, flux, signals)
-        self.assertIsNotNone(joint)
-        self.assertGreater(joint["metadata"]["overlapping_sample_count"], 0)
-        self.assertAlmostEqual(joint["baseline"], 1.001, delta=.00005)
-        self.assertAlmostEqual(joint["depths"][0], .006, delta=.00010)
-        self.assertAlmostEqual(joint["depths"][1], .003, delta=.00010)
-        self.assertLess(float(np.std(joint["residual_flux"])), .00022)
-        analysis.update_signal_joint_depth(signals[0], joint["depths"][0], joint["depth_uncertainties"][0])
-        self.assertAlmostEqual(1 - min(signals[0]["transit_model"]["folded_flux"]), joint["depths"][0])
-        self.assertEqual(signals[0]["period"], 2.0)
+#MARK: model shape
+class ConditionalDurationTests(Unittest.TestCase):
+    def testJointAmplitudesRecoverOverlappingSeededTemplates(self):
+        Time = Np.linspace(0, 12, 6001)
+        Phase = Np.linspace(-1.5, 1.5, 3001)
+        Shape = Np.clip(1 - Np.abs(Phase) / .08, 0, 1)
+        Signals = []
+        EvaluatedShapes = []
+        for Index, (Period, PriorDepth) in enumerate([(2.0, .015), (3.0, .010)]):
+            Signal = {"signal_id": f"signal-{Index + 1}", "label": f"Signal {Index + 1}",
+                      "period": Period, "period_epoch": 1.0,
+                      "transit_model": {"folded_phase_days": Phase.tolist(), "folded_flux": (1 - PriorDepth * Shape).tolist()}}
+            Aligned = Analysis.ModelFluxAtObservations(Time, Period, 1.0, Signal["transit_model"])
+            EvaluatedShapes.append((1 - Aligned) / PriorDepth)
+            Signals.append(Signal)
+        Flux = 1.001 - .006 * EvaluatedShapes[0] - .003 * EvaluatedShapes[1]
+        Flux += Np.random.default_rng(20261105).normal(0, .0002, len(Time))
+        Joint = Analysis.JointTemplateAmplitudes(Time, Flux, Signals)
+        self.assertIsNotNone(Joint)
+        self.assertGreater(Joint["metadata"]["overlapping_sample_count"], 0)
+        self.assertAlmostEqual(Joint["baseline"], 1.001, delta=.00005)
+        self.assertAlmostEqual(Joint["depths"][0], .006, delta=.00010)
+        self.assertAlmostEqual(Joint["depths"][1], .003, delta=.00010)
+        self.assertLess(float(Np.std(Joint["residual_flux"])), .00022)
+        Analysis.UpdateSignalJointDepth(Signals[0], Joint["depths"][0], Joint["depth_uncertainties"][0])
+        self.assertAlmostEqual(1 - min(Signals[0]["transit_model"]["folded_flux"]), Joint["depths"][0])
+        self.assertEqual(Signals[0]["period"], 2.0)
 
-    def test_collective_shallow_tls_signal_does_not_require_three_individual_detections(self):
-        import validate_updates
-        _, time, flux, _, _ = next(case for case in validate_updates.fixtures() if case[0] == "shallow_600ppm")
-        options = {**analysis.DEFAULT_DETECTION_OPTIONS, "min_period": 1.4, "max_period": 3.5,
+    def testCollectiveShallowTlsSignalDoesNotRequireThreeIndividualDetections(self):
+        import validate_updates as ValidateUpdates
+        _, Time, Flux, _, _ = next(Case for Case in ValidateUpdates.Fixtures() if Case[0] == "shallow_600ppm")
+        Options = {**Analysis.DEFAULT_DETECTION_OPTIONS, "min_period": 1.4, "max_period": 3.5,
                    "tls_oversampling": 2, "tls_threads": 1}
-        options["_flux_uncertainty"] = [.0008] * len(time)
-        options["_flux_uncertainty"][0] = None
-        result = analysis.analyze(time + 2459000, flux, options)
-        self.assertIn(result["planet_assessment"]["status"], ("possible_candidate", "strong_candidate"))
-        self.assertLess(len(result["observed_events"]), 3)
-        self.assertTrue(result["diagnostics"]["combined_signal_supported"])
-        self.assertAlmostEqual(result["period"], 2.4, delta=.025)
-        self.assertTrue(any("combined" in evidence["title"].lower() for evidence in result["planet_assessment"]["supporting_evidence"]))
-        self.assertIsNone(result["plot"]["flux_uncertainty"][0])
-        self.assertIn("unweighted fallback", result["uncertainty_usage"])
-        self.assertNotIn("_flux_uncertainty", result["detection_options"])
-        json.dumps(result, allow_nan=False)
+        Options["_flux_uncertainty"] = [.0008] * len(Time)
+        Options["_flux_uncertainty"][0] = None
+        Result = Analysis.RunCurve(Time + 2459000, Flux, Options)
+        self.assertIn(Result["planet_assessment"]["status"], ("possible_candidate", "strong_candidate"))
+        self.assertLess(len(Result["observed_events"]), 3)
+        self.assertTrue(Result["diagnostics"]["combined_signal_supported"])
+        self.assertAlmostEqual(Result["period"], 2.4, delta=.025)
+        self.assertTrue(any("combined" in Evidence["title"].lower() for Evidence in Result["planet_assessment"]["supporting_evidence"]))
+        self.assertIsNone(Result["plot"]["flux_uncertainty"][0])
+        self.assertIn("unweighted fallback", Result["uncertainty_usage"])
+        self.assertNotIn("_flux_uncertainty", Result["detection_options"])
+        Json.dumps(Result, allow_nan=False)
 
-    def test_template_duration_can_shorten_and_estimates_uncertainty(self):
-        time = np.linspace(0, 8, 8001)
-        period, epoch, truth = 1.0, .5, .1
-        phase = ((time - epoch + period/2) % period) - period/2
-        flux = 1 - .01 * np.clip(1 - np.abs(phase) / (truth / 2), 0, 1)
-        flux += np.random.default_rng(9).normal(0, .0002, len(time))
-        model_phase = np.linspace(-.5, .5, 3001)
-        model = 1 - .01 * np.clip(1 - np.abs(model_phase) / .065, 0, 1)
-        result = tls_search.fit_observed_model_duration(time, flux, period, epoch, .13, model_phase, model)
-        self.assertIsNotNone(result)
-        self.assertAlmostEqual(result["duration"], truth, delta=.012)
-        self.assertLess(result["duration"], .13)
-        self.assertGreater(result["duration_uncertainty"], 0)
+    def testTemplateDurationCanShortenAndEstimatesUncertainty(self):
+        Time = Np.linspace(0, 8, 8001)
+        Period, Epoch, Truth = 1.0, .5, .1
+        Phase = ((Time - Epoch + Period/2) % Period) - Period/2
+        Flux = 1 - .01 * Np.clip(1 - Np.abs(Phase) / (Truth / 2), 0, 1)
+        Flux += Np.random.default_rng(9).normal(0, .0002, len(Time))
+        ModelPhase = Np.linspace(-.5, .5, 3001)
+        Model = 1 - .01 * Np.clip(1 - Np.abs(ModelPhase) / .065, 0, 1)
+        Result = TlsSearch.FitObservedModelDuration(Time, Flux, Period, Epoch, .13, ModelPhase, Model)
+        self.assertIsNotNone(Result)
+        self.assertAlmostEqual(Result["duration"], Truth, delta=.012)
+        self.assertLess(Result["duration"], .13)
+        self.assertGreater(Result["duration_uncertainty"], 0)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    Unittest.RunApp()
