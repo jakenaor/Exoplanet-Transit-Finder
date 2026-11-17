@@ -24,6 +24,7 @@ except Exception:
 #MARK: core stuffs
 MAX_PLOT_POINTS = 12000
 MAX_PERIODOGRAM_POINTS = 1600
+MIN_PERIOD_SEARCH_SAMPLES = 50
 DEFAULT_DETECTION_OPTIONS = {
     "strictness": 1.0,
     "smoothing": 1.0,
@@ -64,6 +65,11 @@ def RunCurve(Time, Flux, Options=None, ProgressCallback=None, **LegacyOptions):
     #MARK: curve funcs
     Time, Flux, Options, Exposures, ExposureMetadata = _PrepCurve(Time, Flux, Options)
     ReportProgress("preparing", "Preparing light curve")
+    if len(Time) < MIN_PERIOD_SEARCH_SAMPLES:
+        ReportProgress("building", "Preparing measurements for inspection")
+        Result = _MakeReviewThing(Time, Flux, Options, Exposures, ExposureMetadata)
+        ReportProgress("finalizing", "Finalizing inspection-only result")
+        return Result
     NormalizationPlan = FluxNormalizationPlan(Flux)
     AnalysisFlux, Segments = NormalizeFluxBySegments(Time, Flux)
     NormalizedUncertainty, UncertaintyComplete = _ScaleFluxErrors(
@@ -3545,6 +3551,101 @@ def UpdateSignalJointDepth(Signal, Depth, Uncertainty):
 
 
 #MARK: curve funcs
+def _MakeReviewThing(Time, Flux, Options, Exposures, ExposureMetadata):
+    """Open a short curve without turning it into a period-search result."""
+    TimeReference = float(Time[0])
+    DisplayTime = Time - TimeReference
+    Segments = ObservingSegments(Time)
+    Reason = (
+        f"Only {len(Time)} usable samples are available. This app requires at least "
+        f"{MIN_PERIOD_SEARCH_SAMPLES} samples before running a TLS or BLS period search. "
+        "The uploaded measurements are available for inspection."
+    )
+    PublicOptions = {Key: Value for Key, Value in Options.items() if not Key.startswith("_")}
+
+    # keep errors in the uploaded flux units, including gaps in the error column.
+    Errors = Np.full(len(Flux), Np.nan)
+    SuppliedErrors = Options.get("_flux_uncertainty")
+    if SuppliedErrors is not None:
+        SuppliedErrors = Np.asarray(SuppliedErrors, dtype=float)
+        if SuppliedErrors.shape == Flux.shape:
+            ValidErrors = Np.isfinite(SuppliedErrors) & (SuppliedErrors > 0)
+            Errors[ValidErrors] = SuppliedErrors[ValidErrors]
+    ErrorWidths = Np.where(Np.isfinite(Errors), Errors, 0.0)
+    FluxMin, FluxMax = DomainFor(Np.r_[Flux - ErrorWidths, Flux + ErrorWidths], 0.0, 100.0)
+    if FluxMin == FluxMax:
+        # a flat curve with large counts still needs room on the vertical axis.
+        Padding = max(abs(FluxMin) * 1e-12, 1e-9)
+        FluxMin, FluxMax = FluxMin - Padding, FluxMax + Padding
+    ReviewExposure = {
+        **ExposureMetadata,
+        "scope": "measurement metadata only; no transit model fitted",
+        "unknown_policy": "left unknown; cadence is not substituted for exposure",
+    }
+    InputMetadata = Options.get("_input_metadata") or {"time_format": "unspecified", "time_standard": "unspecified"}
+
+    # no clipping, smoothing, normalization, or local dip detection on this path.
+    Result = {
+        "review_only": True,
+        "analysis_mode": "inspection",
+        "analysis_purpose": "Inspect uploaded measurements; no periodicity or planet assessment performed.",
+        "review_reason": Reason,
+        "search_status": "not_run",
+        "search_reason": Reason,
+        "search_requirements": {"minimum_samples": MIN_PERIOD_SEARCH_SAMPLES, "usable_samples": int(len(Time))},
+        "total_points": int(len(Time)),
+        "time_reference": TimeReference,
+        "time_unit": "Days since first observation",
+        "flux_unit": InputMetadata.get("flux_unit") or "input flux units",
+        "plot": {
+            "time": DisplayTime.tolist(),
+            "raw_flux": Flux.tolist(),
+            "smooth_flux": Flux.tolist(),
+            "flux_uncertainty": [float(Value) if Np.isfinite(Value) else None for Value in Errors],
+            "exposure_seconds": [float(Value) if Np.isfinite(Value) else None for Value in Exposures],
+            "break_indices": [int(Start) for Start, _ in Segments[1:]],
+            "raw_representation": "all cleaned uploaded measurements in their original flux units",
+            "clean_representation": "identical to uploaded measurements; no smoothing applied",
+        },
+        "domain": {"time_min": 0.0, "time_max": float(DisplayTime[-1])},
+        "raw_domain": {"flux_min": FluxMin, "flux_max": FluxMax},
+        "clean_domain": {"flux_min": FluxMin, "flux_max": FluxMax},
+        "zoom_domain": None,
+        "plot_smooth_points": 1,
+        "normalization": {"method": "none", "input_representation": "uploaded flux", "residual_scale": None,
+                          "segment_count": len(Segments),
+                          "segment_time_ranges": [{"start_day": float(DisplayTime[Start]), "end_day": float(DisplayTime[End - 1])}
+                                                  for Start, End in Segments]},
+        "preprocessing": {"normalized": "none", "search": "not run", "display": "all measurements; no clipping or smoothing", "stack": "not built"},
+        "cleaning_report": Options.get("_cleaning_report"),
+        "input_metadata": InputMetadata,
+        "exposure_metadata": ReviewExposure,
+        "uncertainty_usage": "Valid input flux errors retained in original units; missing or invalid errors are null. No model fit uses these errors.",
+        "detection_options": PublicOptions,
+        "effective_settings": {"analysis_mode": "inspection", "search_status": "not_run", "search_bounds": None,
+                               "requested_search_mode": Options.get("search_mode"), "flux_normalization": "none",
+                               "smoothing_points": 1, "exposure": ReviewExposure},
+        "warnings": [{"severity": "info", "title": "Inspection only", "detail": Reason}],
+        "transits": [],
+        "signals": [],
+        "predicted_windows": [],
+        "observed_events": [],
+        "exploratory_dips": [],
+        "period_candidates": [],
+        "period_match_count": 0,
+    }
+    for Key in (
+        "period", "period_scatter", "period_method", "period_epoch", "period_duration", "period_sde",
+        "period_uncertainty", "period_search", "periodogram", "tls_sde_raw", "tls_fap", "tls_snr", "tls",
+        "transit_model", "phase_folded", "transit_stack", "model_comparison", "planet_assessment", "fit_quality",
+        "diagnostics", "p_value", "p_value_percent", "chi_squared_flat", "chi_squared_box", "reduced_chi_squared_box",
+        "delta_chi_squared", "detection_snr", "odd_even_depth_mismatch", "depth_scatter_ratio",
+    ):
+        Result[Key] = None
+    return Result
+
+
+#MARK: curve funcs
 def _PrepCurve(Time, Flux, Options):
     if Options is None:
         Options = dict(DEFAULT_DETECTION_OPTIONS)
@@ -3552,7 +3653,7 @@ def _PrepCurve(Time, Flux, Options):
         Options = {**DEFAULT_DETECTION_OPTIONS, **Options}
     Time, Flux = Np.asarray(Time, dtype=float), Np.asarray(Flux, dtype=float)
     if (
-        len(Time) < 3
+        len(Time) < 2
         or len(Time) != len(Flux)
         or not Np.isfinite(Time).all()
         or not Np.isfinite(Flux).all()

@@ -24,8 +24,8 @@ from analysis import RunCurve
 #MARK: core stuffs
 TERMINAL_STATES = {"completed", "failed", "cancelled"}
 RESULT_SCHEMA_VERSION = 2
-ANALYSIS_VERSION = "2026.11.10.1"
-APP_VERSION = "66"
+ANALYSIS_VERSION = "2026.11.16.1"
+APP_VERSION = "67"
 PROGRESS_FIELDS = ("completed_trials", "total_trials", "estimated_remaining_seconds",
                    "eta_lower_seconds", "eta_upper_seconds", "eta_scope", "work_completed",
                    "work_total", "remaining_seconds_range", "eta_state", "search_elapsed_seconds",

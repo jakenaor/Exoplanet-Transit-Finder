@@ -103,8 +103,7 @@ def CleanLightCurveArrays(Times, Fluxes, Uncertainties=None, Quality=None,
     #MARK: checking what remains
     if len(Time) < 2 or Time[-1] <= Time[0]:
         raise ValueError("The light curve has zero time span; provide distinct observation times.")
-    if len(Time) < 20:
-        raise ValueError("Need at least 20 distinct finite time/flux rows after cleaning.")
+    # short curves can be inspected; analysis decides whether a search can run.
     Report["retained_rows"] = int(len(Time))
     Report["excluded_rows"] = int(Report["input_rows"] - len(Time))
     Report["counts_reconcile"] = (Report["input_rows"] == sum(Report[K] for K in
@@ -399,6 +398,8 @@ def ReadCurveUpload(FileItem, ReturnMetadata=False, **MetadataOptions):
             MetadataOptions[NewName] = MetadataOptions.pop(OldName)
     #MARK: curve uploads
     Filename = UploadedFilename(FileItem)
+    if Filename.lower().endswith(".json"):
+        raise ValueError("JSON sidecar files contain metadata, not light-curve samples. Upload a CSV or FITS light curve.")
     ExtensionIsFits = IsFitsFilename(Filename)
     MaxBytes = MAX_FITS_UPLOAD_BYTES if ExtensionIsFits else MAX_CSV_UPLOAD_BYTES
     FileKind = "FITS" if ExtensionIsFits else "CSV"

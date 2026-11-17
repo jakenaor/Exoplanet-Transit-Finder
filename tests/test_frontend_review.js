@@ -113,6 +113,13 @@ function MakeFakeThing(Id)
 //MARK: fake element list
 const FakeBits = new Map();
 const GrabThing = Id => FakeBits.get(Id) || FakeBits.set(Id, MakeFakeThing(Id)).get(Id);
+const FakeViewButtons = [ 'zoom', 'clean', 'raw', 'phase', 'stack', 'periodogram', 'audit', 'comparison' ]
+    .map(View =>
+    {
+      const Button = MakeFakeThing(`view-${View}`);
+      Button.dataset.view = View;
+      return Button;
+    });
 //MARK: starting controls
 for (const [Id, Value] of Object.entries({
        StrictnessInput : '1',
@@ -132,7 +139,7 @@ for (const [Id, Value] of Object.entries({
 const FakePageThing = {
   getElementById : GrabThing,
   querySelector : () => GrabThing('main'),
-  querySelectorAll : () => [],
+  querySelectorAll : Selector => Selector === '.ViewButton[data-view]' ? FakeViewButtons : [],
   listeners : {},
   addEventListener(Type, Fn)
   {
@@ -467,7 +474,148 @@ RunApp(`
   SignalPickThing.value = SavedCurveState.SignalValue;
   StackEventInput.value = SavedCurveState.EventValue;
 `);
-console.log('Frontend review: 12 behavior groups passed (including signal selection and chart focus).');
+//MARK: curve file selection
+RunApp(`
+  BatchInProgress = false;
+  RunningJobId = null;
+  RequestId = null;
+  JobConnectionLost = false;
+  SetFiles([{name:'curve.csv'}, {name:'curve.json'}, {name:'star.FITS'}, {name:'other.fit'}, {name:'last.fts'}]);
+`);
+Assert.deepEqual(JSON.parse(RunApp('JSON.stringify(CurveFiles.map(File => File.name))')),
+                 ['curve.csv', 'star.FITS', 'other.fit', 'last.fts']);
+Assert.match(GrabThing('Status').textContent, /Skipped 1 unsupported file.*JSON metadata/);
+RunApp("SetFiles([{name:'metadata.JSON'}]);");
+Assert.equal(RunApp('CurveFiles.length'), 4, 'metadata alone does not replace the current light curve selection');
+Assert.match(GrabThing('Status').textContent, /No CSV or FITS light curves were added/);
+
+//MARK: short curve inspection
+RunApp(`
+  globalThis.InspectionFixture = {
+    review_only: true, analysis_mode: 'inspection', search_status: 'not_run',
+    review_reason: 'Only 22 usable samples remain; transit search requires at least 50.',
+    search_requirements: {minimum_samples: 50, usable_samples: 22},
+    total_points: 22, time_reference: 2461360, time_unit: 'days', flux_unit: 'counts',
+    median_flux: 100, robust_noise: null, transits: [], signals: [], observed_events: [],
+    predicted_windows: [], exploratory_dips: [], warnings: [], period: null,
+    planet_assessment: null, fit_quality: null, diagnostics: null, periodogram: null,
+    phase_folded: null, transit_stack: null, transit_model: null, model_comparison: null,
+    input_metadata: {time_format: 'bjd', time_scale: 'tdb'},
+    normalization: {method: 'none', segment_time_ranges: [{start_day:0, end_day:.021}]},
+    domain: {time_min:0, time_max:.021},
+    raw_domain: {flux_min:99.8, flux_max:100.2},
+    clean_domain: {flux_min:99.8, flux_max:100.2},
+    plot: {
+      time: Array.from({length:22}, (Unused,Index) => Index * .001),
+      raw_flux: Array.from({length:22}, (Unused,Index) => 100 + Math.sin(Index) / 10),
+      smooth_flux: Array.from({length:22}, (Unused,Index) => 100 + Math.sin(Index) / 10),
+      flux_uncertainty: Array.from({length:22}, (Unused,Index) => Index % 2 ? null : .04),
+      exposure_seconds: Array(22).fill(null), break_indices: [],
+    },
+  };
+  CurrResult = InspectionFixture;
+  MainResult = InspectionFixture;
+  CurrFile = {name:'short.csv'};
+  CurrView = 'phase';
+  CurrViewport = null;
+  ViewBeforeInspection = null;
+`);
+CanvasDoodles.length = 0;
+RunApp('ShowCurveResult(CurrResult);');
+Assert.equal(RunApp('CurrView'), 'raw', 'short results open the measured light curve');
+Assert.equal(RunApp('CurrentPlanetAssessment()'), null, 'inspection has no fallback planet verdict');
+Assert.match(GrabThing('Assessment').innerHTML, /Short-curve inspection/);
+Assert.doesNotMatch(GrabThing('Assessment').innerHTML, /ScoreTrack|ScoreFill|Candidate score/);
+Assert.doesNotMatch(GrabThing('Metrics').innerHTML, /Orbital period|Supported events|SDE|Radius ratio/);
+Assert.match(GrabThing('SearchUnavailable').textContent, /22.*50/);
+Assert.equal(GrabThing('SearchModeInput').disabled, true);
+Assert.equal(GrabThing('StrictnessInput').disabled, true);
+Assert.equal(GrabThing('ModelControl').hidden, true);
+Assert.equal(GrabThing('ExportCsvButton').disabled, false);
+Assert.equal(GrabThing('ExportCsvButton').textContent, 'Light curve CSV');
+for (const Button of FakeViewButtons)
+  Assert.equal(Button.disabled, Button.dataset.view !== 'raw', `${Button.dataset.view} availability follows inspection mode`);
+Assert.ok(CanvasDoodles.filter(Call => Call[0] === 'arc').length >= 22, 'each retained measurement is visible');
+
+//MARK: supplied error bars
+CanvasDoodles.length = 0;
+RunApp('DrawRawMeasurements([0,.001],[100,100],X=>X,Y=>Y,{xMin:0,xMax:.01});');
+Assert.deepEqual(CanvasDoodles.filter(Call => Call[0] === 'lineTo').map(Call => Call.slice(1)),
+                 [[0,99.96],[3,100.04],[3,99.96]], 'supplied errors stay in input flux units; missing errors are not invented');
+
+//MARK: short curve exports
+RunApp(`
+  globalThis.SavedDownload = DownloadBlob;
+  globalThis.InspectionDownload = null;
+  DownloadBlob = (Content, Filename) => { globalThis.InspectionDownload = {Content, Filename}; };
+  ExportTransitCsv();
+  DownloadBlob = SavedDownload;
+`);
+Assert.match(RunApp('InspectionDownload.Filename'), /light-curve\.csv$/);
+Assert.equal(RunApp('InspectionDownload.Content.split("\\n").length'), 23);
+Assert.match(RunApp('InspectionDownload.Content'), /^Time,Flux,flux_err,exposure_seconds,/);
+Assert.equal(RunApp('RawCurveRowsForExport()[0].Time'), 2461360);
+Assert.equal(RunApp('SummaryForExport().planet_assessment'), null);
+Assert.equal(RunApp('SummaryForExport().period'), null);
+Assert.equal(RunApp('SummaryForExport().metrics'), undefined);
+Assert.equal(RunApp('SummaryForExport().plot.raw_flux[0]'), 100);
+Assert.equal(RunApp('SummaryForExport().plot.flux_uncertainty[0]'), .04);
+RunApp('delete InspectionFixture.median_flux;');
+Assert.ok(RunApp('InspectionMedian()') > 99 && RunApp('InspectionMedian()') < 101, 'the descriptive median uses retained input flux when it is not supplied');
+Assert.doesNotMatch(RunApp("PdfAnalysisDetails(AnalysisPdfRow('short.csv',CurrResult)).map(Line=>Line.text).join('\\n')"),
+                    /Candidate score:|Period:|Local measured depth:/);
+
+//MARK: short curve zoom and pan
+RunApp('CurrViewport = null; HoverThingy = null;');
+const FullSpan = RunApp('GetViewport().xMax - GetViewport().xMin');
+RunApp('ZoomAtPointer(.5);');
+Assert.ok(RunApp('GetViewport().xMax - GetViewport().xMin') < FullSpan, 'raw inspection can zoom');
+const BeforePan = RunApp('GetViewport().xMin');
+for (const Handler of GrabThing('FluxChart').listeners.pointerdown)
+  Handler({button:0, pointerId:7, clientX:450, clientY:250, preventDefault()
+  {
+  }});
+for (const Handler of GrabThing('FluxChart').listeners.pointermove)
+  Handler({pointerId:7, clientX:400, clientY:250});
+for (const Handler of GrabThing('FluxChart').listeners.pointerup)
+  Handler({pointerId:7});
+Assert.notEqual(RunApp('GetViewport().xMin'), BeforePan, 'raw inspection can pan after zooming');
+
+//MARK: inspection batch navigation
+RunApp(`
+  BatchInProgress = true;
+  FileResults = [{file:{name:'short.csv'},result:InspectionFixture}, {file:{name:'running.csv'},result:null,status:'running'}];
+  CurrFileIndex = 0;
+  RenderBatchSelect();
+`);
+Assert.equal(GrabThing('ResultSelect').disabled, false);
+Assert.match(GrabThing('BatchPickerMeta').textContent, /Short-curve inspection/);
+Assert.doesNotMatch(GrabThing('BatchPickerMeta').textContent, /candidate score|supported|SDE|SNR|P -/);
+RunApp('CurrResult = {transits:[]}; UpdateCurveTools();');
+Assert.equal(RunApp('CurrView'), 'phase', 'browsing an inspection does not lose the previous search view');
+Assert.equal(GrabThing('SearchModeInput').disabled, false);
+for (const Button of FakeViewButtons)
+  Assert.equal(Button.disabled, false, 'normal result controls are restored');
+//MARK: search mode transitions
+for (const Mode of ['tls', 'bls'])
+{
+  GrabThing('SearchModeInput').value = Mode;
+  RunApp('UpdateDetectionReadouts();');
+  Assert.equal(GrabThing('TlsOptions').hidden, Mode !== 'tls');
+  GrabThing('TlsThreadsInput').disabled = true;
+  RunApp('CurrResult = InspectionFixture; UpdateCurveTools();');
+  Assert.equal(GrabThing('SearchModeInput').disabled, true);
+  Assert.equal(GrabThing('TlsOptions').hidden, Mode !== 'tls');
+  RunApp('CurrResult = {transits:[]}; UpdateCurveTools();');
+  Assert.equal(GrabThing('SearchModeInput').disabled, false);
+  Assert.equal(GrabThing('TlsThreadsInput').disabled, true, 'inspection preserves a pre-existing disabled search control');
+  Assert.equal(GrabThing('TlsOptions').hidden, Mode !== 'tls');
+  GrabThing('TlsThreadsInput').disabled = false;
+}
+GrabThing('SearchModeInput').value = 'tls';
+RunApp('UpdateDetectionReadouts();');
+RunApp("CurrResult=null; MainResult=null; CurrView='zoom'; CurrViewport=null; BatchInProgress=false; UpdateCurveTools();");
+console.log('Frontend review: 19 behavior groups passed (including short-curve inspection, exports, and navigation).');
 
 //MARK: exposure checks
 GrabThing("ExposureSecondsInput").value = '0';

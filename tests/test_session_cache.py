@@ -10,6 +10,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "Exoplanet data parsing tool"
 Sys.path.insert(0, str(APP_DIR))
 
 from main import TransitRequestHandler  # noqa: E402
+from analysis_jobs import APP_VERSION  # noqa: E402
 from session_cache import SessionCache, SessionCacheManager, ValidateSessionId  # noqa: E402
 
 
@@ -122,7 +123,7 @@ class SessionCacheTests(Unittest.TestCase):
         IndexHtml = (APP_DIR / "static" / "index.html").read_text()
         AppJs = (APP_DIR / "static" / "app.js").read_text()
 
-        self.assertIn('aria-label="Application version 66">v66</span>', IndexHtml)
+        self.assertIn(f'aria-label="Application version {APP_VERSION}">v{APP_VERSION}</span>', IndexHtml)
         self.assertIn('id="SessionIndicator"', IndexHtml)
         self.assertIn('id="SaveLocationHeading">Save File Location</h2>', IndexHtml)
         self.assertIn('id="CacheFolderThing"', IndexHtml)

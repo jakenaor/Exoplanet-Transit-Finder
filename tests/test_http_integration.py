@@ -127,6 +127,48 @@ class HTTPIntegrationTests(Unittest.TestCase):
         self.assertEqual(FilePath.read_bytes(),Original)
         self.assertEqual(self.HttpRequest('/')[0],200)
 
+    def testShortUploadJobAndCacheKeepMeasurementsWithoutSearch(self):
+        Content = ('Time,Flux,flux_err,exposure_seconds,quality\n'
+                   '0,-10,2,15,0\n0.001,999,2,15,1\n0.002,30,3,30,0\n')
+        Body, Mime = Multipart(dict(csvTimeFormat='relative', csvTimeScale='unknown',
+                                    analysisRequestId='http-short-623'), 'short.csv', Content)
+        Status, Raw, _ = self.HttpRequest('/analysis-jobs', 'POST', Body, Mime)
+        self.assertEqual(Status, 202, Raw)
+        JobId = Json.loads(Raw)['job_id']
+        Deadline = Time.monotonic() + 5
+        while Time.monotonic() < Deadline:
+            _, Raw, _ = self.HttpRequest('/analysis-jobs/' + JobId)
+            Job = Json.loads(Raw)
+            if Job['status'] in ('completed', 'failed', 'cancelled'):
+                break
+            Time.sleep(.05)
+        self.assertEqual(Job['status'], 'completed', Job)
+        Result = Job['result']
+        self.assertTrue(Result['review_only'])
+        self.assertEqual(Result['search_status'], 'not_run')
+        self.assertEqual(Result['plot']['raw_flux'], [-10, 30])
+        self.assertEqual(Result['plot']['flux_uncertainty'], [2, 3])
+        self.assertEqual(Result['plot']['exposure_seconds'], [15, 30])
+        self.assertEqual(Result['cleaning']['retained_rows'], 2)
+        self.assertIsNone(Result['period'])
+        self.assertIsNone(Result['planet_assessment'])
+        self.assertEqual(Result['transits'], [])
+        State = dict(results=[dict(file_name='short.csv', result=Result, error=None)],
+                     current_batch_index=0, current_view='raw', active_job_id=None)
+        Status, Raw, _ = self.HttpRequest('/analysis-sessions/short_review_623', 'POST', Json.dumps(State).encode())
+        self.assertEqual(Status, 200, Raw)
+        Status, Raw, _ = self.HttpRequest('/analysis-sessions/short_review_623')
+        self.assertEqual(Status, 200, Raw)
+        self.assertEqual(Json.loads(Raw)['state']['results'][0]['result'], Result)
+
+    def testJsonMetadataUploadExplainsWhichFileToUse(self):
+        Body, Mime = Multipart({}, 'short_time_flux.json', '{"usable_rows": 3}')
+        Status, Raw, _ = self.HttpRequest('/analysis-jobs', 'POST', Body, Mime)
+        self.assertEqual(Status, 400, Raw)
+        Message = Json.loads(Raw)['error'].lower()
+        self.assertIn('metadata', Message)
+        self.assertIn('csv', Message)
+
     def testStaticAssetsAreServedWithExpectedContentTypes(self):
         for FilePath, Expected in [('/', 'text/html'),('/static/app.js','application/javascript'),('/static/styles.css','text/css')]:
             Status, Data, Headers=self.HttpRequest(FilePath)

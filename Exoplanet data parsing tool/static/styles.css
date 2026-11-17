@@ -614,6 +614,7 @@ button:disabled {
 .AssessmentCard.Inconclusive { border-left-color: var(--blue); }
 .AssessmentCard.NoPlanetLikeSignal { border-left-color: var(--danger); }
 .AssessmentCard.Pending { border-left-color: var(--quiet); }
+.AssessmentCard.InspectionOnly { border-left-color: var(--blue); }
 
 .AssessmentHead {
   display: flex;

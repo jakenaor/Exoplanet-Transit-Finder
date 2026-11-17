@@ -13,9 +13,9 @@
       <div>
         <div class="AppTitleRow">
           <h1>Transit Finder</h1>
-          <span class="VersionIndicator" aria-label="Application version 66">v66</span>
+          <span class="VersionIndicator" aria-label="Application version 67">v67</span>
         </div>
-        <p>Upload up to 100 CSV or FITS light curves with time and flux columns.</p>
+        <p>Upload up to 100 CSV or FITS light curves with time and flux columns. JSON metadata files are skipped.</p>
         <p id="SessionIndicator" class="SessionIndicator" aria-live="polite">Preparing session cache…</p>
       </div>
 
@@ -102,6 +102,7 @@
       <details class="AccordionSection" open>
         <summary><h2>Detection</h2></summary>
         <div class="AccordionBody Controls">
+          <p id="SearchUnavailable" class="ControlHelp" hidden></p>
           <div class="ControlRow">
             <label class="ControlLabel" for="StrictnessInput">
               <span>Local dip strictness (lower finds more)</span>
@@ -327,7 +328,7 @@
       <!--MARK: signal and event controls -->
       <div class="InspectorControls" aria-label="Transit inspection controls">
         <label id="SignalControl" hidden>Signal <select id="SignalPickThing"></select></label>
-        <label><input id="ShowModel" type="checkbox" checked> Show fitted model</label>
+        <label id="ModelControl"><input id="ShowModel" type="checkbox" checked> Show fitted model</label>
         <label id="LocalDipsControl" hidden><input id="ShowLocalDips" type="checkbox"> Local dips (unvalidated)</label>
         <span id="FitQualityLabel"></span>
         <label id="PhaseScopeControl" hidden>Phase range <select id="PhaseScope"><option value="focus">Focused transit</option><option value="orbit">Full orbit</option></select></label>

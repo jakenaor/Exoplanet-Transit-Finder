@@ -143,6 +143,8 @@ let JobConnectionLost = false;
 let RequestId = null;
 let ResultViewports = new Map();
 let CurrView = 'zoom';
+let ViewBeforeInspection = null;
+let InspectionControlState = null;
 let CurrViewport = null;
 let DragState = null;
 let HoverThingy = null;
@@ -293,9 +295,97 @@ async function RunCurve(CurveFile, Options, OnJobUpdate = () =>
 function ShowCurveResult(Result)
 {
   EmptyEl.style.display = 'none';
+  UpdateCurveTools();
+  if (IsShortCurve(Result))
+  {
+    ShowInspectionResult();
+    return;
+  }
   RenderMetadata();
   RenderSignalPicker();
   RenderStackEvents();
+  RenderMetrics();
+  UpdateChartHeading();
+  SyncExportButtons();
+  RenderTransitRows();
+  DrawFlux();
+}
+
+//MARK: short curve checks
+function IsShortCurve(Result = CurrResult)
+{
+  return Result?.review_only === true;
+}
+
+//MARK: inspection reason
+function InspectionReason(Result = CurrResult)
+{
+  return Result?.review_reason || Result?.search_reason ||
+         'This curve is available for inspection. Transit search was not run.';
+}
+
+//MARK: measured median
+function InspectionMedian(Result = CurrResult)
+{
+  return NullableNumber(Result?.median_flux) ?? Median(Result?.plot?.raw_flux || []);
+}
+
+//MARK: available curve tools
+function UpdateCurveTools()
+{
+  const Inspect = IsShortCurve();
+  if (Inspect && CurrView !== 'raw')
+  {
+    if (ViewBeforeInspection === null)
+      ViewBeforeInspection = CurrView;
+    CurrView = 'raw';
+    CurrViewport = null;
+  }
+  else if (!Inspect && ViewBeforeInspection !== null)
+  {
+    CurrView = ViewBeforeInspection;
+    ViewBeforeInspection = null;
+    CurrViewport = ResultViewports.get(`${CurrFileIndex}:${CurrView}`) || null;
+  }
+  ViewButtons.forEach(Button =>
+  {
+    Button.disabled = Inspect && Button.dataset.view !== 'raw';
+    Button.title = Button.disabled ? InspectionReason() : '';
+    Button.classList.toggle("Active", Button.dataset.view === CurrView);
+  });
+  if (Inspect)
+  {
+    if (InspectionControlState === null)
+      InspectionControlState = new Map(DetectionControls.map(({input : Input}) => [ Input, Input.disabled ]));
+    for (const {key : Key, input : Input} of DetectionControls)
+    {
+      const MetadataInput = [ 'csvTimeFormat', 'csvTimeScale', 'csvTimeUnit', 'exposureSeconds' ].includes(Key);
+      if (!MetadataInput)
+        Input.disabled = true;
+    }
+  }
+  else if (InspectionControlState !== null)
+  {
+    InspectionControlState.forEach((Disabled, Input) =>
+    {
+      Input.disabled = Disabled;
+    });
+    InspectionControlState = null;
+  }
+  ResetDetectionButton.disabled = Inspect;
+  document.getElementById("SearchUnavailable").hidden = !Inspect;
+  document.getElementById("SearchUnavailable").textContent = Inspect ? InspectionReason() : '';
+  document.getElementById("ModelControl").hidden = Inspect;
+  ShowModelInput.disabled = Inspect;
+  document.getElementById("SignalControl").hidden = Inspect || (MainResult?.signals?.length || 0) < 2;
+}
+
+//MARK: inspect a short curve
+function ShowInspectionResult()
+{
+  SignalPickThing.value = '';
+  StackEventInput.value = 'all';
+  RenderMetadata();
   RenderMetrics();
   UpdateChartHeading();
   SyncExportButtons();
@@ -461,6 +551,8 @@ function DrawFlux()
   FluxPen.lineWidth = CurrView === 'raw' ? 1.2 : 2.4;
   DrawSeriesPath(Times, Flux, XScale, YScale, Viewport,
                  {breakIndices : CurrResult.plot.break_indices || [], timeSeries : true});
+  if (CurrView === 'raw')
+    DrawRawMeasurements(Times, RawFlux, XScale, YScale, Viewport);
   if (HasTransitModel() && CurrView !== 'raw')
   {
     ApplyModelStyle(1.8);
@@ -476,6 +568,41 @@ function DrawFlux()
   }
 
   UpdateCanvasCursor(HoverThingy);
+}
+
+//MARK: raw points and errors
+function DrawRawMeasurements(Times, Flux, XScale, YScale, Viewport)
+{
+  const Errors = CurrResult.plot.flux_uncertainty || [];
+  if (!IsShortCurve())
+    return;
+  FluxPen.strokeStyle = 'rgba(15,118,110,.5)';
+  FluxPen.fillStyle = '#0f766e';
+  FluxPen.lineWidth = 1;
+  Times.forEach((Time, Index) =>
+  {
+    const Value = NullableNumber(Flux[Index]);
+    if (Value === null || Time < Viewport.xMin || Time > Viewport.xMax)
+      return;
+    const X = XScale(Time);
+    const Error = NullableNumber(Errors[Index]);
+    if (Error !== null && Error > 0)
+    {
+      const Top = YScale(Value + Error);
+      const Bottom = YScale(Value - Error);
+      FluxPen.beginPath();
+      FluxPen.moveTo(X, Top);
+      FluxPen.lineTo(X, Bottom);
+      FluxPen.moveTo(X - 3, Top);
+      FluxPen.lineTo(X + 3, Top);
+      FluxPen.moveTo(X - 3, Bottom);
+      FluxPen.lineTo(X + 3, Bottom);
+      FluxPen.stroke();
+    }
+    FluxPen.beginPath();
+    FluxPen.arc(X, YScale(Value), 2.5, 0, Math.PI * 2);
+    FluxPen.fill();
+  });
 }
 
 //MARK: control funcs
@@ -1564,6 +1691,14 @@ function BatchResultDetail(Item)
       score : null,
       transits : null
     };
+  if (IsShortCurve(Item.result))
+    return {
+      label : 'Short-curve inspection',
+      meta : `${Item.result.total_points.toLocaleString()} usable samples · transit search not run`,
+      status : 'inspection_only',
+      score : null,
+      transits : null,
+    };
   const Assessment = AssessmentForResult(Item.result);
   const TransitCount = Item.result.transits.length;
   return {
@@ -1616,7 +1751,8 @@ function RenderBatchPicker()
                  : (FileResults.length ? 'No successful file selected' : 'No processed files');
   BatchPickerMeta.textContent =
       ActiveItem
-          ? `${ActiveDetail.score === null ? 'No score' : `${ActiveDetail.score}/100 candidate score`} · ${
+          ? `${ActiveDetail.status === 'inspection_only' ? '' :
+               (ActiveDetail.score === null ? 'No score · ' : `${ActiveDetail.score}/100 candidate score · `)}${
                 ActiveDetail.label} · ${ActiveDetail.meta}`
           : (FileResults.length && SuccessCount === 0 ? 'All processed files failed.'
                                                       : 'Run analysis to populate this list.');
@@ -1706,6 +1842,7 @@ function RenderBatchSelect()
             const Disabled = !Item.result ? ' disabled' : '';
             const Detail = !Item.result ? (Item.error ? (Item.error === 'Cancelled' ? 'cancelled' : 'failed')
                                                       : (Item.status || 'pending').replaceAll('_', ' '))
+                                        : IsShortCurve(Item.result) ? 'Short-curve inspection; search not run'
                                         : `${AssessmentForResult(Item.result).shortLabel}; ${
                                               Item.result.transits.length} covered windows`;
             return `<option value="${Index}"${Selected}${Disabled}>${Index + 1}. ${
@@ -1725,7 +1862,14 @@ function SetFiles(FileList)
         'Reconnect to or cancel the current job before replacing files. Completed results remain available below.');
     return;
   }
-  const Files = Array.from(FileList || []);
+  const Selected = Array.from(FileList || []);
+  const Files = Selected.filter(CurveFile => /\.(csv|fits|fit|fts)$/i.test(CurveFile.name || ''));
+  const Skipped = Selected.length - Files.length;
+  if (Selected.length && !Files.length)
+  {
+    SetStatus(`Skipped ${Skipped} unsupported file${Skipped === 1 ? '' : 's'} (including JSON metadata). No CSV or FITS light curves were added.`);
+    return;
+  }
   CurveFiles = Files.slice(0, MaxBatchFiles);
   RenderPerFileTarget();
   UpdateSidebarWidth(CurveFiles);
@@ -1736,18 +1880,12 @@ function SetFiles(FileList)
   RenderBatchSelect();
   ClearResultView();
   AnalyzeButton.disabled = !CurveFiles.length;
-  if (!CurveFiles.length)
-  {
-    SetStatus('No file selected.');
-  }
-  else if (Files.length > MaxBatchFiles)
-  {
-    SetStatus(`Selected first ${MaxBatchFiles} of ${Files.length} files.`);
-  }
-  else
-  {
-    SetStatus(CurveFiles.length === 1 ? CurveFiles[0].name : `${CurveFiles.length} files selected.`);
-  }
+  const SelectionText = !CurveFiles.length ? 'No CSV or FITS light curves selected.'
+                        : Files.length > MaxBatchFiles
+                            ? `Selected first ${MaxBatchFiles} of ${Files.length} light curves.`
+                        : CurveFiles.length === 1 ? CurveFiles[0].name
+                                                  : `${CurveFiles.length} light curves selected.`;
+  SetStatus(SelectionText + (Skipped ? ` Skipped ${Skipped} unsupported file${Skipped === 1 ? '' : 's'} (including JSON metadata); choose CSV or FITS light curves.` : ''));
   QueueSessionSave();
 }
 
@@ -1781,6 +1919,7 @@ function UpdateDetectionReadouts()
       {
         Input.disabled = false;
       });
+  UpdateCurveTools();
 }
 
 //MARK: reset settings
@@ -1808,6 +1947,7 @@ function SyncExportButtons()
 {
   const Disabled = !CurrResult;
   ExportCsvButton.disabled = Disabled;
+  ExportCsvButton.textContent = IsShortCurve() ? 'Light curve CSV' : 'Transit CSV';
   ExportPngButton.disabled = Disabled;
   ExportJsonButton.disabled = Disabled;
   ExportAnalysisPdfButton.disabled = Disabled;
@@ -1819,6 +1959,7 @@ function ClearResultView()
 {
   CurrResult = null;
   MainResult = null;
+  UpdateCurveTools();
   UpdateInspectorControls();
   CurrViewport = null;
   EmptyEl.style.display = 'grid';
@@ -2350,12 +2491,15 @@ async function ExecuteBatch(StartIndex = 0, ResumeJobId = null)
                              .filter(Item => ['strong_candidate', 'possible_candidate'].includes(
                                          AssessmentForResult(Item.result).status))
                              .length;
+      const Inspections = Completed.filter(Item => IsShortCurve(Item.result)).length;
       SetStatus(
           Remaining.length
               ? `${Completed.length} results available. Reselect ${
                     Remaining.length} unsubmitted source file(s) to continue; their bytes were not cached.`
               : `Batch ${AnalysisCancelRequested ? 'cancelled' : 'complete'}: ${Completed.length}/${
-                    FileResults.length} processed, ${Candidates} candidate-like${
+                    FileResults.length} processed, ${
+                    Inspections ? `${Inspections} inspection only (search not run)` : `${Candidates} candidate-like`}${
+                    Inspections && Completed.length > Inspections ? `, ${Candidates} candidate-like among ${Completed.length - Inspections} searched` : ''}${
                     Failed.length ? `, ${Failed.length} failed or cancelled` : ''}.`);
     }
   }
@@ -2507,6 +2651,8 @@ ViewButtons.forEach(Button =>
 {
   Button.addEventListener('click', () =>
   {
+    if (IsShortCurve() && Button.dataset.view !== 'raw')
+      return;
     ResultViewports.set(`${CurrFileIndex}:${CurrView}`, CurrViewport);
     CurrView = Button.dataset.view;
     if (SignalPickThing.value === 'combined' && CurrView !== 'comparison')
@@ -2527,20 +2673,20 @@ ViewButtons.forEach(Button =>
 //MARK: plot checks
 function HasPhaseFold()
 {
-  return Boolean(CurrResult && CurrResult.phase_folded && CurrResult.phase_folded.phase.length);
+  return Boolean(!IsShortCurve() && CurrResult && CurrResult.phase_folded && CurrResult.phase_folded.phase.length);
 }
 
 //MARK: stack data check
 function HasTransitStack()
 {
-  return Boolean(CurrResult && CurrResult.transit_stack && Array.isArray(CurrResult.transit_stack.traces) &&
+  return Boolean(!IsShortCurve() && CurrResult && CurrResult.transit_stack && Array.isArray(CurrResult.transit_stack.traces) &&
                  CurrResult.transit_stack.traces.length);
 }
 
 //MARK: model data check
 function HasTransitModel()
 {
-  return Boolean(ShowModelInput.checked && CurrResult && CurrResult.transit_model &&
+  return Boolean(!IsShortCurve() && ShowModelInput.checked && CurrResult && CurrResult.transit_model &&
                  Array.isArray(CurrResult.transit_model.time) && CurrResult.transit_model.time.length);
 }
 
@@ -2620,6 +2766,13 @@ function UpdateChartHeading()
   {
     ChartTitleEl.textContent = 'Flux Over Time';
     SubtitleEl.textContent = 'Transit boxes appear after analysis.';
+    return;
+  }
+  if (IsShortCurve())
+  {
+    ChartTitleEl.textContent = 'Short-Curve Inspection';
+    SubtitleEl.textContent = `${InspectionReason()} Raw measurements${
+        CurrResult.plot.flux_uncertainty?.some(Error => NullableNumber(Error) > 0) ? ' with supplied error bars' : ''}; zoom, pan, and exports remain available.`;
     return;
   }
 
@@ -2985,7 +3138,7 @@ function CurrentWarnings()
 //MARK: saved verdict
 function CurrentPlanetAssessment(Metrics = null, Warnings = null)
 {
-  if (!CurrResult)
+  if (!CurrResult || IsShortCurve())
     return null;
   // reopening a result should show its saved verdict, not score it again.
   const Saved = CurrResult.planet_assessment;
@@ -3016,6 +3169,8 @@ function AssessmentForResult(Result)
 {
   if (!Result)
     return {shortLabel : 'Pending', candidateScore : null, status : 'pending'};
+  if (IsShortCurve(Result))
+    return {shortLabel : 'Short-curve inspection', candidateScore : null, status : 'inspection_only'};
   const PreviousResult = CurrResult;
   CurrResult = Result;
   try
@@ -3076,6 +3231,11 @@ function RenderWarnings(Warnings = null)
   const ResolvedWarnings = Warnings || CurrentWarnings();
   if (!ResolvedWarnings.length)
   {
+    if (IsShortCurve())
+    {
+      WarningsEl.innerHTML = '<div class="WarningItem Info"><strong>No additional input warnings</strong><span>Transit search and candidate checks were not run.</span></div>';
+      return;
+    }
     WarningsEl.innerHTML = `
       <div class="WarningItem Info">
         <strong>No major warnings</strong>
@@ -3126,6 +3286,19 @@ function RenderMetrics()
 {
   if (!CurrResult)
     return;
+  if (IsShortCurve())
+  {
+    AssessmentEl.innerHTML = `<div class="AssessmentCard InspectionOnly"><div class="AssessmentHead"><strong>Short-curve inspection</strong><span>Search not run</span></div><p>${EscapeHtml(InspectionReason())}</p><p>This is an inspection of the supplied measurements. No orbital period or planet assessment was calculated.</p></div>`;
+    MetricsEl.innerHTML = `
+      <div class="Metric"><span>Usable samples</span><span>${CurrResult.total_points.toLocaleString()}</span></div>
+      <div class="Metric"><span>Time span</span><span>${Fmt(CurrResult.domain.time_max - CurrResult.domain.time_min)} days</span></div>
+      <div class="Metric"><span>Median input flux</span><span>${Fmt(InspectionMedian())}</span></div>
+      <div class="Metric"><span>Flux units</span><span>${EscapeHtml(CurrResult.flux_unit || 'not specified')}</span></div>
+      <div class="Metric"><span>Supplied uncertainties</span><span>${(CurrResult.plot.flux_uncertainty || []).filter(Error => NullableNumber(Error) > 0).length} / ${CurrResult.total_points} samples</span></div>`;
+    PeriodCandidatesEl.innerHTML = `<div class="WarningItem Info"><strong>Period search not run</strong><span>${EscapeHtml(InspectionReason())}</span></div>`;
+    RenderWarnings(CurrentWarnings());
+    return;
+  }
   const Metrics = CurrentAnalysisMetrics();
   const Warnings = CurrentWarnings(Metrics);
   const Period =
@@ -3179,6 +3352,11 @@ function RenderTransitRows()
 {
   if (!CurrResult)
     return;
+  if (IsShortCurve())
+  {
+    RowsEl.innerHTML = '<tr><td colspan="10" class="EmptyEventRow">Transit search was not run for this short curve.</td></tr>';
+    return;
+  }
   RowsEl.innerHTML =
       CurrResult.transits.length
           ? CurrResult.transits
@@ -3238,7 +3416,18 @@ function RenderMetadata()
       Result.effective_settings || Provenance.effective_settings || Result.detection_options || {};
   const Cleaning = Result.cleaning || Result.cleaning_report || {};
   const Input = Result.input_metadata || {};
-  const Pairs = [
+  const Pairs = IsShortCurve(Result) ? [
+    [ 'Analysis state', 'Short-curve inspection; transit search not run' ],
+    [ 'Reason', InspectionReason(Result) ],
+    [ 'Usable samples', Result.total_points ],
+    [ 'Analyzed at', Result.analyzed_at || Provenance.analyzed_at || 'Unknown' ],
+    [ 'Analysis version', Provenance.analysis_version || Result.analysis_version || 'Unknown' ],
+    [ 'Result schema', Result.result_schema_version ?? Provenance.result_schema_version ?? 'Unknown' ],
+    [ 'Time format / scale', `${Input.time_format || 'unknown'} / ${Input.time_scale || 'unknown'}` ],
+    [ 'Flux units', Result.flux_unit || 'not specified' ],
+    [ 'Exposure', ExposureSummary(Result.exposure_metadata) ],
+    [ 'Processing', 'Original retained flux values; no transit search, normalization, or smoothing.' ],
+  ] : [
     [ 'Analyzed at', Result.analyzed_at || Provenance.analyzed_at || 'Unknown (legacy analysis)' ],
     [
       'Local dips (unvalidated)',
@@ -3270,8 +3459,8 @@ function RenderMetadata()
           .map(([ Key, Value ]) => `<div class="Metric"><span>${EscapeHtml(Key)}</span><span>${
                    EscapeHtml(Value)}</span></div>`)
           .join('') +
-      "<p class=\"MetadataNote\">The approximate model-vs-flat p-value is not a search-wide false-alarm probability. Candidate scores are not probabilities.</p>" +
-      ObjectRows('Cleaning report', Cleaning) + ObjectRows('Effective search settings', Settings) +
+      (IsShortCurve(Result) ? '' : "<p class=\"MetadataNote\">The approximate model-vs-flat p-value is not a search-wide false-alarm probability. Candidate scores are not probabilities.</p>") +
+      ObjectRows('Cleaning report', Cleaning) + ObjectRows(IsShortCurve(Result) ? 'Requested controls (search not run)' : 'Effective search settings', Settings) +
       ObjectRows('Input metadata', Input) + ObjectRows('Exposure details', Result.exposure_metadata || {}) +
       ObjectRows('Execution and ETA audit', Result.execution || {}) +
       ObjectRows('Search sample context', Result.search_context || {}) +
@@ -3337,6 +3526,7 @@ function UpdateInspectorControls()
   const Quality = CurrResult?.fit_quality;
   document.getElementById("FitQualityLabel").textContent =
       !CurrResult ? ''
+                  : IsShortCurve() ? 'Inspection only — no fitted model'
                   : (Quality?.label ||
                      (IsTentativeModel() ? 'Tentative fit — below candidate threshold' : 'Fitted model'));
   const Element = document.getElementById("EventInspection");
@@ -3495,6 +3685,15 @@ function ExportTransitCsv()
 {
   if (!CurrResult)
     return;
+  if (IsShortCurve())
+  {
+    const Rows = RawCurveRowsForExport();
+    const Headers = Object.keys(Rows[0] || {});
+    const Csv = [ Headers.join(','), ...Rows.map(Row => Headers.map(Header => CsvCell(Row[Header])).join(',')) ].join('\n');
+    DownloadBlob(Csv, `${ExportBaseName()}-light-curve.csv`, 'text/csv;charset=utf-8');
+    SetStatus('Light curve CSV exported with supplied uncertainties. Transit search was not run.');
+    return;
+  }
   const Rows = TransitRowsForExport();
   const HttpHeaders = [
     'transit',
@@ -3533,10 +3732,33 @@ function ExportTransitCsv()
   SetStatus('Transit CSV exported.');
 }
 
+//MARK: measured curve export
+function RawCurveRowsForExport()
+{
+  return CurrResult.plot.time.map((Time, Index) => ({
+    Time : CurrResult.time_reference + Time,
+    Flux : CurrResult.plot.raw_flux[Index],
+    flux_err : CurrResult.plot.flux_uncertainty?.[Index] ?? null,
+    exposure_seconds : CurrResult.plot.exposure_seconds?.[Index] ?? null,
+    time_offset_days : Time,
+    time_reference : CurrResult.time_reference,
+    time_format : CurrResult.input_metadata?.time_format || 'unknown',
+    time_scale : CurrResult.input_metadata?.time_scale || 'unknown',
+    flux_unit : CurrResult.flux_unit || '',
+  }));
+}
+
 //MARK: json fields
 function SummaryForExport()
 {
   // export the settings used for this result, not the current control values.
+  if (IsShortCurve())
+    return {
+      ...CurrResult,
+      exported_at : new Date().toISOString(),
+      source_file : CurrFile?.name || CurrResult.source_file || null,
+      chart_view : CurrView,
+    };
   const Metrics = CurrentAnalysisMetrics();
   const Warnings = CurrentWarnings(Metrics);
   const PlanetAssessment = CurrentPlanetAssessment(Metrics, Warnings);
@@ -3669,6 +3891,20 @@ const AnalysisPdfColumns = [
 //MARK: pdf summary row
 function AnalysisPdfRow(FileName, Result)
 {
+  if (IsShortCurve(Result))
+    return {
+      file : FileName || Result.source_file || 'inspection',
+      assessment : 'Inspection only',
+      score : '-',
+      points : Result.total_points.toLocaleString(),
+      transits : 'Not searched',
+      supported : 'Not searched',
+      period : 'Not searched',
+      duration : '-', depthPercent : '-', sde : '-', snr : '-',
+      medianFlux : Fmt(InspectionMedian(Result)),
+      noise : '-',
+      detailResult : Result,
+    };
   const Metrics = MetricsForResult(Result);
   const Assessment = AssessmentForResult(Result);
   const DepthPpm = Metrics.medianDepthFraction === null || Metrics.medianDepthFraction === undefined
@@ -3948,6 +4184,15 @@ function PdfAnalysisDetails(Row)
     if (Text)
       Add(Text);
   };
+  if (IsShortCurve(Result))
+  {
+    Section('SHORT-CURVE INSPECTION');
+    Add(InspectionReason(Result));
+    Add(`${Row.points} retained measurements. Transit search was not run; no period, model, or planet assessment was calculated.`);
+    Add(`Median input flux: ${Row.medianFlux}. Raw measurements and supplied uncertainties are available in the light curve CSV and JSON exports.`);
+  }
+  else
+  {
   Section('RESULT AND EVIDENCE');
   Add(`Assessment: ${Row.assessment}. Candidate score: ${Row.score}/100 (not a probability).`);
   Add(`Supported events: ${Row.supported}; covered windows: ${Row.transits}; all predicted windows: ${
@@ -3968,6 +4213,7 @@ function PdfAnalysisDetails(Row)
     Add(Assessment.recommendation);
   if (Result.multi_signal_search?.joint_fit)
     Packed(PdfSettingPairs(Result.multi_signal_search.joint_fit, 'Joint fit'));
+  }
   Section('ANALYSIS PROVENANCE');
   const Provenance = Result.provenance || {};
   Add(`Analyzed: ${
@@ -3994,14 +4240,14 @@ function PdfAnalysisDetails(Row)
     Add('Cleaning counts were not recorded in this legacy result.');
   Add(`Normalization: ${Result.normalization?.method || 'unknown'}. Segments: ${
       Result.normalization?.segment_count ?? 'not recorded'}.`);
-  Section('EFFECTIVE SEARCH SETTINGS');
+  Section(IsShortCurve(Result) ? 'REQUESTED CONTROLS (SEARCH NOT RUN)' : 'EFFECTIVE SEARCH SETTINGS');
   Packed(PdfSettingPairs(Result.effective_settings || Provenance.effective_settings ||
                          Result.detection_options || {}));
   if (!(Result.effective_settings || Provenance.effective_settings))
     Add('Legacy controls are recorded above; exact engine defaults and dependency versions may be unknown.');
   Section('WARNINGS');
   if (!Result.warnings?.length)
-    Add('No saved major warnings. This does not establish that the signal is planetary.');
+    Add(IsShortCurve(Result) ? 'No additional input warnings recorded.' : 'No saved major warnings. This does not establish that the signal is planetary.');
   for (const Warning of Result.warnings || [])
     Add(`${Warning.severity}: ${Warning.title}. ${Warning.detail}`);
   return Lines;

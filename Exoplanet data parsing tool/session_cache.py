@@ -91,11 +91,64 @@ def _ValidateResultMetadata(Result, FileName):
                 raise ValueError(f"The saved result for {FileName} has an analysis timestamp without a time zone.")
 
 
+#MARK: inspection results
+def _ValidateInspectionResult(Result, Plot, FileName):
+    """Inspection preserves the samples without inventing search results."""
+    def Invalid(Detail):
+        raise ValueError(f"The saved inspection for {FileName} {Detail}. The original cache is unchanged.")
+
+    if Result.get("analysis_mode") != "inspection" or Result.get("search_status") != "not_run":
+        Invalid("has inconsistent search status")
+    for Key in ("review_reason", "search_reason"):
+        if not isinstance(Result.get(Key), str) or not Result[Key].strip():
+            Invalid("has no explanation for the skipped search")
+    Time = Plot["time"]
+    if len(Time) < 2 or any(Right <= Left for Left, Right in zip(Time, Time[1:])):
+        Invalid("needs at least two distinct, increasing sample times")
+    if Plot["smooth_flux"] != Plot["raw_flux"]:
+        Invalid("changes the original flux samples")
+    Requirements = Result.get("search_requirements")
+    if (not isinstance(Requirements, dict)
+            or type(Requirements.get("minimum_samples")) is not int
+            or Requirements["minimum_samples"] != 50
+            or type(Requirements.get("usable_samples")) is not int
+            or Requirements["usable_samples"] != len(Time)):
+        Invalid("has inconsistent sample counts")
+    if type(Result.get("total_points")) is not int or Result["total_points"] != len(Time):
+        Invalid("has inconsistent total sample counts")
+    if not _FiniteNumber(Result.get("time_reference")):
+        Invalid("has an invalid time reference")
+    # nulls and empty event lists make it clear that no search took place.
+    for Key in ("period", "period_epoch", "period_duration", "period_sde", "period_snr",
+                "period_probability", "transit_probability", "detection_snr",
+                "planet_assessment", "assessment", "fit_quality", "diagnostics",
+                "transit_model", "phase_folded", "transit_stack", "model_comparison", "periodogram", "tls"):
+        if Result.get(Key) is not None:
+            Invalid(f"contains a search-derived {Key}")
+    for Key in ("transits", "signals", "predicted_windows", "observed_events", "exploratory_dips"):
+        if Result.get(Key, []) != []:
+            Invalid(f"contains search-derived {Key}")
+    Exposures = Plot.get("exposure_seconds")
+    if Exposures is not None and (not isinstance(Exposures, list) or len(Exposures) != len(Time)
+            or any(Value is not None and (not _FiniteNumber(Value) or Value < 0) for Value in Exposures)):
+        Invalid("has invalid exposure samples")
+    for Key, Low, High in (("domain", "time_min", "time_max"),
+                            ("raw_domain", "flux_min", "flux_max"),
+                            ("clean_domain", "flux_min", "flux_max")):
+        Domain = Result.get(Key)
+        if (not isinstance(Domain, dict)
+                or not _FiniteNumber(Domain.get(Low)) or not _FiniteNumber(Domain.get(High))
+                or Domain[High] <= Domain[Low]):
+            Invalid(f"has an invalid {Key}")
+
+
 #MARK: save runs
 def ValidateResult(Result, FileName="saved file"):
     """Check the metadata and arrays before the browser uses a saved result."""
     if not isinstance(Result, dict):
         raise ValueError(f"The saved result for {FileName} is not a result object.")
+    if "review_only" in Result and type(Result["review_only"]) is not bool:
+        raise ValueError(f"The saved result for {FileName} has an invalid inspection marker.")
     _ValidateResultMetadata(Result, FileName)
     #MARK: plot stuffs
     Plot = Result.get("plot")
@@ -159,6 +212,8 @@ def ValidateResult(Result, FileName="saved file"):
     if Errors is not None and (not isinstance(Errors, list) or len(Errors) != len(Arrays[0])
             or any(Value is not None and (not _FiniteNumber(Value) or Value <= 0) for Value in Errors)):
         raise ValueError("The saved result has invalid flux uncertainty samples.")
+    if Result.get("review_only"):
+        _ValidateInspectionResult(Result, Plot, FileName)
     return Result
 
 
