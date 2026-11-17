@@ -13,7 +13,7 @@
       <div>
         <div class="AppTitleRow">
           <h1>Transit Finder</h1>
-          <span class="VersionIndicator" aria-label="Application version 67">v67</span>
+          <span class="VersionIndicator" aria-label="Application version 68">v68</span>
         </div>
         <p>Upload up to 100 CSV or FITS light curves with time and flux columns. JSON metadata files are skipped.</p>
         <p id="SessionIndicator" class="SessionIndicator" aria-live="polite">Preparing session cache…</p>
@@ -56,6 +56,15 @@
         </span>
       </label>
       <input id="CurveFilesInput" type="file" accept=".csv,.fits,.fit,.fts,text/csv,application/fits" multiple>
+      <!--MARK: gap thingy -->
+      <fieldset class="ViewingFilters">
+        <legend>Viewing filters</legend>
+        <label class="GapToggle"><input id="InspectOnlyInput" type="checkbox"> View data only (skip period search)</label>
+        <label class="GapToggle"><input id="CutGapsInput" type="checkbox"> Cut large gaps in Observation viewer</label>
+        <label for="GapMinutesInput">Minimum gap (minutes)</label>
+        <input id="GapMinutesInput" type="number" min="0.1" max="10080" step="any" value="30">
+        <p class="ControlHelp">Shorten gaps larger than this and 10 times the typical sampling interval. Original timestamps stay intact for searches and exports.</p>
+      </fieldset>
       <div class="AnalysisActions">
         <button id="AnalyzeButton" disabled>Analyze files</button>
         <button id="CancelAnalysisButton" class="CancelAnalysisButton" type="button" hidden>Cancel analysis</button>
@@ -316,7 +325,7 @@
         <div class="ViewControls" aria-label="Chart view">
           <button class="ViewButton Active" type="button" data-view="zoom">Transit zoom</button>
           <button class="ViewButton" type="button" data-view="clean">Full cleaned</button>
-          <button class="ViewButton" type="button" data-view="raw">Raw series</button>
+          <button class="ViewButton" type="button" data-view="raw">Observation viewer</button>
           <button class="ViewButton" type="button" data-view="phase">Phase folded</button>
           <button class="ViewButton" type="button" data-view="stack">Transit stack</button>
           <button class="ViewButton" type="button" data-view="periodogram">Periodogram</button>
@@ -331,6 +340,16 @@
         <label id="ModelControl"><input id="ShowModel" type="checkbox" checked> Show fitted model</label>
         <label id="LocalDipsControl" hidden><input id="ShowLocalDips" type="checkbox"> Local dips (unvalidated)</label>
         <span id="FitQualityLabel"></span>
+        <!--MARK: observation thingies -->
+        <div id="ObservationTools" class="ObservationTools" hidden>
+          <label>Time units <select id="ObservationUnits"><option value="auto">Auto</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></label>
+          <label>Observing run <select id="ObservationRun"><option value="all">All observations</option></select></label>
+          <label><input id="ObservationJoinPoints" type="checkbox" checked> Join samples</label>
+          <label><input id="ObservationErrors" type="checkbox" checked> Error bars</label>
+          <button id="FitObservationButton" class="ViewButton" type="button">Fit visible data</button>
+          <span id="ObservationSummary" class="ObservationSummary"></span>
+          <output id="ObservationReadout" class="ObservationReadout">Hover over a point to inspect its original time and flux.</output>
+        </div>
         <label id="PhaseScopeControl" hidden>Phase range <select id="PhaseScope"><option value="focus">Focused transit</option><option value="orbit">Full orbit</option></select></label>
         <span id="StackControls" hidden><label>Event <select id="StackEvent"><option value="all">All events</option></select></label><label>Cycles <select id="StackGroup"><option value="all">All</option><option value="odd">Odd</option><option value="even">Even</option></select></label><label><input id="StackIsolate" type="checkbox"> Isolate selected</label><label><input id="StackMedian" type="checkbox" checked> Median</label><label><input id="StackRecenter" type="checkbox"> Measured centers</label></span>
       </div>
@@ -344,7 +363,7 @@
       <div class="TableWrap">
         <table>
           <thead>
-            <tr>
+            <tr id="CurveTableHead">
               <th>Window / evidence</th>
               <th>Start day</th>
               <th>Center day</th>

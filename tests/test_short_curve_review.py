@@ -1,6 +1,7 @@
 """Short observations can be inspected without inventing a transit search."""
 import json as Json
 from pathlib import Path
+from types import SimpleNamespace
 import sys as Sys
 import unittest as Unittest
 from unittest import mock as Mock
@@ -115,6 +116,84 @@ class ShortCurveReviewTests(Unittest.TestCase):
                 Analysis.RunCurve(Time, Flux)
         with self.assertRaisesRegex(ValueError, "at least 50"):
             Analysis.EstimatePeriodWithTls(Np.arange(49), Np.ones(49))
+
+
+#MARK: observation viewer and gaps
+class ObservationViewTests(Unittest.TestCase):
+    def testViewOnlyOpensFortyEightHoursWithoutSearchingOrNormalizing(self):
+        Times = 2459000 + Np.linspace(0, 2, 97)
+        Flux = 400 + Np.sin(Np.arange(len(Times)))
+        with Mock.patch.object(Analysis, "DetectTransits", side_effect=AssertionError("search ran")), \
+                Mock.patch.object(Analysis, "NormalizeFluxBySegments", side_effect=AssertionError("normalized")):
+            Result = Analysis.RunCurve(Times, Flux, {"inspection_only": True, "cut_gaps": True})
+        self.assertTrue(Result["review_only"])
+        self.assertIn("view-only", Result["review_reason"])
+        View = Result["observation_view"]
+        Np.testing.assert_equal(View["plot"]["raw_flux"], Flux)
+        Np.testing.assert_equal(View["plot"]["time"], Times - Times[0])
+        Np.testing.assert_equal(View["plot"]["display_time"], View["plot"]["time"])
+        self.assertEqual(View["display_time_map"]["gap_count"], 0)
+        self.assertEqual(View["domain"]["time_max"], 2)
+        self.assertIsNone(Result["period"])
+
+    def testThreeNightsCompressOnlyEmptyIntervalsAndKeepMeasurements(self):
+        Times = Np.r_[Np.arange(4), 2880 + Np.arange(4), 7200 + Np.arange(4)] / 1440
+        Flux = Np.arange(12, dtype=float) - 3
+        Errors = Np.arange(12) / 100 + .01
+        Exposures = Np.arange(12, dtype=float)
+        Views = []
+        for Cut in (False, True):
+            Result = Analysis.RunCurve(Times, Flux, {"cut_gaps": Cut, "gap_minutes": 30,
+                "_flux_uncertainty": Errors, "_exposure_seconds": Exposures})
+            View = Result["observation_view"]
+            Views.append(View)
+            self.assertEqual(View["display_time_map"]["gap_count"], 2)
+            self.assertEqual(View["plot"]["break_indices"], [4, 8])
+            Np.testing.assert_equal(View["plot"]["time"], Times)
+            Np.testing.assert_equal(View["plot"]["raw_flux"], Flux)
+            Np.testing.assert_equal(View["plot"]["flux_uncertainty"], Errors)
+            Np.testing.assert_equal(View["plot"]["exposure_seconds"], Exposures)
+            self.assertEqual(View["domain"]["time_max"], Times[-1])
+            Json.dumps(Result, allow_nan=False)
+        Np.testing.assert_equal(Views[0]["plot"]["display_time"], Times)
+        Np.testing.assert_allclose(Np.diff(Views[1]["plot"]["display_time"]), 1 / 1440)
+        self.assertAlmostEqual(Views[1]["display_time_map"]["removed_days"], Times[-1] - 11 / 1440)
+
+    def testTwoSamplesDoNotInventCadenceAndDenseCurvesKeepRunEdges(self):
+        View = Analysis.RunCurve([1, 8], [3, 4], {"cut_gaps": True})["observation_view"]
+        self.assertIsNone(View["display_time_map"]["cadence_days"])
+        self.assertIn("three", View["display_time_map"]["reason"])
+        self.assertEqual(View["plot"]["display_time"], [0, 7])
+        Times = Np.r_[Np.arange(15000) / 86400, 3 + Np.arange(15000) / 86400]
+        Flux = Np.ones(len(Times))
+        Flux[7312] = .5
+        View = Analysis.MakeObservationThing(Times, Flux, {"cut_gaps": True}, Np.zeros(len(Times)))
+        self.assertLess(len(View["plot"]["time"]), len(Times))
+        self.assertEqual(View["total_points"], len(Times))
+        for Edge in (Times[0], Times[14999], Times[15000], Times[-1]):
+            self.assertIn(Edge, View["plot"]["time"])
+        self.assertIn(.5, View["plot"]["raw_flux"])
+        self.assertAlmostEqual(View["display_time_map"]["cadence_days"], 1 / 86400)
+
+    def testGapFilterDoesNotChangeScientificResults(self):
+        Times = Np.r_[Np.linspace(0, 2, 250), Np.linspace(4, 6, 250)]
+        Phase = ((Times - .25 + .5) % 1) - .5
+        Flux = 1000 * (1 - .01 * (Np.abs(Phase) < .04))
+        Options = {"search_mode": "bls", "min_period": .9, "max_period": 1.1}
+        Original = Analysis.RunCurve(Times, Flux, {**Options, "cut_gaps": False})
+        Cut = Analysis.RunCurve(Times, Flux, {**Options, "cut_gaps": True})
+        for Key in ("period", "period_epoch", "transits", "transit_model", "planet_assessment", "phase_folded", "plot"):
+            self.assertEqual(Original.get(Key), Cut.get(Key), Key)
+        self.assertNotEqual(Original["observation_view"]["plot"]["display_time"], Cut["observation_view"]["plot"]["display_time"])
+
+    def testUploadGapChoicesRejectInvalidValues(self):
+        Options = Analysis.ParseDetectionOptions({Key: SimpleNamespace(value=Value) for Key, Value in {"cutGaps": "true", "gapMinutes": "45", "inspectOnly": "true"}.items()})
+        self.assertTrue(Options["cut_gaps"])
+        self.assertTrue(Options["inspection_only"])
+        self.assertEqual(Options["gap_minutes"], 45)
+        for Fields in ({"cutGaps": "maybe"}, {"inspectOnly": "maybe"}, {"gapMinutes": "nan"}, {"gapMinutes": "0"}, {"gapMinutes": "-1"}):
+            with self.subTest(fields=Fields), self.assertRaises(ValueError):
+                Analysis.ParseDetectionOptions({Key: SimpleNamespace(value=Value) for Key, Value in Fields.items()})
 
 
 if __name__ == "__main__":

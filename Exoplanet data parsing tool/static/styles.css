@@ -1390,3 +1390,16 @@ th {
 .Workspace > .InspectorHelp { grid-row:3; }
 .Workspace > .ChartWrap { grid-row:4; }
 .Workspace > .TableWrap { grid-row:5; }
+
+/*MARK: viewing thingies */
+.ViewingFilters { margin:12px 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--surface-soft); }
+.ViewingFilters legend { font-weight:700; padding:0 5px; }
+.GapToggle { display:flex; align-items:center; gap:8px; margin-bottom:12px; font-weight:600; }
+.GapToggle input { width:auto; flex:none; }
+.ViewingFilters > label:not(.GapToggle) { display:block; margin-bottom:5px; font-size:12px; }
+.ObservationTools { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; width:100%; }
+.ObservationTools[hidden] { display:none!important; }
+.ObservationTools select { width:auto; max-width:220px; }
+.ObservationSummary { font-weight:600; color:var(--accent); }
+.ObservationReadout { flex-basis:100%; min-height:1.4em; color:var(--muted); font-variant-numeric:tabular-nums; }
+.Workspace.ObservationMode .TableWrap table { min-width:660px; }

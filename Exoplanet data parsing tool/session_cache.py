@@ -143,6 +143,91 @@ def _ValidateInspectionResult(Result, Plot, FileName):
 
 
 #MARK: save runs
+#MARK: observation cache thingy
+def _ValidateObservationView(Result, FileName):
+    View = Result.get("observation_view")
+    if View is None:
+        return
+
+    def Need(Condition):
+        if not Condition:
+            raise ValueError(f"The saved observation view for {FileName} is invalid. The original cache is unchanged.")
+
+    def Near(A, B):
+        return _FiniteNumber(A) and _FiniteNumber(B) and Math.isclose(A, B, rel_tol=0.0, abs_tol=1e-9)
+
+    def Domain(Value, Low, High):
+        Need(isinstance(Value, dict) and _FiniteNumber(Value.get(Low)) and _FiniteNumber(Value.get(High)) and Value[High] > Value[Low])
+
+    Need(isinstance(View, dict) and type(View.get("version")) is int and View["version"] == 1)
+    Plot = View.get("plot")
+    Need(isinstance(Plot, dict))
+    Arrays = [Plot.get(Key) for Key in ("time", "display_time", "raw_flux")]
+    Need(all(isinstance(A, list) and len(A) >= 2 for A in Arrays) and len({len(A) for A in Arrays}) == 1)
+    Need(all(_FiniteNumber(X) for A in Arrays for X in A))
+    Times, Display, Flux = Arrays
+    Count = len(Times)
+    Need(all(B > A for Values in (Times, Display) for A, B in zip(Values, Values[1:])))
+    Need(type(View.get("total_points")) is int and View["total_points"] >= Count)
+    Need(View["total_points"] == Result.get("total_points") and Near(View.get("time_reference"), Result.get("time_reference")))
+    for Key, Positive in (("flux_uncertainty", True), ("exposure_seconds", False)):
+        Values = Plot.get(Key)
+        Need(isinstance(Values, list) and len(Values) == Count)
+        Need(all(X is None or (_FiniteNumber(X) and (X > 0 if Positive else X >= 0)) for X in Values))
+    Domain(View.get("domain"), "time_min", "time_max")
+    Domain(View.get("raw_domain"), "flux_min", "flux_max")
+    Need(Near(Times[0], 0) and Near(View["domain"]["time_min"], Times[0]) and Near(View["domain"]["time_max"], Times[-1]))
+    Map = View.get("display_time_map")
+    Need(isinstance(Map, dict) and type(Map.get("version")) is int and Map["version"] == 1 and type(Map.get("enabled")) is bool)
+    Need(Map.get("reason") is None or isinstance(Map["reason"], str))
+    Cadence, Threshold = Map.get("cadence_days"), Map.get("threshold_days")
+    Need(_FiniteNumber(Threshold) and Threshold > 0)
+    if Cadence is None:
+        Need(View["total_points"] == 2 and Map.get("join_days") is None and bool(Map.get("reason")))
+    else:
+        Need(_FiniteNumber(Cadence) and Cadence > 0 and Near(Map.get("join_days"), Cadence) and Threshold >= 10 * Cadence)
+    Domain(Map.get("display_domain"), "time_min", "time_max")
+    Need(Near(Display[0], 0) and Near(Map["display_domain"]["time_min"], Display[0]) and Near(Map["display_domain"]["time_max"], Display[-1]))
+    Runs, Gaps, Knots = (Map.get(Key) for Key in ("runs", "gaps", "knots"))
+    Need(isinstance(Runs, list) and 1 <= len(Runs) <= Count and isinstance(Gaps, list) and isinstance(Knots, list))
+    Need(type(Map.get("gap_count")) is int and Map["gap_count"] == len(Gaps) == len(Runs) - 1)
+    Next, SourceCount, Boundaries = 0, 0, set()
+    for Index, Run in enumerate(Runs):
+        Need(isinstance(Run, dict))
+        A, B = Run.get("plot_start"), Run.get("plot_end")
+        Need(type(A) is int and type(B) is int and A == Next and 0 <= A < B <= Count)
+        Need(type(Run.get("run_id")) is int and Run["run_id"] == Index + 1)
+        Need(type(Run.get("points")) is int and Run["points"] >= B - A)
+        Need(Near(Run.get("time_start"), Times[A]) and Near(Run.get("time_end"), Times[B - 1]))
+        Need(Near(Run.get("display_start"), Display[A]) and Near(Run.get("display_end"), Display[B - 1]))
+        Need(all(Near(Display[I] - Display[A], Times[I] - Times[A]) for I in range(A, B)))
+        Next, SourceCount = B, SourceCount + Run["points"]
+        Boundaries.update((A, B - 1))
+    Need(Next == Count and SourceCount == View["total_points"])
+    Need(Plot.get("break_indices") == [Run["plot_start"] for Run in Runs[1:]])
+    Need(all(type(I) is int for I in Plot.get("break_indices", [])))
+    Removed = 0.0
+    for Index, Gap in enumerate(Gaps):
+        Need(isinstance(Gap, dict))
+        Left, Right = Runs[Index], Runs[Index + 1]
+        Need(all(Near(Gap.get(Key), Value) for Key, Value in (
+            ("time_start", Left["time_end"]), ("time_end", Right["time_start"]),
+            ("display_start", Left["display_end"]), ("display_end", Right["display_start"]))))
+        Length = Right["time_start"] - Left["time_end"]
+        Need(Cadence is not None and Length > Threshold)
+        Expected = Length - Cadence if Map["enabled"] else 0.0
+        Need(_FiniteNumber(Gap.get("removed_days")) and Gap["removed_days"] >= 0 and Near(Gap["removed_days"], Expected))
+        Need(Near(Right["display_start"] - Left["display_end"], Length - Expected))
+        Removed += Gap["removed_days"]
+    Need(_FiniteNumber(Map.get("removed_days")) and Map["removed_days"] >= 0 and Near(Map["removed_days"], Removed))
+    Need(Near(Display[-1] - Display[0], Times[-1] - Times[0] - Removed))
+    if not Map["enabled"]:
+        Need(all(Near(A, B) for A, B in zip(Times, Display)) and Near(Removed, 0))
+    Need(len(Knots) == len(Boundaries))
+    for Knot, Index in zip(Knots, sorted(Boundaries)):
+        Need(isinstance(Knot, dict) and Near(Knot.get("time"), Times[Index]) and Near(Knot.get("display_time"), Display[Index]))
+
+
 def ValidateResult(Result, FileName="saved file"):
     """Check the metadata and arrays before the browser uses a saved result."""
     if not isinstance(Result, dict):
@@ -214,6 +299,7 @@ def ValidateResult(Result, FileName="saved file"):
         raise ValueError("The saved result has invalid flux uncertainty samples.")
     if Result.get("review_only"):
         _ValidateInspectionResult(Result, Plot, FileName)
+    _ValidateObservationView(Result, FileName)
     return Result
 
 

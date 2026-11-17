@@ -226,5 +226,70 @@ class InspectionCacheTests(Unittest.TestCase):
             ValidateResult(Bad)
 
 
+#MARK: saved observation coordinates
+class ObservationCacheTests(Unittest.TestCase):
+    def Fixture(self, Cut=True):
+        from analysis import RunCurve
+        from analysis_jobs import AnnotateAnalysisResult
+        Times = Np.array([0, .001, .002, 2, 2.001, 2.002])
+        Result = RunCurve(Times, Np.array([10, 11, 9, 10, 12, 11]), {
+            "cut_gaps": Cut, "_flux_uncertainty": [None, .1, .1, .1, .1, .1],
+            "_exposure_seconds": [0, 15, None, 30, 30, 30]})
+        return AnnotateAnalysisResult(Result, {}, "night.csv")
+
+    def testEnabledAndDisabledViewsRoundTripWithoutChangingSourceTimes(self):
+        with Tempfile.TemporaryDirectory() as Folder:
+            Cache = SessionCache(Folder)
+            for Cut in (False, True):
+                Result = self.Fixture(Cut)
+                Cache.save("observation_12345678", {"results": [{"file_name": "night.csv", "result": Result}]})
+                Loaded = Cache.load("observation_12345678")["state"]["results"][0]["result"]
+                self.assertEqual(Loaded, Result)
+                self.assertEqual(Loaded["plot"]["time"], [0, .001, .002, 2, 2.001, 2.002])
+                self.assertEqual(Loaded["observation_view"]["display_time_map"]["enabled"], Cut)
+
+    def testDownsampledViewKeepsSourceCountsAndRunBoundaries(self):
+        Result = self.Fixture()
+        View = Result["observation_view"]
+        for Key in ("time", "display_time", "raw_flux", "flux_uncertainty", "exposure_seconds"):
+            View["plot"][Key] = [View["plot"][Key][Index] for Index in (0, 2, 3, 5)]
+        View["plot"]["break_indices"] = [2]
+        for Run, Start, End in zip(View["display_time_map"]["runs"], (0, 2), (2, 4)):
+            Run["plot_start"], Run["plot_end"] = Start, End
+        self.assertIs(ValidateResult(Result), Result)
+        self.assertEqual(View["total_points"], 6)
+        self.assertEqual(len(View["plot"]["time"]), 4)
+
+    def testMalformedViewCannotOverwriteAnExistingCache(self):
+        Cases = [("version", True), ("total_points", 5), ("time_reference", 1),
+                 ("plot.time", [0, .001, .002, 2, 2, 2.002]),
+                 ("plot.display_time", [0, .001]), ("plot.raw_flux", [10, 11, 9, 10, float("nan"), 11]),
+                 ("plot.flux_uncertainty", [.1, .1, 0, .1, .1, .1]),
+                 ("plot.exposure_seconds", [-1, 15, None, 30, 30, 30]),
+                 ("display_time_map.version", True), ("display_time_map.enabled", "true"),
+                 ("display_time_map.enabled", False), ("display_time_map.cadence_days", "x"),
+                 ("display_time_map.threshold_days", -1), ("display_time_map.removed_days", 0),
+                 ("display_time_map.gap_count", 0), ("display_time_map.knots", []),
+                 ("display_time_map.runs", []), ("display_time_map.gaps", [])]
+        with Tempfile.TemporaryDirectory() as Folder:
+            Cache = SessionCache(Folder)
+            Original = self.Fixture()
+            State = {"results": [{"file_name": "night.csv", "result": Original}]}
+            Cache.save("observation_12345678", State)
+            FilePath = Cache.PathFor("observation_12345678")
+            Before = FilePath.read_bytes()
+            for Field, Value in Cases:
+                with self.subTest(field=Field):
+                    Bad = Copy.deepcopy(Original)
+                    Target = Bad["observation_view"]
+                    Parts = Field.split(".")
+                    for Part in Parts[:-1]:
+                        Target = Target[Part]
+                    Target[Parts[-1]] = Value
+                    with self.assertRaises(ValueError):
+                        Cache.save("observation_12345678", {"results": [{"file_name": "night.csv", "result": Bad}]})
+                    self.assertEqual(FilePath.read_bytes(), Before)
+
+
 if __name__ == "__main__":
     Unittest.main()

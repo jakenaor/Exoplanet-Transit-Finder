@@ -200,6 +200,13 @@ Source = Source.replace(
     "SessionReadyPromise = OpenRun();",
     "SessionReadyPromise = Promise.resolve();",
 );
+//MARK: real markup still needs every control
+const PageSource = Fs.readFileSync(Path.join(__dirname, '../Exoplanet data parsing tool/static/index.html'), 'utf8');
+const PageIds = [...PageSource.matchAll(/\bid=["']([^"']+)["']/g)].map(Match => Match[1]);
+Assert.equal(new Set(PageIds).size, PageIds.length, 'html ids must be unique');
+for (const Match of Source.matchAll(/document\.getElementById\(["']([^"']+)["']\)/g))
+  Assert.ok(PageIds.includes(Match[1]), 'missing html control: ' + Match[1]);
+
 Vm.runInContext(Source, FakeAppThing);
 const RunApp = Code => Vm.runInContext(Code, FakeAppThing);
 
@@ -524,7 +531,7 @@ CanvasDoodles.length = 0;
 RunApp('ShowCurveResult(CurrResult);');
 Assert.equal(RunApp('CurrView'), 'raw', 'short results open the measured light curve');
 Assert.equal(RunApp('CurrentPlanetAssessment()'), null, 'inspection has no fallback planet verdict');
-Assert.match(GrabThing('Assessment').innerHTML, /Short-curve inspection/);
+Assert.match(GrabThing('Assessment').innerHTML, /Data inspection/);
 Assert.doesNotMatch(GrabThing('Assessment').innerHTML, /ScoreTrack|ScoreFill|Candidate score/);
 Assert.doesNotMatch(GrabThing('Metrics').innerHTML, /Orbital period|Supported events|SDE|Radius ratio/);
 Assert.match(GrabThing('SearchUnavailable').textContent, /22.*50/);
@@ -589,7 +596,7 @@ RunApp(`
   RenderBatchSelect();
 `);
 Assert.equal(GrabThing('ResultSelect').disabled, false);
-Assert.match(GrabThing('BatchPickerMeta').textContent, /Short-curve inspection/);
+Assert.match(GrabThing('BatchPickerMeta').textContent, /Data inspection/);
 Assert.doesNotMatch(GrabThing('BatchPickerMeta').textContent, /candidate score|supported|SDE|SNR|P -/);
 RunApp('CurrResult = {transits:[]}; UpdateCurveTools();');
 Assert.equal(RunApp('CurrView'), 'phase', 'browsing an inspection does not lose the previous search view');
@@ -616,6 +623,99 @@ GrabThing('SearchModeInput').value = 'tls';
 RunApp('UpdateDetectionReadouts();');
 RunApp("CurrResult=null; MainResult=null; CurrView='zoom'; CurrViewport=null; BatchInProgress=false; UpdateCurveTools();");
 console.log('Frontend review: 19 behavior groups passed (including short-curve inspection, exports, and navigation).');
+
+//MARK: observation viewer
+RunApp(`
+  globalThis.ObservationFixture = {
+    ...InspectionFixture, total_points:6,
+    plot:{...InspectionFixture.plot, time:[0,.001,.002,2,2.001,2.002], raw_flux:[100,101,99,102,103,101], smooth_flux:[100,101,99,102,103,101]},
+    domain:{time_min:0,time_max:2.002}, raw_domain:{flux_min:98,flux_max:104},
+    observation_view:{
+      version:1,total_points:6,time_reference:2461360,flux_unit:'counts',representation:'original input flux',
+      domain:{time_min:0,time_max:2.002},raw_domain:{flux_min:98,flux_max:104},
+      plot:{time:[0,.001,.002,2,2.001,2.002],display_time:[0,.001,.002,.003,.004,.005],raw_flux:[100,101,99,102,103,101],flux_uncertainty:[.1,null,.2,.3,.4,.5],exposure_seconds:[0,15,null,30,30,30],break_indices:[3]},
+      display_time_map:{version:1,enabled:true,cadence_days:.001,threshold_days:30/1440,join_days:.001,gap_count:1,removed_days:1.997,
+        display_domain:{time_min:0,time_max:.005},
+        gaps:[{time_start:.002,time_end:2,display_start:.002,display_end:.003,removed_days:1.997}],
+        knots:[{time:0,display_time:0},{time:.002,display_time:.002},{time:2,display_time:.003},{time:2.002,display_time:.005}],
+        runs:[{run_id:1,points:3,plot_start:0,plot_end:3,time_start:0,time_end:.002,display_start:0,display_end:.002},{run_id:2,points:3,plot_start:3,plot_end:6,time_start:2,time_end:2.002,display_start:.003,display_end:.005}],
+      },
+    },
+  };
+  MainResult=ObservationFixture; CurrResult=MainResult; CurrView='raw'; CurrViewport=null;
+  ObservationUnitsInput.value='minutes'; ShowCurveResult(CurrResult);
+`);
+Assert.equal(RunApp('GetViewport().xMax'), .005, 'only observation coordinates shrink');
+Assert.ok(Math.abs(RunApp('ObservationRealTime(.003)') - 2) < 1e-12);
+Assert.equal(RunApp('ObservationUnit().factor'), 1440);
+Assert.match(GrabThing('ObservationSummary').textContent, /1 gaps cut/);
+Assert.match(GrabThing('CurveTableHead').innerHTML, /Original time/);
+Assert.ok(RunApp('RawCurveRowsForExport()[3].Time') === 2461362, 'CSV uses original time after the gap');
+Assert.equal(RunApp('RawCurveRowsForExport()[0].exposure_seconds'), 0);
+CanvasDoodles.length = 0;
+RunApp("DrawChartAxes(GetChartGeometry(),GetViewport(),{xTickFormat:Value=>'tick:'+Value});");
+Assert.ok(CanvasDoodles.some(Call => Call[0] === 'fillText' && String(Call[1]).startsWith('tick:')), 'axes use the requested formatter');
+RunApp(`
+  const Geo=GetChartGeometry(), View=GetViewport();
+  UpdateObservationHover({x:Geo.pad.left+.003/.005*Geo.innerW,y:Geo.pad.top+(View.yMax-102)/(View.yMax-View.yMin)*Geo.innerH});
+`);
+Assert.equal(RunApp('ObservationHoverIndex'), 3);
+Assert.match(GrabThing('ObservationReadout').textContent, /2461362.*flux 102/);
+Assert.match(GrabThing('ObservationReadout').textContent, /30.*s/);
+GrabThing('ObservationRun').value='1';
+RunApp('PickObservationRun();');
+Assert.ok(RunApp('GetViewport().xMin') >= .002 - 1e-12);
+Assert.ok(RunApp('GetViewport().xMax') <= .005 + 1e-12);
+GrabThing('ObservationUnits').value='auto';
+Assert.equal(RunApp('ObservationUnit().name'), 'minutes', 'shortened gap margins do not inflate a single-run span');
+GrabThing('ObservationUnits').value='minutes';
+RunApp(`
+  FileResults=[{file:{name:'two-nights.csv'},result:ObservationFixture}]; CurrFileIndex=0;
+  globalThis.ObservationState=JSON.parse(JSON.stringify(PackRunState()));
+  RestoreSessionState(ObservationState);
+`);
+Assert.equal(GrabThing('ObservationUnits').value, 'minutes');
+Assert.equal(GrabThing('ObservationRun').value, '1');
+Assert.equal(RunApp('GetViewport().xMin'), RunApp('ObservationState.current_viewport.xMin'));
+RunApp(`
+  MainResult={...ObservationFixture,total_points:100};
+  CurrResult=MainResult; UpdateCurveTools(); CurrView='raw'; CurrViewport=null;
+`);
+Assert.equal(GrabThing('SearchModeInput').disabled, false, 'long view-only results permit search-setting changes');
+RunApp('CurrResult.review_only=false; CurrResult.period=2;');
+RunApp('DownloadBlob=(Content,Filename)=>{globalThis.ObservationDownload={Content,Filename};}; ExportTransitCsv(); DownloadBlob=SavedDownload;');
+Assert.match(GrabThing('Status').textContent, /original timestamps/);
+Assert.doesNotMatch(GrabThing('Status').textContent, /search was not run/);
+Assert.ok(RunApp('SummaryForExport().observation_view.display_time_map.enabled'));
+Assert.match(RunApp("PdfAnalysisDetails(AnalysisPdfRow('two-nights.csv',CurrResult)).map(Line=>Line.text).join(' ')"), /OBSERVATION VIEW/);
+
+//MARK: old caches still know where the night ended
+RunApp(`
+  MainResult={...InspectionFixture,total_points:4,domain:{time_min:0,time_max:6},
+    normalization:{segment_time_ranges:[{start_day:0,end_day:1},{start_day:5,end_day:6}]},
+    plot:{time:[0,1,5,6],raw_flux:[1,1,1,1],smooth_flux:[1,1,1,1]}};
+  CurrResult=MainResult; CurrView='raw'; CurrViewport=null;
+`);
+Assert.equal(RunApp('CurrentObservation().display_time_map.runs.length'), 2);
+CanvasDoodles.length = 0;
+RunApp("DrawSeriesPath(ObservationTimes(),CurrentObservation().plot.raw_flux,X=>X,Y=>Y,{xMin:0,xMax:6},{breakIndices:CurrentObservation().plot.break_indices});");
+Assert.equal(CanvasDoodles.filter(Call=>Call[0]==='lineTo').length, 2, 'legacy metadata cannot draw a line through the night gap');
+
+//MARK: points crowded into the same screen column
+RunApp(`
+  const Time=Array.from({length:1000},(Unused,Index)=>Index/1000);
+  const Flux=Array(1000).fill(100); Flux[505]=103;
+  MainResult={...ObservationFixture,observation_view:{...ObservationFixture.observation_view,
+    total_points:1000,domain:{time_min:0,time_max:.999},raw_domain:{flux_min:99,flux_max:104},
+    plot:{time:Time,display_time:Time,raw_flux:Flux,flux_uncertainty:[],exposure_seconds:[]},
+    display_time_map:{enabled:false,runs:[],gaps:[],knots:[]}}};
+  CurrResult=MainResult; CurrView='raw'; CurrViewport=null;
+  const DenseGeo=GetChartGeometry(), DenseView=GetViewport();
+  UpdateObservationHover({x:DenseGeo.pad.left+.5/.999*DenseGeo.innerW,y:DenseGeo.pad.top+(DenseView.yMax-103)/(DenseView.yMax-DenseView.yMin)*DenseGeo.innerH});
+`);
+Assert.equal(RunApp('ObservationHoverIndex'), 505, 'hover finds visible peaks among overlapping samples');
+RunApp("CurrResult=null; MainResult=null; CurrView='zoom'; CurrViewport=null; BatchInProgress=false; UpdateCurveTools();");
+console.log('Observation viewer: original timestamps, gap map, units, hover, runs, cache, and exports passed.');
 
 //MARK: exposure checks
 GrabThing("ExposureSecondsInput").value = '0';
@@ -710,6 +810,9 @@ async function CheckRequestRecovery()
   console.log('Frontend request recovery: stable request token and poll-only reconnect passed.');
 
   //MARK: exposure upload
+  GrabThing('InspectOnlyInput').checked = true;
+  GrabThing('CutGapsInput').checked = true;
+  GrabThing('GapMinutesInput').value = '45';
   for (const [FileIndex, Exposure] of [[ 1, '0' ], [ 2, '1200' ]])
   {
     Requests.length = 0;
@@ -721,6 +824,9 @@ async function CheckRequestRecovery()
     `);
     await RunApp("RunCurve(TestFile,DetectionOptions())");
     const Submitted = Requests.find(Request => Request.options.method === 'POST');
+    Assert.equal(Submitted.options.body.get('inspectOnly'), 'true');
+    Assert.equal(Submitted.options.body.get('cutGaps'), 'true');
+    Assert.equal(Submitted.options.body.get('gapMinutes'), '45');
     Assert.equal(Submitted.options.body.get('exposureSeconds'), Exposure,
                  'the declared exposure reaches the upload request');
   }

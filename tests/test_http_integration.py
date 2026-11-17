@@ -161,6 +161,46 @@ class HTTPIntegrationTests(Unittest.TestCase):
         self.assertEqual(Status, 200, Raw)
         self.assertEqual(Json.loads(Raw)['state']['results'][0]['result'], Result)
 
+    #MARK: longer observations can skip the search
+    def testViewOnlyGapFilterSurvivesUploadAndCache(self):
+        Times = Np.r_[Np.arange(50) / 1440, 2 + Np.arange(50) / 1440]
+        Content = 'Time,Flux,flux_err,exposure_seconds\n' + '\n'.join(
+            f'{T:.12f},{100 + Index / 10},0.2,30' for Index, T in enumerate(Times))
+        Results = []
+        for Cut in ('false', 'true'):
+            Fields = dict(inspectOnly='true', cutGaps=Cut, gapMinutes='30',
+                          csvTimeFormat='relative', analysisRequestId='viewer-gap-' + Cut)
+            Body, Mime = Multipart(Fields, 'two-nights.csv', Content)
+            Status, Raw, _ = self.HttpRequest('/analysis-jobs', 'POST', Body, Mime)
+            self.assertEqual(Status, 202, Raw)
+            JobId = Json.loads(Raw)['job_id']
+            Deadline = Time.monotonic() + 5
+            while Time.monotonic() < Deadline:
+                _, Raw, _ = self.HttpRequest('/analysis-jobs/' + JobId)
+                Job = Json.loads(Raw)
+                if Job['status'] in ('completed', 'failed', 'cancelled'):
+                    break
+                Time.sleep(.05)
+            self.assertEqual(Job['status'], 'completed', Job)
+            Result = Job['result']
+            Results.append(Result)
+            self.assertTrue(Result['review_only'])
+            self.assertEqual(Result['total_points'], 100)
+            self.assertIsNone(Result['period'])
+            self.assertEqual(Result['provenance']['app_version'], '68')
+            View = Result['observation_view']
+            self.assertEqual(View['display_time_map']['enabled'], Cut == 'true')
+            self.assertEqual(View['display_time_map']['gap_count'], 1)
+        self.assertEqual(Results[0]['plot'], Results[1]['plot'])
+        self.assertLess(Results[1]['observation_view']['display_time_map']['display_domain']['time_max'], .1)
+        self.assertGreater(Results[1]['domain']['time_max'], 2)
+        State = dict(results=[dict(file_name='two-nights.csv', result=Results[1])], current_view='raw')
+        Status, Raw, _ = self.HttpRequest('/analysis-sessions/viewer_gap_623', 'POST', Json.dumps(State).encode())
+        self.assertEqual(Status, 200, Raw)
+        Status, Raw, _ = self.HttpRequest('/analysis-sessions/viewer_gap_623')
+        self.assertEqual(Status, 200, Raw)
+        self.assertEqual(Json.loads(Raw)['state']['results'][0]['result'], Results[1])
+
     def testJsonMetadataUploadExplainsWhichFileToUse(self):
         Body, Mime = Multipart({}, 'short_time_flux.json', '{"usable_rows": 3}')
         Status, Raw, _ = self.HttpRequest('/analysis-jobs', 'POST', Body, Mime)

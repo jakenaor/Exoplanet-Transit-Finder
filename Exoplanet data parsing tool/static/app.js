@@ -78,6 +78,18 @@ const CsvTimeFormatInput = document.getElementById("CsvTimeFormat");
 const CsvTimeScaleInput = document.getElementById("CsvTimeScale");
 const CsvTimeUnitInput = document.getElementById("CsvTimeUnit");
 const ExposureSecondsInput = document.getElementById("ExposureSecondsInput");
+const InspectOnlyInput = document.getElementById("InspectOnlyInput");
+const CutGapsInput = document.getElementById("CutGapsInput");
+const GapMinutesInput = document.getElementById("GapMinutesInput");
+const ObservationTools = document.getElementById("ObservationTools");
+const ObservationUnitsInput = document.getElementById("ObservationUnits");
+const ObservationRunInput = document.getElementById("ObservationRun");
+const ObservationJoinInput = document.getElementById("ObservationJoinPoints");
+const ObservationErrorsInput = document.getElementById("ObservationErrors");
+const ObservationReadout = document.getElementById("ObservationReadout");
+const ObservationSummary = document.getElementById("ObservationSummary");
+const CurveTableHead = document.getElementById("CurveTableHead");
+const TransitTableHead = CurveTableHead.innerHTML;
 
 //MARK: search controls
 //  reset and restored sessions should use the same defaults.
@@ -148,6 +160,10 @@ let InspectionControlState = null;
 let CurrViewport = null;
 let DragState = null;
 let HoverThingy = null;
+let ObservationHoverIndex = null;
+let LastObservation = null;
+let ObservationRowsKey = "";
+const LegacyObservations = new WeakMap();
 let SessionId = null;
 let SessionInitialized = false;
 let RestoringSession = false;
@@ -353,7 +369,8 @@ function UpdateCurveTools()
     Button.title = Button.disabled ? InspectionReason() : '';
     Button.classList.toggle("Active", Button.dataset.view === CurrView);
   });
-  if (Inspect)
+  const ShortInput = Inspect && CurrResult.total_points < 50;
+  if (ShortInput)
   {
     if (InspectionControlState === null)
       InspectionControlState = new Map(DetectionControls.map(({input : Input}) => [ Input, Input.disabled ]));
@@ -372,7 +389,7 @@ function UpdateCurveTools()
     });
     InspectionControlState = null;
   }
-  ResetDetectionButton.disabled = Inspect;
+  ResetDetectionButton.disabled = ShortInput;
   document.getElementById("SearchUnavailable").hidden = !Inspect;
   document.getElementById("SearchUnavailable").textContent = Inspect ? InspectionReason() : '';
   document.getElementById("ModelControl").hidden = Inspect;
@@ -403,6 +420,12 @@ function DrawFlux()
   FluxPen.clearRect(0, 0, Width, Height);
   if (!CurrResult)
     return;
+
+  if (CurrView === 'raw')
+  {
+    DrawObservationChart(Geo);
+    return;
+  }
 
   if (CurrView === 'comparison')
   {
@@ -568,6 +591,338 @@ function DrawFlux()
   }
 
   UpdateCanvasCursor(HoverThingy);
+}
+
+//MARK: original observation thingy
+function CurrentObservation()
+{
+  const Result = MainResult || CurrResult;
+  if (!Result)
+    return null;
+  if (Result.observation_view)
+    return Result.observation_view;
+  if (LegacyObservations.has(Result))
+    return LegacyObservations.get(Result);
+  const Plot = Result.plot;
+  // older caches sometimes kept run boundaries only in normalization metadata.
+  const Breaks = new Set(Plot.break_indices || []);
+  const Ranges = ObservationRangesForResult(Result);
+  for (let Index = 1; Index < Plot.time.length; Index++)
+  {
+    if (Ranges.some(Range => Plot.time[Index - 1] <= Range.end && Plot.time[Index] > Range.end))
+      Breaks.add(Index);
+  }
+  const Starts = [0, ...[...Breaks].filter(Index => Index > 0 && Index < Plot.time.length).sort((A, B) => A - B)];
+  const Ends = [ ...Starts.slice(1), Plot.time.length ];
+  const Saved = {
+    total_points : Result.total_points || Plot.time.length,
+    time_reference : Result.time_reference || 0,
+    flux_unit : Result.flux_unit || "saved display flux",
+    representation : "saved display flux; original input values were not saved",
+    legacy : true,
+    domain : Result.domain,
+    raw_domain : Result.raw_domain,
+    plot : {...Plot, display_time : Plot.time, break_indices : Starts.slice(1)},
+    display_time_map : {
+      enabled : false, removed_days : 0, gap_count : 0, gaps : [], knots : [],
+      display_domain : Result.domain,
+      runs : Starts.map((Start, Index) => ({
+        run_id : Index + 1, points : Ends[Index] - Start, plot_start : Start, plot_end : Ends[Index],
+        time_start : Plot.time[Start], time_end : Plot.time[Ends[Index] - 1],
+        display_start : Plot.time[Start], display_end : Plot.time[Ends[Index] - 1],
+      })),
+    },
+  };
+  LegacyObservations.set(Result, Saved);
+  return Saved;
+}
+
+//MARK: time coordinates
+function ObservationTimes()
+{
+  const Observation = CurrentObservation();
+  return Observation.display_time_map.enabled ? Observation.plot.display_time : Observation.plot.time;
+}
+
+function ObservationDomain()
+{
+  const Observation = CurrentObservation();
+  const Time = Observation.display_time_map.enabled ? Observation.display_time_map.display_domain : Observation.domain;
+  return {xMin : Time.time_min, xMax : Time.time_max, yMin : Observation.raw_domain.flux_min, yMax : Observation.raw_domain.flux_max};
+}
+
+//MARK: turn a squeezed coordinate back into the real elapsed time
+function ObservationRealTime(Value)
+{
+  const Map = CurrentObservation().display_time_map;
+  const Knots = Map.knots || [];
+  if (!Map.enabled || Knots.length < 2)
+    return Value;
+  let Left = 0, Right = Knots.length - 1;
+  while (Right - Left > 1)
+  {
+    const Middle = (Left + Right) >> 1;
+    if (Knots[Middle].display_time <= Value)
+      Left = Middle;
+    else
+      Right = Middle;
+  }
+  const A = Knots[Left], B = Knots[Right];
+  return A.time + (Value - A.display_time) * (B.time - A.time) / (B.display_time - A.display_time);
+}
+
+function ObservationUnit()
+{
+  let Choice = ObservationUnitsInput.value;
+  if (![ "minutes", "hours", "days" ].includes(Choice))
+  {
+    const View = GetViewport();
+    const Observation = CurrentObservation(), Times = ObservationTimes();
+    const First = LowerBoundTime(Times, View.xMin);
+    const Last = Math.min(Times.length - 1, LowerBoundTime(Times, View.xMax + 1e-12) - 1);
+    // ignore the shortened empty margins when choosing units for one run.
+    const Span = Last > First ? Observation.plot.time[Last] - Observation.plot.time[First] : ObservationRealTime(View.xMax) - ObservationRealTime(View.xMin);
+    Choice = Span < 2 / 24 ? "minutes" : Span < 3 ? "hours" : "days";
+  }
+  return {name : Choice, factor : Choice === "minutes" ? 1440 : Choice === "hours" ? 24 : 1};
+}
+
+//MARK: observation controls
+function UpdateObservationTools()
+{
+  const Active = Boolean(CurrResult && CurrView === "raw");
+  ObservationTools.hidden = !Active;
+  document.querySelector(".Workspace")?.classList.toggle("ObservationMode", Active);
+  if (!Active)
+    return;
+  const Observation = CurrentObservation();
+  const Map = Observation.display_time_map;
+  if (LastObservation !== Observation)
+  {
+    LastObservation = Observation;
+    ObservationRowsKey = "";
+    ObservationHoverIndex = null;
+    ObservationRunInput.innerHTML = '<option value="all">All observations</option>' +
+        Map.runs.map((Run, Index) => `<option value="${Index}">Run ${Index + 1} · ${Run.points} samples</option>`).join("");
+    ObservationRunInput.value = "all";
+    ObservationReadout.textContent = "Hover over a point to inspect its original time and flux.";
+  }
+  const Span = Observation.domain.time_max - Observation.domain.time_min;
+  ObservationSummary.textContent = `${Observation.total_points.toLocaleString()} retained · ${DurationLabel(Span)} actual span · ${Map.enabled ? `${Map.gap_count} gaps cut` : "original time axis"}`;
+  ObservationErrorsInput.disabled = !(Observation.plot.flux_uncertainty || []).some(Error => NullableNumber(Error) > 0);
+}
+
+//MARK: observation drawing
+function DrawObservationChart(Geo)
+{
+  UpdateObservationTools();
+  const Observation = CurrentObservation();
+  const Plot = Observation.plot;
+  const Times = ObservationTimes();
+  const View = GetViewport();
+  const Unit = ObservationUnit();
+  const X = Time => Geo.pad.left + (Time - View.xMin) / (View.xMax - View.xMin) * Geo.innerW;
+  const Y = Flux => Geo.pad.top + (View.yMax - Flux) / (View.yMax - View.yMin) * Geo.innerH;
+  FluxPen.fillStyle = "#fbfcfd";
+  FluxPen.fillRect(0, 0, Geo.width, Geo.height);
+  const TickSpan = Math.abs(ObservationRealTime(View.xMax) - ObservationRealTime(View.xMin)) * Unit.factor;
+  const Digits = Math.max(0, Math.min(6, Math.ceil(-Math.log10(TickSpan / 5 || 1)) + 1));
+  DrawChartAxes(Geo, View, {
+    xTickFormat : Value =>
+    {
+      const Map = Observation.display_time_map;
+      const InsideCut = Map.enabled && Map.gaps.some(Gap => Value > Gap.display_start + 1e-12 && Value < Gap.display_end - 1e-12);
+      return InsideCut ? "" : Fmt(ObservationRealTime(Value) * Unit.factor, Digits);
+    },
+    yDigits : Math.max(3, Math.min(9, Math.ceil(-Math.log10(View.yMax - View.yMin)) + 2)),
+    xLabel : `${Unit.name[0].toUpperCase() + Unit.name.slice(1)} since first observation${Observation.display_time_map.enabled ? " (gaps shortened)" : ""}`,
+    yLabel : Observation.legacy ? "Saved display flux" : `Input flux (${Observation.flux_unit})`,
+  });
+  FluxPen.save();
+  ClipToChartPlot(Geo);
+  if (ObservationJoinInput.checked)
+  {
+    FluxPen.strokeStyle = "rgba(15,118,110,.6)";
+    FluxPen.lineWidth = 1.2;
+    DrawSeriesPath(Times, Plot.raw_flux, X, Y, View, {breakIndices : Plot.break_indices || []});
+  }
+  const First = Math.max(0, LowerBoundTime(Times, View.xMin) - 1);
+  const Last = Math.min(Times.length, LowerBoundTime(Times, View.xMax) + 1);
+  const Radius = Last - First < 200 ? 3.5 : Last - First < 2000 ? 2 : 1.3;
+  for (let Index = First; Index < Last; Index++)
+  {
+    if (Times[Index] < View.xMin || Times[Index] > View.xMax)
+      continue;
+    const Px = X(Times[Index]), Py = Y(Plot.raw_flux[Index]);
+    const Error = NullableNumber(Plot.flux_uncertainty?.[Index]);
+    if (ObservationErrorsInput.checked && Error !== null && Error > 0)
+    {
+      const Top = Y(Plot.raw_flux[Index] + Error), Bottom = Y(Plot.raw_flux[Index] - Error);
+      FluxPen.strokeStyle = "rgba(15,118,110,.5)";
+      FluxPen.lineWidth = 1;
+      FluxPen.beginPath();
+      FluxPen.moveTo(Px, Top);
+      FluxPen.lineTo(Px, Bottom);
+      FluxPen.moveTo(Px - 3, Top);
+      FluxPen.lineTo(Px + 3, Top);
+      FluxPen.moveTo(Px - 3, Bottom);
+      FluxPen.lineTo(Px + 3, Bottom);
+      FluxPen.stroke();
+    }
+    FluxPen.fillStyle = "#0f766e";
+    FluxPen.beginPath();
+    FluxPen.arc(Px, Py, Radius, 0, Math.PI * 2);
+    FluxPen.fill();
+  }
+  if (Observation.display_time_map.enabled)
+  {
+    let LastLabel = -Infinity;
+    for (const Gap of Observation.display_time_map.gaps)
+    {
+      const Px = X((Gap.display_start + Gap.display_end) / 2);
+      if (Px < Geo.pad.left || Px > Geo.width - Geo.pad.right)
+        continue;
+      FluxPen.strokeStyle = "#b45309";
+      FluxPen.lineWidth = 1;
+      FluxPen.setLineDash([4, 4]);
+      FluxPen.beginPath();
+      FluxPen.moveTo(Px, Geo.pad.top);
+      FluxPen.lineTo(Px, Geo.pad.top + Geo.innerH);
+      FluxPen.stroke();
+      FluxPen.setLineDash([]);
+      if (Px - LastLabel > 100)
+      {
+        const Label = `${DurationLabel(Gap.removed_days)} cut`;
+        const Width = FluxPen.measureText(Label).width + 10;
+        const Left = Math.max(Geo.pad.left, Math.min(Px + 5, Geo.width - Geo.pad.right - Width));
+        FluxPen.fillStyle = "rgba(255,255,255,.94)";
+        FluxPen.fillRect(Left, Geo.pad.top + 4, Width, 19);
+        FluxPen.fillStyle = "#92400e";
+        FluxPen.font = "11px system-ui,sans-serif";
+        FluxPen.textAlign = "left";
+        FluxPen.fillText(Label, Left + 5, Geo.pad.top + 17);
+        LastLabel = Px;
+      }
+    }
+  }
+  if (ObservationHoverIndex !== null)
+  {
+    const Index = ObservationHoverIndex;
+    FluxPen.strokeStyle = "#2563eb";
+    FluxPen.lineWidth = 2;
+    FluxPen.beginPath();
+    FluxPen.arc(X(Times[Index]), Y(Plot.raw_flux[Index]), Radius + 3, 0, Math.PI * 2);
+    FluxPen.stroke();
+  }
+  FluxPen.restore();
+  RenderObservationRows();
+  UpdateCanvasCursor();
+}
+
+//MARK: the actual measured rows
+function RenderObservationRows()
+{
+  const Observation = CurrentObservation();
+  const Plot = Observation.plot, Times = ObservationTimes(), View = GetViewport(), Unit = ObservationUnit();
+  const Key = `${CurrFileIndex}:${Observation.time_reference}:${View.xMin}:${View.xMax}:${Unit.name}`;
+  if (Key === ObservationRowsKey)
+    return;
+  ObservationRowsKey = Key;
+  CurveTableHead.innerHTML = `<th>Sample</th><th>Elapsed ${Unit.name}</th><th>Original time (days)</th><th>${Observation.legacy ? "Saved flux" : "Input flux"}</th><th>Flux error</th><th>Exposure (s)</th>`;
+  const First = LowerBoundTime(Times, View.xMin), End = LowerBoundTime(Times, View.xMax + 1e-12);
+  const Rows = [];
+  for (let Index = First; Index < Math.min(End, First + 200); Index++)
+  {
+    Rows.push(`<tr><td>${Index + 1}</td><td>${Fmt(Plot.time[Index] * Unit.factor, 5)}</td><td>${FmtReference(Observation.time_reference + Plot.time[Index])}</td><td>${Fmt(Plot.raw_flux[Index], 8)}</td><td>${Fmt(Plot.flux_uncertainty?.[Index], 8)}</td><td>${Fmt(Plot.exposure_seconds?.[Index], 3)}</td></tr>`);
+  }
+  RowsEl.innerHTML = Rows.join("") || '<tr><td colspan="6" class="EmptyEventRow">No retained samples in this time window.</td></tr>';
+  if (End - First > 200)
+    RowsEl.innerHTML += `<tr><td colspan="6">First 200 of ${End - First} visible plot samples. Zoom in to inspect a smaller window.</td></tr>`;
+}
+
+//MARK: point readout
+function UpdateObservationHover(Point)
+{
+  const Previous = ObservationHoverIndex;
+  ObservationHoverIndex = null;
+  if (CurrView !== "raw" || !CurrResult || !Point)
+  {
+    ObservationReadout.textContent = "Hover over a point to inspect its original time and flux.";
+    return Previous !== null;
+  }
+  const Observation = CurrentObservation(), Plot = Observation.plot, Times = ObservationTimes();
+  const Geo = GetChartGeometry(), View = GetViewport();
+  const Target = DataAtCanvasPoint(Point, View).x;
+  const TimeRadius = 16 * (View.xMax - View.xMin) / Geo.innerW;
+  const First = LowerBoundTime(Times, Target - TimeRadius);
+  const End = LowerBoundTime(Times, Target + TimeRadius + 1e-12);
+  let Distance = 16;
+  for (let Index = First; Index < End; Index++)
+  {
+    const X = Geo.pad.left + (Times[Index] - View.xMin) / (View.xMax - View.xMin) * Geo.innerW;
+    const Y = Geo.pad.top + (View.yMax - Plot.raw_flux[Index]) / (View.yMax - View.yMin) * Geo.innerH;
+    const Away = Math.hypot(X - Point.x, Y - Point.y);
+    if (Away < Distance)
+    {
+      Distance = Away;
+      ObservationHoverIndex = Index;
+    }
+  }
+  if (ObservationHoverIndex === null)
+    ObservationReadout.textContent = "Hover over a point to inspect its original time and flux.";
+  else
+  {
+    const Index = ObservationHoverIndex, Error = NullableNumber(Plot.flux_uncertainty?.[Index]);
+    const Exposure = NullableNumber(Plot.exposure_seconds?.[Index]);
+    const Input = MainResult?.input_metadata || {};
+    ObservationReadout.textContent = `Sample ${Index + 1} · original time ${FmtReference(Observation.time_reference + Plot.time[Index])} days (${Input.time_format || "unknown"}/${Input.time_scale || "unknown"}) · flux ${Fmt(Plot.raw_flux[Index], 9)} ${Observation.flux_unit} · error ${Error === null ? "not supplied" : Fmt(Error, 9)} · exposure ${Exposure === null ? "not supplied" : Exposure === 0 ? "instantaneous" : `${Fmt(Exposure, 3)} s`}`;
+  }
+  return Previous !== ObservationHoverIndex;
+}
+
+//MARK: look at one observing run
+function PickObservationRun()
+{
+  ObservationHoverIndex = null;
+  const Observation = CurrentObservation();
+  const Run = Observation.display_time_map.runs[Number(ObservationRunInput.value)];
+  if (ObservationRunInput.value === "all" || !Run)
+    CurrViewport = null;
+  else
+  {
+    const Cut = Observation.display_time_map.enabled;
+    const Start = Cut ? Run.display_start : Run.time_start, End = Cut ? Run.display_end : Run.time_end;
+    const Pad = Math.max((End - Start) * .05, Observation.display_time_map.cadence_days || 1e-8);
+    const Runs = Observation.display_time_map.runs, Index = Number(ObservationRunInput.value);
+    const Domain = ObservationDomain();
+    const Left = Index > 0 ? ((Cut ? Runs[Index - 1].display_end : Runs[Index - 1].time_end) + Start) / 2 : Domain.xMin;
+    const Right = Index + 1 < Runs.length ? (End + (Cut ? Runs[Index + 1].display_start : Runs[Index + 1].time_start)) / 2 : Domain.xMax;
+    CurrViewport = ClampViewport({...Domain, xMin : Math.max(Left, Start - Pad), xMax : Math.min(Right, End + Pad)});
+  }
+  ObservationRowsKey = "";
+  FitObservationFlux();
+  QueueSessionSave();
+}
+
+function FitObservationFlux()
+{
+  if (!CurrResult || CurrView !== "raw")
+    return;
+  const Observation = CurrentObservation(), Plot = Observation.plot, Times = ObservationTimes(), View = GetViewport();
+  let Low = Infinity, High = -Infinity;
+  for (let Index = LowerBoundTime(Times, View.xMin); Index < Times.length && Times[Index] <= View.xMax; Index++)
+  {
+    const Error = ObservationErrorsInput.checked ? NullableNumber(Plot.flux_uncertainty?.[Index]) || 0 : 0;
+    Low = Math.min(Low, Plot.raw_flux[Index] - Error);
+    High = Math.max(High, Plot.raw_flux[Index] + Error);
+  }
+  if (Number.isFinite(Low))
+  {
+    const Pad = Math.max((High - Low) * .08, Math.abs(High) * 1e-9, 1e-9);
+    CurrViewport = ClampViewport({...View, yMin : Low - Pad, yMax : High + Pad});
+  }
+  DrawFlux();
+  QueueSessionSave();
 }
 
 //MARK: raw points and errors
@@ -1190,6 +1545,10 @@ function PackRunState()
     current_view : CurrView,
     current_viewport : CurrViewport,
     phase_scope : PhaseScopeInput.value,
+    observation_units : ObservationUnitsInput.value,
+    observation_join_points : ObservationJoinInput.checked,
+    observation_errors : ObservationErrorsInput.checked,
+    observation_run : ObservationRunInput.value,
     current_signal_index : MainResult?.signals?.indexOf(CurrResult) ?? -1,
     current_signal_selection : SignalPickThing.value,
     active_job_id : RunningJobId,
@@ -1278,6 +1637,9 @@ function ApplySavedDetectionOptions(Options)
     const Value = Options[Key];
     Input.value = Value === null || Value === undefined ? DefaultValue : String(Value);
   }
+  InspectOnlyInput.checked = Options.inspectOnly === true;
+  CutGapsInput.checked = Options.cutGaps === true;
+  GapMinutesInput.value = String(Options.gapMinutes ?? 30);
   UpdateDetectionReadouts();
 }
 
@@ -1318,6 +1680,9 @@ function RestoreSessionState(State)
     JobConnectionLost = Boolean(RunningJobId || RequestId);
     ReconnectJobButton.hidden = !JobConnectionLost;
     PhaseScopeInput.value = State.phase_scope === 'orbit' ? 'orbit' : 'focus';
+    ObservationUnitsInput.value = ['minutes', 'hours', 'days'].includes(State.observation_units) ? State.observation_units : 'auto';
+    ObservationJoinInput.checked = State.observation_join_points !== false;
+    ObservationErrorsInput.checked = State.observation_errors !== false;
     //MARK: restore view
     CurrView = SessionViews.has(State.current_view) ? State.current_view : 'zoom';
     ViewButtons.forEach(Button => Button.classList.toggle("Active", Button.dataset.view === CurrView));
@@ -1337,6 +1702,8 @@ function RestoreSessionState(State)
       CurrResult = Item.result.signals?.[State.current_signal_index] || Item.result;
       CurrViewport = ValidViewport(State.current_viewport) ? State.current_viewport : null;
       ShowCurveResult(CurrResult);
+      const SavedRun = Number(State.observation_run);
+      ObservationRunInput.value = State.observation_run !== 'all' && Number.isInteger(SavedRun) && CurrentObservation()?.display_time_map.runs[SavedRun] ? String(SavedRun) : 'all';
       if (State.current_signal_selection === 'combined' && MainResult.joint_model_comparison)
       {
         SignalPickThing.value = 'combined';
@@ -1693,7 +2060,7 @@ function BatchResultDetail(Item)
     };
   if (IsShortCurve(Item.result))
     return {
-      label : 'Short-curve inspection',
+      label : 'Data inspection',
       meta : `${Item.result.total_points.toLocaleString()} usable samples · transit search not run`,
       status : 'inspection_only',
       score : null,
@@ -1842,7 +2209,7 @@ function RenderBatchSelect()
             const Disabled = !Item.result ? ' disabled' : '';
             const Detail = !Item.result ? (Item.error ? (Item.error === 'Cancelled' ? 'cancelled' : 'failed')
                                                       : (Item.status || 'pending').replaceAll('_', ' '))
-                                        : IsShortCurve(Item.result) ? 'Short-curve inspection; search not run'
+                                        : IsShortCurve(Item.result) ? 'Data inspection; search not run'
                                         : `${AssessmentForResult(Item.result).shortLabel}; ${
                                               Item.result.transits.length} covered windows`;
             return `<option value="${Index}"${Selected}${Disabled}>${Index + 1}. ${
@@ -1904,6 +2271,9 @@ function DetectionOptions()
   {
     Options[Key] = Read(Input.value);
   }
+  Options.inspectOnly = InspectOnlyInput.checked;
+  Options.cutGaps = CutGapsInput.checked;
+  Options.gapMinutes = NullableNumber(GapMinutesInput.value) ?? 30;
   return Options;
 }
 
@@ -1912,6 +2282,7 @@ function UpdateDetectionReadouts()
 {
   StrictnessValue.value = `${Number(StrictnessInput.value).toFixed(2)}x`;
   SmoothingValue.value = `${Number(SmoothingInput.value).toFixed(2)}x`;
+  GapMinutesInput.disabled = !CutGapsInput.checked;
   const TlsMode = SearchModeInput.value === 'tls';
   TlsOptionsEl.hidden = !TlsMode;
   [StrictnessInput, MinDepthInput, MinDurationInput, MaxDurationInput].forEach(
@@ -1925,6 +2296,9 @@ function UpdateDetectionReadouts()
 //MARK: reset settings
 function ResetDetectionControls()
 {
+  InspectOnlyInput.checked = false;
+  CutGapsInput.checked = false;
+  GapMinutesInput.value = "30";
   for (const {input : Input, defaultValue : DefaultValue} of DetectionControls)
   {
     Input.value = DefaultValue;
@@ -1947,7 +2321,7 @@ function SyncExportButtons()
 {
   const Disabled = !CurrResult;
   ExportCsvButton.disabled = Disabled;
-  ExportCsvButton.textContent = IsShortCurve() ? 'Light curve CSV' : 'Transit CSV';
+  ExportCsvButton.textContent = CurrResult && (IsShortCurve() || CurrView === 'raw') ? (CurrentObservation().plot.time.length < CurrentObservation().total_points ? 'Plotted samples CSV' : 'Light curve CSV') : 'Transit CSV';
   ExportPngButton.disabled = Disabled;
   ExportJsonButton.disabled = Disabled;
   ExportAnalysisPdfButton.disabled = Disabled;
@@ -2011,6 +2385,9 @@ function ClearResultView()
 //MARK: upload settings
 function AppendDetectionOptions(UploadForm, Options)
 {
+  UploadForm.append('inspectOnly', String(Options.inspectOnly === true));
+  UploadForm.append('cutGaps', String(Options.cutGaps === true));
+  UploadForm.append('gapMinutes', Options.gapMinutes ?? 30);
   UploadForm.append('strictness', Options.strictness);
   UploadForm.append('smoothing', Options.smoothing);
   UploadForm.append('searchMode', Options.searchMode);
@@ -2209,6 +2586,27 @@ function SelectBatchResult(Index)
 }
 
 //MARK: run buttons
+//MARK: observation controls
+CutGapsInput.addEventListener('change', () =>
+{
+  UpdateDetectionReadouts();
+  MarkDetectionControlsChanged();
+});
+GapMinutesInput.addEventListener('change', MarkDetectionControlsChanged);
+InspectOnlyInput.addEventListener('change', MarkDetectionControlsChanged);
+ObservationRunInput.addEventListener('change', PickObservationRun);
+document.getElementById('FitObservationButton').addEventListener('click', FitObservationFlux);
+for (const Input of [ObservationUnitsInput, ObservationJoinInput, ObservationErrorsInput])
+{
+  Input.addEventListener('change', () =>
+  {
+    ObservationRowsKey = '';
+    UpdateChartHeading();
+    DrawFlux();
+    QueueSessionSave();
+  });
+}
+
 CurveFilesInput.addEventListener('change', () => SetFiles(CurveFilesInput.files));
 for (const {input : Input} of DetectionControls)
 {
@@ -2762,17 +3160,20 @@ function DomainForPeriodogram()
 function UpdateChartHeading()
 {
   UpdateInspectorControls();
+  SyncExportButtons();
+  if (CurrResult)
+    RenderTransitRows();
   if (!CurrResult)
   {
     ChartTitleEl.textContent = 'Flux Over Time';
     SubtitleEl.textContent = 'Transit boxes appear after analysis.';
     return;
   }
-  if (IsShortCurve())
+  if (CurrView === "raw")
   {
-    ChartTitleEl.textContent = 'Short-Curve Inspection';
-    SubtitleEl.textContent = `${InspectionReason()} Raw measurements${
-        CurrResult.plot.flux_uncertainty?.some(Error => NullableNumber(Error) > 0) ? ' with supplied error bars' : ''}; zoom, pan, and exports remain available.`;
+    const Observation = CurrentObservation(), Map = Observation.display_time_map;
+    ChartTitleEl.textContent = "Observation Viewer";
+    SubtitleEl.textContent = `${Observation.plot.time.length.toLocaleString()} plotted of ${Observation.total_points.toLocaleString()} retained samples · original coverage ${DurationLabel(Observation.domain.time_max - Observation.domain.time_min)}. ${Map.enabled ? `${Map.gap_count} gaps shortened by ${DurationLabel(Map.removed_days)} in this view.` : "Original time axis."} ${IsShortCurve() ? "Period search was not run." : "Search results use the original timestamps."}${Observation.legacy ? " Saved display flux; original input values unavailable." : ""}`;
     return;
   }
 
@@ -3170,7 +3571,7 @@ function AssessmentForResult(Result)
   if (!Result)
     return {shortLabel : 'Pending', candidateScore : null, status : 'pending'};
   if (IsShortCurve(Result))
-    return {shortLabel : 'Short-curve inspection', candidateScore : null, status : 'inspection_only'};
+    return {shortLabel : 'Data inspection', candidateScore : null, status : 'inspection_only'};
   const PreviousResult = CurrResult;
   CurrResult = Result;
   try
@@ -3288,7 +3689,7 @@ function RenderMetrics()
     return;
   if (IsShortCurve())
   {
-    AssessmentEl.innerHTML = `<div class="AssessmentCard InspectionOnly"><div class="AssessmentHead"><strong>Short-curve inspection</strong><span>Search not run</span></div><p>${EscapeHtml(InspectionReason())}</p><p>This is an inspection of the supplied measurements. No orbital period or planet assessment was calculated.</p></div>`;
+    AssessmentEl.innerHTML = `<div class="AssessmentCard InspectionOnly"><div class="AssessmentHead"><strong>Data inspection</strong><span>Search not run</span></div><p>${EscapeHtml(InspectionReason())}</p><p>This is an inspection of the supplied measurements. No orbital period or planet assessment was calculated.</p></div>`;
     MetricsEl.innerHTML = `
       <div class="Metric"><span>Usable samples</span><span>${CurrResult.total_points.toLocaleString()}</span></div>
       <div class="Metric"><span>Time span</span><span>${Fmt(CurrResult.domain.time_max - CurrResult.domain.time_min)} days</span></div>
@@ -3352,6 +3753,13 @@ function RenderTransitRows()
 {
   if (!CurrResult)
     return;
+  if (CurrView === "raw")
+  {
+    RenderObservationRows();
+    return;
+  }
+  CurveTableHead.innerHTML = TransitTableHead;
+  ObservationRowsKey = "";
   if (IsShortCurve())
   {
     RowsEl.innerHTML = '<tr><td colspan="10" class="EmptyEventRow">Transit search was not run for this short curve.</td></tr>';
@@ -3417,7 +3825,7 @@ function RenderMetadata()
   const Cleaning = Result.cleaning || Result.cleaning_report || {};
   const Input = Result.input_metadata || {};
   const Pairs = IsShortCurve(Result) ? [
-    [ 'Analysis state', 'Short-curve inspection; transit search not run' ],
+    [ 'Analysis state', 'Data inspection; transit search not run' ],
     [ 'Reason', InspectionReason(Result) ],
     [ 'Usable samples', Result.total_points ],
     [ 'Analyzed at', Result.analyzed_at || Provenance.analyzed_at || 'Unknown' ],
@@ -3518,15 +3926,17 @@ function RenderStackEvents()
 //MARK: inspector controls
 function UpdateInspectorControls()
 {
+  UpdateObservationTools();
+  document.getElementById("ModelControl").hidden = IsShortCurve() || CurrView === "raw";
   document.getElementById("PhaseScopeControl").hidden = CurrView !== 'phase';
   document.getElementById("StackControls").hidden = CurrView !== 'stack';
   document.getElementById("LocalDipsControl").hidden =
-      !['zoom', 'clean', 'raw', 'audit'].includes(CurrView) ||
+      !['zoom', 'clean', 'audit'].includes(CurrView) ||
       !(MainResult?.exploratory_dips?.length || CurrResult?.exploratory_dips?.length);
   const Quality = CurrResult?.fit_quality;
   document.getElementById("FitQualityLabel").textContent =
       !CurrResult ? ''
-                  : IsShortCurve() ? 'Inspection only — no fitted model'
+                  : CurrView === 'raw' ? 'Original measurements' : IsShortCurve() ? 'Inspection only — no fitted model'
                   : (Quality?.label ||
                      (IsTentativeModel() ? 'Tentative fit — below candidate threshold' : 'Fitted model'));
   const Element = document.getElementById("EventInspection");
@@ -3685,13 +4095,13 @@ function ExportTransitCsv()
 {
   if (!CurrResult)
     return;
-  if (IsShortCurve())
+  if (IsShortCurve() || CurrView === "raw")
   {
     const Rows = RawCurveRowsForExport();
     const Headers = Object.keys(Rows[0] || {});
     const Csv = [ Headers.join(','), ...Rows.map(Row => Headers.map(Header => CsvCell(Row[Header])).join(',')) ].join('\n');
     DownloadBlob(Csv, `${ExportBaseName()}-light-curve.csv`, 'text/csv;charset=utf-8');
-    SetStatus('Light curve CSV exported with supplied uncertainties. Transit search was not run.');
+    SetStatus('Observation samples exported with original timestamps and supplied uncertainties.');
     return;
   }
   const Rows = TransitRowsForExport();
@@ -3735,16 +4145,18 @@ function ExportTransitCsv()
 //MARK: measured curve export
 function RawCurveRowsForExport()
 {
-  return CurrResult.plot.time.map((Time, Index) => ({
-    Time : CurrResult.time_reference + Time,
-    Flux : CurrResult.plot.raw_flux[Index],
-    flux_err : CurrResult.plot.flux_uncertainty?.[Index] ?? null,
-    exposure_seconds : CurrResult.plot.exposure_seconds?.[Index] ?? null,
+  const Observation = CurrentObservation(), Plot = Observation.plot;
+  const Input = MainResult?.input_metadata || CurrResult.input_metadata || {};
+  return Plot.time.map((Time, Index) => ({
+    Time : Observation.time_reference + Time,
+    Flux : Plot.raw_flux[Index],
+    flux_err : Plot.flux_uncertainty?.[Index] ?? null,
+    exposure_seconds : Plot.exposure_seconds?.[Index] ?? null,
     time_offset_days : Time,
-    time_reference : CurrResult.time_reference,
-    time_format : CurrResult.input_metadata?.time_format || 'unknown',
-    time_scale : CurrResult.input_metadata?.time_scale || 'unknown',
-    flux_unit : CurrResult.flux_unit || '',
+    time_reference : Observation.time_reference,
+    time_format : Input.time_format || "unknown",
+    time_scale : Input.time_scale || "unknown",
+    flux_unit : Observation.flux_unit || "",
   }));
 }
 
@@ -3766,6 +4178,7 @@ function SummaryForExport()
     exported_at : new Date().toISOString(),
     source_file : CurrFile ? CurrFile.name : null,
     chart_view : CurrView,
+    observation_view : CurrentObservation(),
     total_points : CurrResult.total_points,
     time_reference : CurrResult.time_reference,
     time_reference_jd :
@@ -4184,9 +4597,18 @@ function PdfAnalysisDetails(Row)
     if (Text)
       Add(Text);
   };
+  const Observation = Result.observation_view;
+  if (Observation)
+  {
+    const Map = Observation.display_time_map;
+    Section('OBSERVATION VIEW');
+    Add(`${Observation.total_points} retained samples; ${Observation.plot.time.length} displayed. Original coverage: ${DurationLabel(Observation.domain.time_max - Observation.domain.time_min)}.`);
+    Add(Map.enabled ? `${Map.gap_count} gaps shortened by ${DurationLabel(Map.removed_days)} for viewing only. Search calculations and exported timestamps remain original.` : 'Original observation time axis; gap cutting disabled.');
+    Add(`Gap threshold: ${DurationLabel(Map.threshold_days)}. Flux: ${Observation.representation}.`);
+  }
   if (IsShortCurve(Result))
   {
-    Section('SHORT-CURVE INSPECTION');
+    Section('DATA INSPECTION');
     Add(InspectionReason(Result));
     Add(`${Row.points} retained measurements. Transit search was not run; no period, model, or planet assessment was calculated.`);
     Add(`Median input flux: ${Row.medianFlux}. Raw measurements and supplied uncertainties are available in the light curve CSV and JSON exports.`);
@@ -4347,6 +4769,8 @@ function GetInitialDomain()
 {
   if (!CurrResult)
     return null;
+  if (CurrView === "raw")
+    return ObservationDomain();
   if (CurrView === 'comparison')
     return ComparisonDomain();
   if (CurrView === 'stack')
@@ -4411,6 +4835,8 @@ function GetLimitDomain()
 {
   if (!CurrResult)
     return null;
+  if (CurrView === "raw")
+    return ObservationDomain();
   if (CurrView === 'comparison')
     return ComparisonDomain();
   if (CurrView === 'stack')
@@ -4639,6 +5065,7 @@ function DrawChartAxes(Geo, Viewport, Options = {})
     yDigits : YDigits = 4,
     xLabel : XLabel = '',
     yLabel : YLabel = '',
+    xTickFormat : XTickFormat = null,
   } = Options;
   const XDivisions = Math.max(2, Math.min(6, Math.floor(InnerW / 88)));
   const YDivisions = Math.max(2, Math.min(5, Math.floor(InnerH / 52)));
@@ -4672,7 +5099,7 @@ function DrawChartAxes(Geo, Viewport, Options = {})
     FluxPen.lineTo(X, PlotBottom + 5);
     FluxPen.stroke();
     FluxPen.textAlign = I === 0 ? 'left' : (I === XDivisions ? 'right' : 'center');
-    FluxPen.fillText(Fmt(Value, XDigits), X, PlotBottom + 10);
+    FluxPen.fillText(XTickFormat ? XTickFormat(Value) : Fmt(Value, XDigits), X, PlotBottom + 10);
   }
 
   FluxPen.fillStyle = '#202124';
@@ -4939,6 +5366,9 @@ function DrawPeriodogramChart(Geo)
 FluxChart.addEventListener('pointermove', UiEvent =>
 {
   HoverThingy = PointerPosition(UiEvent);
+  const ObservationChanged = UpdateObservationHover(HoverThingy);
+  if (ObservationChanged && !DragState && CurrView === 'raw')
+    DrawFlux();
   if (!DragState || !CurrResult)
   {
     UpdateCanvasCursor(HoverThingy);
@@ -5002,7 +5432,11 @@ FluxChart.addEventListener('pointercancel', FinishDrag);
 FluxChart.addEventListener('pointerleave', UiEvent =>
 {
   if (!DragState)
+  {
     HoverThingy = null;
+    if (UpdateObservationHover(null) && CurrView === 'raw')
+      DrawFlux();
+  }
   UpdateCanvasCursor(HoverThingy);
 });
 
@@ -5421,6 +5855,9 @@ function DrawAuditLegend(Geo, Metrics)
 //MARK: reset plot
 function ResetFluxView()
 {
+  ObservationRunInput.value = "all";
+  ObservationHoverIndex = null;
+  UpdateObservationHover(null);
   CurrViewport = null;
   DrawFlux();
   QueueSessionSave();

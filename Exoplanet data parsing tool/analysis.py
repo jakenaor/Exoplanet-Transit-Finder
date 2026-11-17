@@ -46,6 +46,9 @@ DEFAULT_DETECTION_OPTIONS = {
     "tls_duration_grid_step": 1.1,
     "tls_max_signals": 1,
     "exposure_seconds": None,
+    "inspection_only": False,
+    "cut_gaps": False,
+    "gap_minutes": 30.0,
 }
 
 
@@ -65,9 +68,11 @@ def RunCurve(Time, Flux, Options=None, ProgressCallback=None, **LegacyOptions):
     #MARK: curve funcs
     Time, Flux, Options, Exposures, ExposureMetadata = _PrepCurve(Time, Flux, Options)
     ReportProgress("preparing", "Preparing light curve")
-    if len(Time) < MIN_PERIOD_SEARCH_SAMPLES:
+    if Options.get("inspection_only") or len(Time) < MIN_PERIOD_SEARCH_SAMPLES:
         ReportProgress("building", "Preparing measurements for inspection")
         Result = _MakeReviewThing(Time, Flux, Options, Exposures, ExposureMetadata)
+        if not Options.get("_skip_local_inspection"):
+            Result["observation_view"] = MakeObservationThing(Time, Flux, Options, Exposures)
         ReportProgress("finalizing", "Finalizing inspection-only result")
         return Result
     NormalizationPlan = FluxNormalizationPlan(Flux)
@@ -375,6 +380,8 @@ def RunCurve(Time, Flux, Options=None, ProgressCallback=None, **LegacyOptions):
                 Result["multi_signal_search"].update(joint_refit=True, joint_fit=Joint["metadata"],
                                                       limitation="Joint amplitudes and baseline fitted; orbital parameters and transit shapes remain conditional and require follow-up vetting.")
     TagExploratoryAssignments(Result, Result.get("signals") or [Result])
+    if not Options.get("_skip_local_inspection"):
+        Result["observation_view"] = MakeObservationThing(Time, Flux, Options, Exposures)
     return Result
 
 
@@ -500,6 +507,10 @@ def ParseDetectionOptions(Form):
         and Options["max_period"] <= Options["min_period"]
     ):
         raise ValueError("maxPeriod must be greater than minPeriod.")
+    Options["inspection_only"] = ParseChoice(Form, "inspectOnly", {"true": True, "false": False, "on": True, "off": False, "1": True, "0": False}, False)
+    Options["cut_gaps"] = ParseChoice(Form, "cutGaps", {"true": True, "false": False, "on": True, "off": False, "1": True, "0": False}, False)
+    GapMinutes = ParseOptionalFloat(Form, "gapMinutes", 0.1, 10080.0)
+    Options["gap_minutes"] = 30.0 if GapMinutes is None else GapMinutes
     return Options
 
 
@@ -3552,7 +3563,7 @@ def UpdateSignalJointDepth(Signal, Depth, Uncertainty):
 
 #MARK: curve funcs
 def _MakeReviewThing(Time, Flux, Options, Exposures, ExposureMetadata):
-    """Open a short curve without turning it into a period-search result."""
+    """Open measurements without turning them into a period-search result."""
     TimeReference = float(Time[0])
     DisplayTime = Time - TimeReference
     Segments = ObservingSegments(Time)
@@ -3561,6 +3572,8 @@ def _MakeReviewThing(Time, Flux, Options, Exposures, ExposureMetadata):
         f"{MIN_PERIOD_SEARCH_SAMPLES} samples before running a TLS or BLS period search. "
         "The uploaded measurements are available for inspection."
     )
+    if Options.get("inspection_only"):
+        Reason = "Period search was skipped because view-only mode was selected. The uploaded measurements are available for inspection."
     PublicOptions = {Key: Value for Key, Value in Options.items() if not Key.startswith("_")}
 
     # keep errors in the uploaded flux units, including gaps in the error column.
@@ -3792,3 +3805,77 @@ def normalized_flux_for_tls(time, flux):
 #MARK: tls funcs
 def estimate_period_with_tls(time, flux, options=None, progress_callback=None):
     return EstimatePeriodWithTls(time, flux, options, ProgressCallback=progress_callback)
+
+#MARK: observation viewer
+def MakeObservationThing(Time, Flux, Options, Exposures):
+    TimeReference = float(Time[0])
+    RelativeTime = Time - TimeReference
+    Deltas = Np.diff(RelativeTime)
+    FloorMinutes = float(Options.get("gap_minutes", 30.0))
+    CutGaps = Options.get("cut_gaps", False)
+    if type(CutGaps) is not bool:
+        raise ValueError("cut_gaps must be true or false.")
+    if not Math.isfinite(FloorMinutes) or FloorMinutes <= 0:
+        raise ValueError("Gap threshold must be a positive number of minutes.")
+
+    # keep an overnight gap out of the typical sampling interval.
+    Cadence = None
+    if len(Time) >= 3:
+        LowerDeltas = Np.sort(Deltas)[:(len(Deltas) + 1) // 2]
+        Cadence = float(Np.median(LowerDeltas))
+    Threshold = max(FloorMinutes / 1440.0, 10.0 * (Cadence or 0.0))
+    GapStarts = (Np.flatnonzero(Deltas > Threshold) + 1
+                 if Cadence is not None else Np.asarray([], dtype=int))
+    Removed = Np.zeros(len(Time), dtype=float)
+    if CutGaps and GapStarts.size:
+        Removed[GapStarts] = Deltas[GapStarts - 1] - Cadence
+    DisplayTime = RelativeTime - Np.cumsum(Removed)
+    Starts = Np.r_[0, GapStarts].astype(int)
+    Ends = Np.r_[GapStarts, len(Time)].astype(int)
+
+    # these are original input units, including the supplied error bars.
+    Errors = Np.full(len(Flux), Np.nan)
+    Supplied = Options.get("_flux_uncertainty")
+    if Supplied is not None:
+        Supplied = Np.asarray(Supplied, dtype=float)
+        if Supplied.shape == Flux.shape:
+            Valid = Np.isfinite(Supplied) & (Supplied > 0)
+            Errors[Valid] = Supplied[Valid]
+    ErrorWidths = Np.where(Np.isfinite(Errors), Errors, 0.0)
+    Keep = DownsampleIndicesForSeries([Flux, Flux - ErrorWidths, Flux + ErrorWidths], MAX_PLOT_POINTS)
+    Boundaries = Np.unique(Np.r_[Starts, Ends - 1]).astype(int)
+    Keep = Np.unique(Np.r_[Keep, Boundaries]).astype(int)
+    FluxMin, FluxMax = DomainFor(Np.r_[Flux - ErrorWidths, Flux + ErrorWidths], 0.0, 100.0)
+    if FluxMin == FluxMax:
+        Padding = max(abs(FluxMin) * 1e-12, 1e-9)
+        FluxMin, FluxMax = FluxMin - Padding, FluxMax + Padding
+    Runs = [{"run_id": Index + 1, "points": int(End - Start),
+             "time_start": float(RelativeTime[Start]), "time_end": float(RelativeTime[End - 1]),
+             "display_start": float(DisplayTime[Start]), "display_end": float(DisplayTime[End - 1]),
+             "plot_start": int(Np.searchsorted(Keep, Start)), "plot_end": int(Np.searchsorted(Keep, End))}
+            for Index, (Start, End) in enumerate(zip(Starts, Ends))]
+    Gaps = [{"time_start": float(RelativeTime[Start - 1]), "time_end": float(RelativeTime[Start]),
+             "display_start": float(DisplayTime[Start - 1]), "display_end": float(DisplayTime[Start]),
+             "removed_days": float(Removed[Start])} for Start in GapStarts]
+    Reason = ("At least three samples are needed to estimate a join cadence." if Cadence is None
+              else "No intervals exceed the gap threshold." if not Gaps else None)
+    Input = Options.get("_input_metadata") or {}
+    return {
+        "version": 1, "total_points": int(len(Time)), "time_reference": TimeReference,
+        "time_unit": "Days since first observation", "flux_unit": Input.get("flux_unit") or "input flux units",
+        "representation": "original retained flux at displayed samples; no normalization or smoothing",
+        "domain": {"time_min": 0.0, "time_max": float(RelativeTime[-1])},
+        "raw_domain": {"flux_min": FluxMin, "flux_max": FluxMax},
+        "plot": {"time": RelativeTime[Keep].tolist(), "display_time": DisplayTime[Keep].tolist(),
+                 "raw_flux": Flux[Keep].tolist(),
+                 "flux_uncertainty": [float(Value) if Np.isfinite(Value) else None for Value in Errors[Keep]],
+                 "exposure_seconds": [float(Value) if Np.isfinite(Value) else None for Value in Exposures[Keep]],
+                 "break_indices": [int(Np.searchsorted(Keep, Start)) for Start in Starts[1:]]},
+        "display_time_map": {"version": 1, "enabled": CutGaps, "reason": Reason,
+                             "cadence_days": Cadence, "threshold_days": Threshold, "join_days": Cadence,
+                             "gap_count": len(Gaps), "removed_days": float(Np.sum(Removed)),
+                             "display_domain": {"time_min": 0.0, "time_max": float(DisplayTime[-1])},
+                             "runs": Runs, "gaps": Gaps,
+                             "knots": [{"time": float(RelativeTime[Index]), "display_time": float(DisplayTime[Index])}
+                                       for Index in Boundaries]},
+    }
