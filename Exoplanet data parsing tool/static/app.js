@@ -1583,13 +1583,14 @@ function SaveRunNow()
     SessionSaveTimer = null;
   }
   const Snapshot = PackRunState();
+  const SaveSessionId = SessionId;
   SetSessionIndicator(`Session ${ShortSessionId()} · saving cache…`, 'saving');
   // keep saves in order so an older request cannot replace a newer view.
   SessionSaveChain = SessionSaveChain.catch(() => false).then(async () =>
   {
     try
     {
-      const Reply = await fetch(`/analysis-sessions/${encodeURIComponent(SessionId)}`, {
+      const Reply = await fetch(`/analysis-sessions/${encodeURIComponent(SaveSessionId)}`, {
         method : 'POST',
         headers : {'Content-Type' : 'application/json'},
         body : JSON.stringify(Snapshot),

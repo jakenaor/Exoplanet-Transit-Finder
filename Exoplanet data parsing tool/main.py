@@ -20,6 +20,7 @@ import time as Time
 from urllib.parse import parse_qs as ParseQs, unquote as Unquote, urlparse as Urlparse
 import webbrowser as Webbrowser
 
+from image_jobs import ImageJobManager, HandleImageRequest
 from analysis import RunCurve, ParseDetectionOptions
 from analysis_jobs import AnalysisJobManager, AnnotateAnalysisResult
 from parsers import ReadCurveUpload
@@ -61,6 +62,7 @@ def RunApp():
         MaxJobs = 1
     Server.AnalysisJobs = AnalysisJobManager(MaxRunning=MaxJobs)
     Server.RunCache = SessionCacheManager()
+    Server.ImageJobs = ImageJobManager()
 
     Url = f"http://{HOST}:{Server.server_port}/"
     print(f"Transit Finder running at {Url}")
@@ -73,6 +75,7 @@ def RunApp():
         print("\nStopping server.")
     finally:
         Server.AnalysisJobs.shutdown()
+        Server.ImageJobs.shutdown()
         Server.server_close()
 
 
@@ -131,6 +134,8 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     #MARK: do get
     def do_GET(self):
+        if HandleImageRequest(self, "GET"):
+            return
         FilePath = Urlparse(self.path).path
         if FilePath == "/analysis-jobs":
             RequestId = ParseQs(Urlparse(self.path).query).get("request_id", [""])[0]
@@ -201,6 +206,8 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     #MARK: do post
     def do_POST(self):
+        if HandleImageRequest(self, "POST"):
+            return
         FilePath = Urlparse(self.path).path
         LocationSessionId = self.AnalysisSessionLocationId(FilePath)
         if LocationSessionId is not None:
@@ -266,6 +273,8 @@ class TransitRequestHandler(BaseHTTPRequestHandler):
 
     #MARK: do delete
     def do_DELETE(self):
+        if HandleImageRequest(self, "DELETE"):
+            return
         FilePath = Urlparse(self.path).path
         JobId = self.AnalysisJobId(FilePath)
         if JobId is None:

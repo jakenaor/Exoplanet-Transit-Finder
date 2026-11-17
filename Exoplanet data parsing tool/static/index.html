@@ -7,13 +7,19 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <main>
+  <!--MARK: app tabs -->
+  <nav class="AppTabsBar" role="tablist" aria-label="App workspace">
+    <button id="FinderTabButton" type="button" role="tab" aria-selected="true" aria-controls="FinderPane">Transit finder</button>
+    <button id="ImagesTabButton" type="button" role="tab" aria-selected="false" aria-controls="ImagesPane">FITS → light curve</button>
+  </nav>
+  <iframe id="ImagesPane" title="FITS image calibration and photometry" role="tabpanel" aria-labelledby="ImagesTabButton" hidden></iframe>
+  <main id="FinderPane" role="tabpanel" aria-labelledby="FinderTabButton">
     <!--MARK: sidebar stuffs -->
     <aside class="Sidebar">
       <div>
         <div class="AppTitleRow">
           <h1>Transit Finder</h1>
-          <span class="VersionIndicator" aria-label="Application version 68">v68</span>
+          <span class="VersionIndicator" aria-label="Application version 69">v69</span>
         </div>
         <p>Upload up to 100 CSV or FITS light curves with time and flux columns. JSON metadata files are skipped.</p>
         <p id="SessionIndicator" class="SessionIndicator" aria-live="polite">Preparing session cache…</p>
@@ -386,5 +392,6 @@
 
   <!--MARK: start the frontend -->
   <script src="/static/app.js"></script>
+  <script src="/static/tabs.js"></script>
 </body>
 </html>

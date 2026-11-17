@@ -2,6 +2,7 @@
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
   "python.useEnvironmentsExtension": false,
   "python.analysis.extraPaths": [
+    "${workspaceFolder}/Exoplanet data parsing tool",
     "${workspaceFolder}/.venv/lib/python3.9/site-packages"
   ],
   "python-envs.defaultEnvManager": "ms-python.python:system"

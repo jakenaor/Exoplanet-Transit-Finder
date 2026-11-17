@@ -1,23 +1,24 @@
 # credits
 
-Exoplanet Transit Finder is a project by **Jnaor**.
-Contact: **jake_5101** on Discord :D
+made by **Jnaor**
 
-## software behind the app
+discord: **jake_5101** :D
 
-| Software | Credit | Used for |
+## the stuff this uses
+
+| thing | who made it | what it does |
 | --- | --- | --- |
 | [Transit Least Squares](https://github.com/hippke/tls) | Michael Hippke, René Heller, and contributors | The reference transit-search engine. The app currently uses TLS 1.32. |
 | [batman](https://lkreidberg.github.io/batman/docs/html/index.html) | Laura Kreidberg and contributors | Physical transit templates inside TLS 1.32; also used for the app's injection tests. |
 | [NumPy](https://numpy.org/citing-numpy/) | The NumPy developers | Array operations and numerical calculations. |
 | [SciPy](https://scipy.org/citing-scipy/) | The SciPy developers | Signal processing, statistics, and conditional model fitting. |
-| [Astropy](https://www.astropy.org/acknowledging.html) | The Astropy Collaboration and contributors | FITS input and the optional Box Least Squares search. |
+| [Astropy](https://www.astropy.org/acknowledging.html) | The Astropy Collaboration and contributors | FITS input, image sections, time handling, clipped background statistics, and the optional Box Least Squares search. |
 | [Numba](https://numba.pydata.org/) | The Numba developers | Compiled numerical routines used by TLS. |
 | [tqdm](https://tqdm.github.io/) | Casper da Costa-Luis and the tqdm contributors | TLS's progress machinery, which the app adapts for its job progress and ETA. |
 
-The app adds preprocessing, event checks, candidate scoring, plots, exports,
-and batch/session handling around these tools. The original TLS search and
-batman transit models are credited to their authors above.
+the app handles loading files, checking results, plots, exports, and the
+batch/session thingies. TLS does the period search, and batman provides the
+transit models used by TLS. credits for those are above.
 
 ## references for a paper
 
@@ -46,20 +47,27 @@ batman transit models are credited to their authors above.
   *Astronomy & Astrophysics, 391*, 369–377.
   [Paper](https://doi.org/10.1051/0004-6361:20020802).
 
-Record the versions and settings from the final analysis results alongside the
-paper. Acknowledging a package here does not establish that every optional
-method was used in a particular run.
+for the paper, keep the package versions and settings with the final results.
+only cite the optional methods if they were actually used.
 
 ## data credits
 
-Credit each dataset's actual telescope/mission, archive, instrument, and
-reduction pipeline when its source is confirmed. The original sources of the
-current test CSVs remain unverified, so no particular NASA mission or archive
-is assigned credit based only on a filename. Keep the original download link,
-data-product identifier, and required acknowledgment wording with each dataset.
+credit the telescope/mission, archive, and whoever made the dataset once we
+know where it came from. some of the old CSV sources still need checking, so
+don't guess the NASA mission from the filename. keep the download link and any
+required credit text with the data.
+
+## image stuff
+
+the image tab subtracts matching median darks, then measures the stars with
+circular apertures. the sky comes from a ring around each star. aperture edges
+use 8 × 8 subpixels; NumPy does the math and SciPy helps find the star centers.
+timing assumptions and calibration limits get saved with the table.
+
+method references: [Astropy image sections and scaling](https://docs.astropy.org/en/stable/io/fits/usage/image.html)
+and [Photutils aperture/background/error guidance](https://photutils.readthedocs.io/en/stable/user_guide/aperture.html).
 
 ## licenses
 
-The project's license is in [LICENSE](LICENSE). Third-party software retains its
-own licenses and copyright notices. The links above lead to the original
-projects and their notices; these research references do not replace them.
+project license: [LICENSE](LICENSE). the libraries keep their own licenses and
+copyright notices. those are linked above too; paper citations don't replace them.

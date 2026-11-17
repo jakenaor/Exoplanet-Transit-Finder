@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FITS to light curve · Transit Finder</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="ImagesPage">
+  <!--MARK: image tab thingy -->
+  <header class="ImageHeader">
+    <nav class="StandaloneImageNav"><a href="/">Transit finder</a> <a href="/images" aria-current="page">FITS → light curve</a></nav>
+    <h1>FITS → light curve</h1>
+    <p>Turn raw science images and matching dark frames into a time–flux table. Process one field, filter and camera setup at a time.</p>
+  </header>
+  <div class="ImageLayout">
+    <section class="ImageSettings">
+      <!--MARK: files go here -->
+      <h2>1. Load the images</h2>
+      <label for="ScienceImages">Raw science images</label>
+      <input id="ScienceImages" type="file" accept=".fits,.fit,.fts" multiple>
+      <label for="DarkImages">Raw dark frames</label>
+      <input id="DarkImages" type="file" accept=".fits,.fit,.fts" multiple>
+      <p class="ControlHelp">Darks must match exposure and camera settings. No exposure scaling or flat-field correction is applied. Already dark-corrected images are rejected when identified by their headers.</p>
+      <p class="ControlHelp">Up to 10,000 science images and 128 darks; 512 MiB per image and 20 GiB of staged uploads. Source images stay unchanged; finished tables are saved under Desktop/Current/Exoplanet Transit Finder Stuff/Image Light Curves.</p>
+      <button id="PrepareImages" type="button">Upload and preview</button>
+      <h2>2. Pick the stars</h2>
+      <label for="StarRole">Click in the preview to select</label>
+      <select id="StarRole"><option value="target">Target star</option><option value="comparison">Comparison star</option></select>
+      <p class="ControlHelp">Choose isolated stars. One target is required; up to eight comparison stars are optional. Comparison stars should be stable and unsaturated.</p>
+      <ol id="StarList"><li>No stars selected.</li></ol>
+      <button id="UndoStar" class="ViewButton" type="button" disabled>Undo last star</button>
+      <!--MARK: aperture thingies -->
+      <div class="ImageNumberGrid">
+        <label>Aperture radius (px)<input id="ApertureRadius" type="number" min="2" max="128" step="any" value="8"></label>
+        <label>Sky inner radius (px)<input id="SkyInner" type="number" min="3" max="192" step="any" value="12"></label>
+        <label>Sky outer radius (px)<input id="SkyOuter" type="number" min="5" max="256" step="any" value="20"></label>
+        <label>Tracking radius (px)<input id="TrackRadius" type="number" min="1" max="64" step="any" value="12"></label>
+      </div>
+      <p class="ControlHelp">Tracking searches near the selected positions. Split meridian flips, large rotations and moves into separate runs.</p>
+      <h2>3. Make the table</h2>
+      <label for="ImageClock">DATE-OBS / JD-OBS refers to</label>
+      <select id="ImageClock"><option value="start">Exposure start (assumption)</option><option value="midpoint">Exposure midpoint</option></select>
+      <p class="ControlHelp">DATE-AVG is treated as a midpoint. The output records timing assumptions; missing time scales remain unverified and no barycentric correction is made.</p>
+      <label for="ImageWorkers">Processing workers</label>
+      <select id="ImageWorkers"><option>1</option><option>2</option><option>3</option><option selected>4</option></select>
+      <div class="ImageActions"><button id="ProcessImages" type="button" disabled>Make time–flux table</button><button id="CancelImages" class="ViewButton" type="button" disabled>Cancel</button></div>
+      <p id="ImageStatus" role="status" aria-live="polite">Choose science images and dark frames.</p>
+      <progress id="ImageProgress" max="1" value="0" hidden></progress>
+    </section>
+    <!--MARK: the image and the finished sheet -->
+    <section class="ImageWorkspace">
+      <div class="ImageCard">
+        <h2 id="PreviewHeading">Image preview</h2>
+        <p id="PreviewNote">The first science image will appear here. Preview pixels are averaged for display; measurements use the original pixels.</p>
+        <canvas id="StarCanvas" width="1000" height="650" aria-label="Science image; click a star to place a measurement aperture"></canvas>
+      </div>
+      <div id="ImageResults" class="ImageCard" hidden>
+        <h2>Time–flux table</h2>
+        <p id="ImageResultSummary"></p>
+        <p id="ImageOutputPath" class="ImagePath"></p>
+        <div class="ImageActions"><a id="ImageCsv" class="ImageDownload" download="lightcurve.csv">Download CSV</a><a id="ImageMetadata" class="ImageDownload" download="metadata.json">Download measurements + metadata</a><button id="ImageToFinder" type="button" disabled>Open in transit finder</button></div>
+        <ul id="ImageWarnings"></ul>
+        <canvas id="ImageCurveCanvas" width="1000" height="320" aria-label="Extracted light curve"></canvas>
+        <div class="ImageTableWrap"><table><thead><tr><th>Time (relative days)</th><th>Flux</th><th>Flux error</th><th>Quality / reason</th></tr></thead><tbody id="ImageRows"></tbody></table></div>
+      </div>
+    </section>
+  </div>
+  <script src="/static/images.js"></script>
+</body>
+</html>

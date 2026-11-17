@@ -187,7 +187,7 @@ class HTTPIntegrationTests(Unittest.TestCase):
             self.assertTrue(Result['review_only'])
             self.assertEqual(Result['total_points'], 100)
             self.assertIsNone(Result['period'])
-            self.assertEqual(Result['provenance']['app_version'], '68')
+            self.assertEqual(Result['provenance']['app_version'], '69')
             View = Result['observation_view']
             self.assertEqual(View['display_time_map']['enabled'], Cut == 'true')
             self.assertEqual(View['display_time_map']['gap_count'], 1)

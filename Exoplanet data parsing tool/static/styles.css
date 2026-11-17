@@ -1403,3 +1403,44 @@ th {
 .ObservationSummary { font-weight:600; color:var(--accent); }
 .ObservationReadout { flex-basis:100%; min-height:1.4em; color:var(--muted); font-variant-numeric:tabular-nums; }
 .Workspace.ObservationMode .TableWrap table { min-width:660px; }
+
+/*MARK: app tab thingies */
+.AppTabsBar { height:46px; display:flex; align-items:center; gap:8px; padding:6px 14px; border-bottom:1px solid var(--line); background:#fff; }
+.AppTabsBar button { background:var(--surface-soft); color:var(--quiet); padding:6px 14px; }
+.AppTabsBar button[aria-selected=true] { background:var(--accent); color:#fff; }
+#FinderPane { height:calc(100dvh - 46px); }
+#FinderPane[hidden],#ImagesPane[hidden] { display:none!important; }
+#ImagesPane { position:fixed; inset:46px 0 0; width:100%; height:calc(100dvh - 46px); border:0; background:var(--surface-soft); }
+
+/*MARK: image workspace */
+body.ImagesPage { height:auto; min-height:100dvh; overflow:auto; background:var(--surface-soft); }
+.ImageHeader { padding:18px 22px 8px; }
+.ImageHeader h1 { margin:4px 0; }
+.ImageHeader p { color:var(--muted); margin:4px 0 10px; }
+.StandaloneImageNav { display:flex; gap:16px; margin-bottom:16px; }
+.EmbeddedImages .StandaloneImageNav { display:none; }
+.ImageLayout { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; padding:0 20px 24px; align-items:start; }
+.ImageSettings,.ImageCard { border:1px solid var(--line); border-radius:8px; background:#fff; padding:16px; box-shadow:var(--shadow-soft); }
+.ImageSettings h2 { font-size:15px; margin:18px 0 10px; }
+.ImageSettings h2:first-child { margin-top:0; }
+.ImageSettings > label { display:block; font-weight:600; margin:10px 0 4px; }
+.ImageSettings input,.ImageSettings select { width:100%; max-width:100%; }
+.ImageSettings input[type=file] { font-size:12px; padding:8px 0; }
+.ImageNumberGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+.ImageNumberGrid label { font-size:12px; }
+.ImageNumberGrid input { margin-top:4px; }
+.ImageWorkspace { min-width:0; display:grid; gap:18px; }
+.ImageCard h2 { margin:0 0 8px; }
+.ImageCard > p { color:var(--muted); font-size:13px; }
+.ImageCard[hidden] { display:none!important; }
+#StarCanvas { display:block; width:100%; height:auto; background:#111827; cursor:crosshair; border-radius:4px; }
+#ImageCurveCanvas { display:block; width:100%; height:auto; background:var(--surface-soft); }
+.ImageActions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:14px 0 8px; }
+.ImageDownload { display:inline-block; color:var(--accent-dark); padding:8px 12px; border:1px solid var(--line); border-radius:5px; background:var(--accent-soft); text-decoration:none; font-weight:600; font-size:12px; }
+#ImageWarnings { font-size:12px; color:var(--quiet); padding-left:20px; }
+#ImageWarnings li { margin-bottom:6px; }
+.ImagePath,#ImageStatus { overflow-wrap:anywhere; font-size:12px; }
+#ImageProgress { width:100%; height:16px; }
+.ImageTableWrap { max-height:360px; overflow:auto; margin-top:12px; }
+.ImageTableWrap table { min-width:500px; width:100%; }
+@media(max-width:860px) { #FinderPane { height:auto; min-height:calc(100dvh - 46px); } .ImageLayout { grid-template-columns:1fr; padding:0 12px 18px; } .ImageHeader { padding:14px 14px 4px; } }
