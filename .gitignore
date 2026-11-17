@@ -1,3 +1,6 @@
 /docs/
+/build/
+/dist/
+**/__pycache__/
 **/.gitignore/
 **/.venv/
