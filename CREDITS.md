@@ -59,8 +59,7 @@ required credit text with the data.
 
 ## image stuff
 
-the image tab subtracts matching median darks, then measures the stars with
-circular apertures. the sky comes from a ring around each star. aperture edges
+the image tab subtracts matching median darks, then measures the stars with very cool circular apertures. the sky comes from a ring around each star. aperture edges
 use 8 × 8 subpixels; NumPy does the math and SciPy helps find the star centers.
 timing assumptions and calibration limits get saved with the table.
 
