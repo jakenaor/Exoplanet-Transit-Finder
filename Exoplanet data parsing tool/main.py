@@ -9,6 +9,8 @@
 # full credits + paper references: ../CREDITS.md                   #
 #------------------------------------------------------------------#
 
+# cooliosis
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi as Cgi
 import json as Json
