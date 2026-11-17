@@ -9,7 +9,7 @@
 # full credits + paper references: ../CREDITS.md                   #
 #------------------------------------------------------------------#
 
-# anti-cooliosis
+# anti-cooliosis :D
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi as Cgi
