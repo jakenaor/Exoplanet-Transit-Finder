@@ -1420,12 +1420,12 @@ body.ImagesPage { height:auto; min-height:100dvh; overflow:auto; background:var(
 .StandaloneImageNav { display:flex; gap:16px; margin-bottom:16px; }
 .EmbeddedImages .StandaloneImageNav { display:none; }
 .ImageLayout { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; padding:0 20px 24px; align-items:start; }
-.ImageSettings,.ImageCard { border:1px solid var(--line); border-radius:8px; background:#fff; padding:16px; box-shadow:var(--shadow-soft); }
+.ImageSettings,.ImageCard { min-width:0; border:1px solid var(--line); border-radius:8px; background:#fff; padding:16px; box-shadow:var(--shadow-soft); }
 .ImageSettings h2 { font-size:15px; margin:18px 0 10px; }
 .ImageSettings h2:first-child { margin-top:0; }
 .ImageSettings > label { display:block; font-weight:600; margin:10px 0 4px; }
 .ImageSettings input,.ImageSettings select { width:100%; max-width:100%; }
-.ImageSettings input[type=file] { font-size:12px; padding:8px 0; }
+.ImageSettings input[type=file] { display:block; font-size:12px; padding:8px 0; }
 .ImageNumberGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
 .ImageNumberGrid label { font-size:12px; }
 .ImageNumberGrid input { margin-top:4px; }
